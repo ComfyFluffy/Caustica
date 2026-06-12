@@ -28,11 +28,12 @@ import java.util.OptionalDouble;
  * restored and the low-res color is upscaled with a bilinear fullscreen blit
  * (vanilla TRACY_BLIT pipeline + linear sampler).
  *
- * <p>Scale comes from {@code -Dupscaler.renderScale} (default 0.5); set it to
- * 1.0 to disable. Values are clamped to [0.1, 1.0].
+ * <p>Scale comes from {@code -Dupscaler.renderScale} (default: FSR Quality,
+ * 1/1.5); set it to 1.0 to disable. Values are clamped to [0.1, 1.0].
  */
 public final class WorldRenderScaler {
 	public static final WorldRenderScaler INSTANCE = new WorldRenderScaler();
+	private static final float DEFAULT_SCALE = 1.0f / 1.5f;
 
 	private final float scale;
 
@@ -41,8 +42,11 @@ public final class WorldRenderScaler {
 	private GpuTextureView lowResColorView;
 	private GpuTexture lowResDepth;
 	private GpuTextureView lowResDepthView;
+	private GpuTexture sceneDepth;
+	private GpuTextureView sceneDepthView;
 	private int lowResWidth = -1;
 	private int lowResHeight = -1;
+	private boolean sceneDepthValid;
 
 	// native textures stashed during the level-render window
 	private GpuTexture savedColor;
@@ -55,13 +59,13 @@ public final class WorldRenderScaler {
 	private boolean loggedActivation;
 
 	private WorldRenderScaler() {
-		float configured = 0.5f;
+		float configured = DEFAULT_SCALE;
 		String prop = System.getProperty("upscaler.renderScale");
 		if (prop != null) {
 			try {
 				configured = Float.parseFloat(prop);
 			} catch (NumberFormatException e) {
-				UpscalerMod.LOGGER.warn("Invalid upscaler.renderScale '{}', using 0.5", prop);
+				UpscalerMod.LOGGER.warn("Invalid upscaler.renderScale '{}', using FSR Quality scale {}", prop, DEFAULT_SCALE);
 			}
 		}
 		this.scale = Math.clamp(configured, 0.1f, 1.0f);
@@ -97,12 +101,29 @@ public final class WorldRenderScaler {
 		mainTarget.width = renderWidth;
 		mainTarget.height = renderHeight;
 		this.active = true;
+		this.sceneDepthValid = false;
 
 		if (!this.loggedActivation) {
 			this.loggedActivation = true;
 			UpscalerMod.LOGGER.info("World render scale active: {}x{} -> {}x{} (scale {})",
 					renderWidth, renderHeight, this.savedWidth, this.savedHeight, this.scale);
 		}
+	}
+
+	/**
+	 * Vanilla clears the main depth buffer before drawing the first-person hand.
+	 * Since the main target is currently swapped to our low-res textures, preserve
+	 * world depth here so FSR does not receive a depth buffer containing only hand
+	 * pixels.
+	 */
+	public void captureSceneDepthBeforeHand() {
+		if (!this.active || this.lowResDepth == null || this.sceneDepth == null) {
+			return;
+		}
+
+		RenderSystem.getDevice().createCommandEncoder().copyTextureToTexture(
+				this.lowResDepth, this.sceneDepth, 0, 0, 0, 0, 0, this.lowResWidth, this.lowResHeight);
+		this.sceneDepthValid = true;
 	}
 
 	/** Restore native textures and upscale the low-res world into them. Call before GUI rendering. */
@@ -125,8 +146,10 @@ public final class WorldRenderScaler {
 		this.savedDepthView = null;
 
 		// Preferred path: FSR 3.1 temporal upscale low-res color/depth -> native color.
+		GpuTexture fsrDepth = this.sceneDepthValid ? this.sceneDepth : this.lowResDepth;
+		GpuTextureView fsrDepthView = this.sceneDepthValid ? this.sceneDepthView : this.lowResDepthView;
 		boolean fsrDone = FsrPipeline.INSTANCE.dispatch(
-				this.lowResColor, this.lowResDepth, this.lowResDepthView, this.lowResWidth, this.lowResHeight,
+				this.lowResColor, fsrDepth, fsrDepthView, this.lowResWidth, this.lowResHeight,
 				mainTarget.getColorTexture(), this.savedWidth, this.savedHeight);
 		if (fsrDone) {
 			return;
@@ -160,8 +183,11 @@ public final class WorldRenderScaler {
 		this.lowResColorView = device.createTextureView(this.lowResColor);
 		this.lowResDepth = device.createTexture(() -> "Upscaler world / Depth", 15, GpuFormat.D32_FLOAT, width, height, 1, 1);
 		this.lowResDepthView = device.createTextureView(this.lowResDepth);
+		this.sceneDepth = device.createTexture(() -> "Upscaler scene depth snapshot", 15, GpuFormat.D32_FLOAT, width, height, 1, 1);
+		this.sceneDepthView = device.createTextureView(this.sceneDepth);
 		this.lowResWidth = width;
 		this.lowResHeight = height;
+		this.sceneDepthValid = false;
 	}
 
 	private void destroyLowResTargets() {
@@ -181,7 +207,16 @@ public final class WorldRenderScaler {
 			this.lowResDepth.close();
 			this.lowResDepth = null;
 		}
+		if (this.sceneDepthView != null) {
+			this.sceneDepthView.close();
+			this.sceneDepthView = null;
+		}
+		if (this.sceneDepth != null) {
+			this.sceneDepth.close();
+			this.sceneDepth = null;
+		}
 		this.lowResWidth = -1;
 		this.lowResHeight = -1;
+		this.sceneDepthValid = false;
 	}
 }

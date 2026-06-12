@@ -62,7 +62,7 @@ public abstract class GameRendererMixin {
 		// Capture the unjittered frame matrices for the MV reprojection pass
 		// (this projection already includes view bobbing, exactly as rendered).
 		var cameraState = this.gameRenderState().levelRenderState.cameraRenderState;
-		FsrPipeline.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix, cameraState.pos);
+		FsrPipeline.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix, cameraState.pos, cameraState.depthFar);
 
 		float jx = FsrPipeline.INSTANCE.jitterNdcX();
 		float jy = FsrPipeline.INSTANCE.jitterNdcY();
@@ -70,6 +70,15 @@ public abstract class GameRendererMixin {
 			return projection;
 		}
 		return new Matrix4f().translation(jx, jy, 0.0f).mul(projection);
+	}
+
+	@Inject(method = "renderLevel(Lnet/minecraft/client/DeltaTracker;)V",
+			at = @At(value = "INVOKE",
+					target = "Lcom/mojang/blaze3d/systems/RenderSystem;setProjectionMatrix(Lcom/mojang/blaze3d/buffers/GpuBufferSlice;Lcom/mojang/blaze3d/ProjectionType;)V",
+					ordinal = 1,
+					shift = At.Shift.AFTER))
+	private void upscaler$captureSceneDepthBeforeHand(DeltaTracker deltaTracker, CallbackInfo ci) {
+		WorldRenderScaler.INSTANCE.captureSceneDepthBeforeHand();
 	}
 
 	@Shadow

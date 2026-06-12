@@ -35,10 +35,10 @@ import java.nio.file.Path;
  *
  * <p>Current limitations (intentional, next milestones):
  * <ul>
- *   <li>Motion vectors are a zero-cleared texture — camera motion will ghost/smear
- *       until the M4 reprojection pass lands.</li>
- *   <li>No projection jitter yet (M3), so FSR adds little detail beyond its
- *       spatial/edge reconstruction.</li>
+ *   <li>Motion vectors are camera-only reprojection from depth, so moving
+ *       entities/particles may still ghost until per-object vectors or reactive
+ *       masks land.</li>
+ *   <li>Texture mip bias and sharpening are not wired into user settings yet.</li>
  * </ul>
  *
  * <p>Interop notes: Blaze3D keeps all textures in VK_IMAGE_LAYOUT_GENERAL
@@ -87,9 +87,12 @@ public final class FsrPipeline {
 
 	// M4: camera reprojection motion vectors
 	private final float mvSignX = Float.parseFloat(System.getProperty("upscaler.mvSignX", "1"));
-	private final float mvSignY = Float.parseFloat(System.getProperty("upscaler.mvSignY", "-1"));
+	private final float mvSignY = Float.parseFloat(System.getProperty("upscaler.mvSignY", "1"));
 	private final org.joml.Matrix4f prevViewProj = new org.joml.Matrix4f();
 	private final org.joml.Matrix4f reprojectMatrix = new org.joml.Matrix4f();
+	private float cameraNear = 1000.0f; // FSR naming under reversed-Z: far distance
+	private float cameraFar = 0.05f;    // FSR naming under reversed-Z: near distance
+	private float cameraFovY = (float) Math.toRadians(70.0);
 	private double prevCamX;
 	private double prevCamY;
 	private double prevCamZ;
@@ -112,6 +115,7 @@ public final class FsrPipeline {
 					.withColorTargetState(new com.mojang.blaze3d.pipeline.ColorTargetState(
 							java.util.Optional.empty(), com.mojang.blaze3d.GpuFormat.RG16_FLOAT, 0xFFFFFFFF))
 					.withPrimitiveTopology(com.mojang.blaze3d.PrimitiveTopology.TRIANGLES)
+					.withCull(false)
 					.build();
 
 	private FsrPipeline() {
@@ -123,8 +127,12 @@ public final class FsrPipeline {
 	 * matrix used by the MV pass. Called from GameRendererMixin every level frame,
 	 * before jitter is applied.
 	 */
-	public void captureFrame(org.joml.Matrix4fc projection, org.joml.Matrix4fc viewRotation, net.minecraft.world.phys.Vec3 cameraPos) {
+	public void captureFrame(org.joml.Matrix4fc projection, org.joml.Matrix4fc viewRotation,
+	                         net.minecraft.world.phys.Vec3 cameraPos, float depthFar) {
 		org.joml.Matrix4f curViewProj = new org.joml.Matrix4f(projection).mul(viewRotation);
+		this.cameraNear = Math.max(0.05f, depthFar);
+		this.cameraFar = 0.05f;
+		this.cameraFovY = fovYFromProjection(projection);
 		if (this.hasPrevFrame) {
 			// p_relPrev = p_relCur + (camCur - camPrev); all in camera-relative space
 			float dx = (float) (cameraPos.x - this.prevCamX);
@@ -142,6 +150,11 @@ public final class FsrPipeline {
 		this.prevCamY = cameraPos.y;
 		this.prevCamZ = cameraPos.z;
 		this.hasPrevFrame = true;
+	}
+
+	private static float fovYFromProjection(org.joml.Matrix4fc projection) {
+		float yScale = Math.abs(projection.m11());
+		return yScale > 1.0e-6f ? 2.0f * (float) Math.atan(1.0f / yScale) : (float) Math.toRadians(70.0);
 	}
 
 	/**
@@ -257,7 +270,6 @@ public final class FsrPipeline {
 		this.contextUpscaleHeight = upscaleHeight;
 		this.resetNextDispatch = true;
 
-		// zero motion vectors (until M4)
 		var blazeDevice = RenderSystem.getDevice();
 		this.mvTexture = blazeDevice.createTexture(() -> "Upscaler MV", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_RENDER_ATTACHMENT,
 				com.mojang.blaze3d.GpuFormat.RG16_FLOAT, renderWidth, renderHeight, 1, 1);
@@ -364,16 +376,16 @@ public final class FsrPipeline {
 					new FfxUpscaleContext.Resource(this.outputImage, FfxUpscaleContext.FORMAT_R8G8B8A8_UNORM,
 							upscaleWidth, upscaleHeight, FfxUpscaleContext.USAGE_UAV, FfxUpscaleContext.STATE_UNORDERED_ACCESS),
 					this.jitterPixelsX, this.jitterPixelsY,
-					// MV texture holds NDC-space deltas (current -> previous); convert
-					// to render-res pixels, Y flipped for texel-space-down convention
-					mvValid ? 0.5f * renderWidth * this.mvSignX : 1.0f,
-					mvValid ? 0.5f * renderHeight * this.mvSignY : 1.0f,
+					// MV texture holds NDC-space deltas (current -> previous). FSR's
+					// host API expects full render dimensions as the NDC scale.
+					mvValid ? renderWidth * this.mvSignX : 1.0f,
+					mvValid ? renderHeight * this.mvSignY : 1.0f,
 					renderWidth, renderHeight,
 					upscaleWidth, upscaleHeight,
 					frameTimeMs, this.resetNextDispatch,
 					// reversed-Z (DEPTH_INVERTED): FFX expects cameraNear > cameraFar,
 					// i.e. near carries the far-plane distance and vice versa
-					1000.0f, 0.05f, (float) Math.toRadians(70.0),
+					this.cameraNear, this.cameraFar, this.cameraFovY,
 					FfxUpscaleContext.DISPATCH_FLAG_NON_LINEAR_COLOR_SRGB));
 			this.resetNextDispatch = false;
 
