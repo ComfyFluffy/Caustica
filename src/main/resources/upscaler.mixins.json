@@ -1,0 +1,15 @@
+{
+	"required": true,
+	"minVersion": "0.8",
+	"package": "dev.upscaler.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"GameRendererMixin",
+		"GpuDeviceAccessor",
+		"RenderTargetAccessor",
+		"VulkanBackendMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}
