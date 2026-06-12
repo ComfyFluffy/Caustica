@@ -80,6 +80,7 @@ public final class WorldRenderScaler {
 		int renderWidth = Math.max(1, Math.round(mainTarget.width * this.scale));
 		int renderHeight = Math.max(1, Math.round(mainTarget.height * this.scale));
 		ensureLowResTargets(renderWidth, renderHeight);
+		FsrPipeline.INSTANCE.prepareFrameJitter(renderWidth, renderHeight, mainTarget.width);
 
 		var accessor = (RenderTargetAccessor) mainTarget;
 		this.savedColor = accessor.upscaler$getColorTexture();
@@ -125,7 +126,7 @@ public final class WorldRenderScaler {
 
 		// Preferred path: FSR 3.1 temporal upscale low-res color/depth -> native color.
 		boolean fsrDone = FsrPipeline.INSTANCE.dispatch(
-				this.lowResColor, this.lowResDepth, this.lowResWidth, this.lowResHeight,
+				this.lowResColor, this.lowResDepth, this.lowResDepthView, this.lowResWidth, this.lowResHeight,
 				mainTarget.getColorTexture(), this.savedWidth, this.savedHeight);
 		if (fsrDone) {
 			return;

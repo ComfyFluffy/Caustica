@@ -76,7 +76,110 @@ public final class FsrPipeline {
 	private boolean resetNextDispatch;
 	private boolean loggedActive;
 
+	// M3: per-frame camera jitter (FSR-recommended Halton sequence via ffxQuery)
+	private final float jitterSignX = Float.parseFloat(System.getProperty("upscaler.jitterSignX", "1"));
+	private final float jitterSignY = Float.parseFloat(System.getProperty("upscaler.jitterSignY", "-1"));
+	private int jitterFrameIndex;
+	private float jitterPixelsX;
+	private float jitterPixelsY;
+	private float jitterNdcX;
+	private float jitterNdcY;
+
+	// M4: camera reprojection motion vectors
+	private final float mvSignX = Float.parseFloat(System.getProperty("upscaler.mvSignX", "1"));
+	private final float mvSignY = Float.parseFloat(System.getProperty("upscaler.mvSignY", "-1"));
+	private final org.joml.Matrix4f prevViewProj = new org.joml.Matrix4f();
+	private final org.joml.Matrix4f reprojectMatrix = new org.joml.Matrix4f();
+	private double prevCamX;
+	private double prevCamY;
+	private double prevCamZ;
+	private boolean hasPrevFrame;
+	private boolean reprojectValid;
+	private com.mojang.blaze3d.buffers.GpuBuffer mvParamsBuffer;
+
+	private static final com.mojang.blaze3d.pipeline.BindGroupLayout MV_BIND_GROUP =
+			com.mojang.blaze3d.pipeline.BindGroupLayout.builder()
+					.withSampler("InDepth")
+					.withUniform("MvParams", com.mojang.blaze3d.shaders.UniformType.UNIFORM_BUFFER)
+					.build();
+
+	private static final com.mojang.blaze3d.pipeline.RenderPipeline MV_PIPELINE =
+			com.mojang.blaze3d.pipeline.RenderPipeline.builder()
+					.withLocation(net.minecraft.resources.Identifier.fromNamespaceAndPath("upscaler", "pipeline/mv"))
+					.withBindGroupLayout(MV_BIND_GROUP)
+					.withVertexShader("core/screenquad")
+					.withFragmentShader(net.minecraft.resources.Identifier.fromNamespaceAndPath("upscaler", "mv"))
+					.withColorTargetState(new com.mojang.blaze3d.pipeline.ColorTargetState(
+							java.util.Optional.empty(), com.mojang.blaze3d.GpuFormat.RG16_FLOAT, 0xFFFFFFFF))
+					.withPrimitiveTopology(com.mojang.blaze3d.PrimitiveTopology.TRIANGLES)
+					.build();
+
 	private FsrPipeline() {
+	}
+
+	/**
+	 * Captures the frame's unjittered view-projection (post-bob projection, as
+	 * uploaded for level rendering) and camera position; builds the reprojection
+	 * matrix used by the MV pass. Called from GameRendererMixin every level frame,
+	 * before jitter is applied.
+	 */
+	public void captureFrame(org.joml.Matrix4fc projection, org.joml.Matrix4fc viewRotation, net.minecraft.world.phys.Vec3 cameraPos) {
+		org.joml.Matrix4f curViewProj = new org.joml.Matrix4f(projection).mul(viewRotation);
+		if (this.hasPrevFrame) {
+			// p_relPrev = p_relCur + (camCur - camPrev); all in camera-relative space
+			float dx = (float) (cameraPos.x - this.prevCamX);
+			float dy = (float) (cameraPos.y - this.prevCamY);
+			float dz = (float) (cameraPos.z - this.prevCamZ);
+			this.reprojectMatrix.set(this.prevViewProj)
+					.mul(new org.joml.Matrix4f().translation(dx, dy, dz))
+					.mul(new org.joml.Matrix4f(curViewProj).invert());
+			this.reprojectValid = true;
+		} else {
+			this.reprojectValid = false;
+		}
+		this.prevViewProj.set(curViewProj);
+		this.prevCamX = cameraPos.x;
+		this.prevCamY = cameraPos.y;
+		this.prevCamZ = cameraPos.z;
+		this.hasPrevFrame = true;
+	}
+
+	/**
+	 * Advances the jitter sequence for this frame. Called from
+	 * {@link WorldRenderScaler#begin} before the level renders; the same offset is
+	 * applied to the level projection (via GameRendererMixin) and reported to the
+	 * FSR dispatch. Until the context exists (first frame), jitter is zero.
+	 */
+	public void prepareFrameJitter(int renderWidth, int renderHeight, int displayWidth) {
+		if (this.context == null || this.failed || !this.enabledByProperty) {
+			this.jitterPixelsX = 0.0f;
+			this.jitterPixelsY = 0.0f;
+			this.jitterNdcX = 0.0f;
+			this.jitterNdcY = 0.0f;
+			return;
+		}
+		try {
+			int phaseCount = Math.max(1, this.context.queryJitterPhaseCount(renderWidth, displayWidth));
+			var offset = this.context.queryJitterOffset(this.jitterFrameIndex++ % phaseCount, phaseCount);
+			this.jitterPixelsX = offset.x();
+			this.jitterPixelsY = offset.y();
+			this.jitterNdcX = this.jitterSignX * 2.0f * offset.x() / renderWidth;
+			this.jitterNdcY = this.jitterSignY * 2.0f * offset.y() / renderHeight;
+		} catch (FfxUpscaleContext.FfxException e) {
+			UpscalerMod.LOGGER.warn("Jitter query failed; disabling jitter", e);
+			this.jitterPixelsX = 0.0f;
+			this.jitterPixelsY = 0.0f;
+			this.jitterNdcX = 0.0f;
+			this.jitterNdcY = 0.0f;
+		}
+	}
+
+	public float jitterNdcX() {
+		return this.jitterNdcX;
+	}
+
+	public float jitterNdcY() {
+		return this.jitterNdcY;
 	}
 
 	/**
@@ -84,7 +187,8 @@ public final class FsrPipeline {
 	 *
 	 * @return true if dispatched; false if the caller should fall back to the bilinear blit
 	 */
-	public boolean dispatch(GpuTexture lowResColor, GpuTexture lowResDepth, int renderWidth, int renderHeight,
+	public boolean dispatch(GpuTexture lowResColor, GpuTexture lowResDepth, GpuTextureView lowResDepthView,
+	                        int renderWidth, int renderHeight,
 	                        GpuTexture nativeColor, int upscaleWidth, int upscaleHeight) {
 		if (!this.enabledByProperty || this.failed) {
 			return false;
@@ -96,7 +200,8 @@ public final class FsrPipeline {
 		try {
 			ensureLibrary();
 			ensureResources(device, renderWidth, renderHeight, upscaleWidth, upscaleHeight);
-			recordDispatch(device, lowResColor, lowResDepth, renderWidth, renderHeight, nativeColor, upscaleWidth, upscaleHeight);
+			boolean mvValid = renderMotionVectors(lowResDepthView);
+			recordDispatch(device, lowResColor, lowResDepth, renderWidth, renderHeight, nativeColor, upscaleWidth, upscaleHeight, mvValid);
 			if (!this.loggedActive) {
 				this.loggedActive = true;
 				UpscalerMod.LOGGER.info("FSR upscaling active: {}x{} -> {}x{}", renderWidth, renderHeight, upscaleWidth, upscaleHeight);
@@ -187,9 +292,40 @@ public final class FsrPipeline {
 		}
 	}
 
+	/**
+	 * Fullscreen depth-reprojection pass writing NDC-delta motion vectors into
+	 * {@link #mvTexture}. Recorded through the regular Blaze3D encoder, so it lands
+	 * in the command stream before the FSR dispatch's transient command buffer.
+	 *
+	 * @return true if real MVs were written; false if the texture was zero-cleared
+	 */
+	private boolean renderMotionVectors(GpuTextureView lowResDepthView) {
+		var encoder = RenderSystem.getDevice().createCommandEncoder();
+		if (!this.reprojectValid) {
+			encoder.clearColorTexture(this.mvTexture, new Vector4f(0.0f, 0.0f, 0.0f, 0.0f));
+			return false;
+		}
+
+		if (this.mvParamsBuffer == null) {
+			this.mvParamsBuffer = RenderSystem.getDevice().createBuffer(() -> "Upscaler MV params",
+					com.mojang.blaze3d.buffers.GpuBuffer.USAGE_UNIFORM | com.mojang.blaze3d.buffers.GpuBuffer.USAGE_COPY_DST, 64);
+		}
+		java.nio.ByteBuffer matrixData = java.nio.ByteBuffer.allocateDirect(64).order(java.nio.ByteOrder.nativeOrder());
+		this.reprojectMatrix.get(matrixData); // column-major, std140 mat4
+		encoder.writeToBuffer(this.mvParamsBuffer.slice(), matrixData);
+
+		try (var pass = encoder.createRenderPass(() -> "Upscaler MV", this.mvTextureView, java.util.Optional.empty())) {
+			pass.setPipeline(MV_PIPELINE);
+			pass.bindTexture("InDepth", lowResDepthView, RenderSystem.getSamplerCache().getClampToEdge(com.mojang.blaze3d.textures.FilterMode.NEAREST));
+			pass.setUniform("MvParams", this.mvParamsBuffer);
+			pass.draw(3, 1, 0, 0);
+		}
+		return true;
+	}
+
 	private void recordDispatch(VulkanDevice device, GpuTexture lowResColor, GpuTexture lowResDepth,
 	                            int renderWidth, int renderHeight,
-	                            GpuTexture nativeColor, int upscaleWidth, int upscaleHeight) {
+	                            GpuTexture nativeColor, int upscaleWidth, int upscaleHeight, boolean mvValid) {
 		var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
 		VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
 
@@ -227,8 +363,11 @@ public final class FsrPipeline {
 							renderWidth, renderHeight, FfxUpscaleContext.USAGE_READ_ONLY, FfxUpscaleContext.STATE_COMMON),
 					new FfxUpscaleContext.Resource(this.outputImage, FfxUpscaleContext.FORMAT_R8G8B8A8_UNORM,
 							upscaleWidth, upscaleHeight, FfxUpscaleContext.USAGE_UAV, FfxUpscaleContext.STATE_UNORDERED_ACCESS),
-					0.0f, 0.0f,                       // jitter (M3)
-					1.0f, 1.0f,                       // motion vector scale (zeros anyway until M4)
+					this.jitterPixelsX, this.jitterPixelsY,
+					// MV texture holds NDC-space deltas (current -> previous); convert
+					// to render-res pixels, Y flipped for texel-space-down convention
+					mvValid ? 0.5f * renderWidth * this.mvSignX : 1.0f,
+					mvValid ? 0.5f * renderHeight * this.mvSignY : 1.0f,
 					renderWidth, renderHeight,
 					upscaleWidth, upscaleHeight,
 					frameTimeMs, this.resetNextDispatch,
@@ -289,6 +428,12 @@ public final class FsrPipeline {
 			this.outputImage = 0;
 			this.outputAllocation = 0;
 		}
+		if (this.mvParamsBuffer != null) {
+			this.mvParamsBuffer.close();
+			this.mvParamsBuffer = null;
+		}
+		this.hasPrevFrame = false;
+		this.reprojectValid = false;
 		this.contextRenderWidth = -1;
 		this.contextRenderHeight = -1;
 		this.contextUpscaleWidth = -1;

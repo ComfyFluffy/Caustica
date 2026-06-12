@@ -181,13 +181,18 @@ public final class FfxUpscaleContext implements AutoCloseable {
 		}
 	}
 
+	private static final java.util.Set<String> SEEN_MESSAGES = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
 	@SuppressWarnings("unused") // upcall target
 	private static void onFfxMessage(int type, MemorySegment message) {
 		String text = readWideString(message);
+		if (!SEEN_MESSAGES.add(text)) {
+			return; // repeated every frame otherwise
+		}
 		if (type == 0) {
 			UpscalerMod.LOGGER.error("[FFX] {}", text);
 		} else {
-			UpscalerMod.LOGGER.warn("[FFX] {}", text);
+			UpscalerMod.LOGGER.warn("[FFX] {} (further occurrences suppressed)", text);
 		}
 	}
 
