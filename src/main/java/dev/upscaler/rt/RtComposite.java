@@ -40,7 +40,7 @@ public final class RtComposite {
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + accumFrame(@88) + debugView(@92)
     // + prevViewProj(@96) + camDelta(@160)
     private static final int WORLD_PUSH_SIZE = 172;
-    private static final int GUIDE_COUNT = 4; // P4 guide buffers bound at world-pipeline bindings 3..6
+    private static final int GUIDE_COUNT = 5; // P4 guide buffers bound at world-pipeline bindings 3..7
 
     /** Debug guide-buffer view: 0 = normal render, 1 = normals, 2 = albedo, 3 = depth, 4 = roughness. */
     public static final int DEBUG_VIEW = Integer.getInteger("upscaler.rt.debugView", 0);
@@ -70,6 +70,9 @@ public final class RtComposite {
     private RtImage gAlbedo;
     private RtImage gDepth;
     private RtImage gMotion;
+    private RtImage gSpecAlbedo;
+    // DLSS-RR denoised output (display res); copied back into `output` so the blend path is unchanged.
+    private RtImage rrOutput;
 
     // Motion-vector reprojection state (P4.0b): the previous frame's camera-relative view-projection
     // and camera position. Held separately from the accumulation's last* fields (those are overwritten
@@ -204,6 +207,7 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(1, gAlbedo.view);
         worldPipeline.setExtraStorageImage(2, gDepth.view);
         worldPipeline.setExtraStorageImage(3, gMotion.view);
+        worldPipeline.setExtraStorageImage(4, gSpecAlbedo.view);
     }
 
     private void destroyGuideImages() {
@@ -222,6 +226,14 @@ public final class RtComposite {
         if (gMotion != null) {
             gMotion.destroy();
             gMotion = null;
+        }
+        if (gSpecAlbedo != null) {
+            gSpecAlbedo.destroy();
+            gSpecAlbedo = null;
+        }
+        if (rrOutput != null) {
+            rrOutput.destroy();
+            rrOutput = null;
         }
     }
 
@@ -248,6 +260,11 @@ public final class RtComposite {
         gAlbedo = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
         gDepth = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R32_SFLOAT);
         gMotion = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16_SFLOAT);
+        gSpecAlbedo = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
+        if (RtDlssRr.ENABLED) {
+            // DLSS-RR output. P4.2a is native res (display == render); P4.2b makes this display-res.
+            rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
+        }
         accumNeedsReset = true; // the recreated HDR target has no valid accumulation history
         mvHasPrev = false;      // recreated images -> first MV frame is zero
         if (trianglePipeline != null) {
@@ -324,18 +341,27 @@ public final class RtComposite {
                 push.putFloat(68, (float) (camY - terrain.blockY));
                 push.putFloat(72, (float) (camZ - terrain.blockZ));
                 push.putLong(80, terrain.tableAddress());
-                push.putInt(88, accumFrame);
+                // DLSS-RR does its own temporal denoise, so feed it a single noisy frame (no
+                // accumulate-when-static) by pushing accumFrame 0 whenever RR is enabled.
+                push.putInt(88, RtDlssRr.ENABLED ? 0 : accumFrame);
                 push.putInt(92, DEBUG_VIEW);
                 mvPushMatrix.get(96, push);
                 push.putFloat(160, mvCamDeltaX);
                 push.putFloat(164, mvCamDeltaY);
                 push.putFloat(168, mvCamDeltaZ);
                 active.trace(cmd, width, height, push);
-                // P4.2a checkpoint: bring up DLSS-RR (NGX init + availability gate + feature creation)
-                // at native resolution. Per-frame evaluate + composite follow; for now the feature is
-                // created (and logged) but not yet consumed.
-                if (RtDlssRr.ENABLED) {
-                    RtDlssRr.INSTANCE.ensureFeature(cmd.address(), width, height, width, height);
+                // P4.2a: DLSS-RR denoise. The RT pass wrote the noisy color into `output` plus the guide
+                // buffers; RR reads them and writes the denoised result into rrOutput, which we copy back
+                // into `output` so the downstream tonemap/blend path is unchanged (native res, 1:1 copy).
+                if (RtDlssRr.ENABLED && rrOutput != null
+                        && RtDlssRr.INSTANCE.ensureFeature(cmd.address(), width, height, width, height)) {
+                    VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
+                    if (RtDlssRr.INSTANCE.evaluate(cmd.address(), output, gDepth, gMotion, gAlbedo,
+                            gSpecAlbedo, gNormal, rrOutput, width, height, width, height)) {
+                        VulkanCommandEncoder.memoryBarrier(cmd, stack); // DLSS write visible to the copy
+                        VK10.vkCmdCopyImage(cmd, rrOutput.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                                output.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, width, height));
+                    }
                 }
             } else {
                 active.trace(cmd, width, height);

@@ -36,11 +36,14 @@ public final class RtDlssRr {
     private static final int QUALITY_MAX_QUALITY = 2; // NVSDK_NGX_PerfQuality_Value_MaxQuality
     // DLSS feature flags. IsHDR (bit 0): color is linear HDR (rgba16f) — RR requires it ("HDR Color
     // required"). MVLowRes (bit 1): motion vectors are at render/input resolution, not display — RR
-    // requires it ("Low resolution Motion Vectors required"). MVs are unjittered and depth is linear,
-    // so no MV_JITTERED / DEPTH_INVERTED.
+    // requires it ("Low resolution Motion Vectors required"). AutoExposure (bit 6): in HDR mode DLSS
+    // needs the scene exposure (exposure texture or auto-estimate); without it the output is black, so
+    // let DLSS estimate exposure from the color itself. MVs are unjittered and depth is linear, so no
+    // MV_JITTERED / DEPTH_INVERTED.
     private static final int FEATURE_FLAG_IS_HDR = 1 << 0;
     private static final int FEATURE_FLAG_MV_LOW_RES = 1 << 1;
-    private static final int FEATURE_FLAGS = FEATURE_FLAG_IS_HDR | FEATURE_FLAG_MV_LOW_RES;
+    private static final int FEATURE_FLAG_AUTO_EXPOSURE = 1 << 6;
+    private static final int FEATURE_FLAGS = FEATURE_FLAG_IS_HDR | FEATURE_FLAG_MV_LOW_RES | FEATURE_FLAG_AUTO_EXPOSURE;
     // 0 = let the RR DLL pick its per-mode default preset (tuned in P4.3).
     private static final int RENDER_PRESET = Integer.getInteger("upscaler.rt.dlssRr.preset", 0);
 
@@ -58,11 +61,54 @@ public final class RtDlssRr {
     private int featureDisplayWidth = -1;
     private int featureDisplayHeight = -1;
 
+    private boolean resetHistory;
+    private long lastFrameNanos;
+
     private RtDlssRr() {
     }
 
     public boolean isReady() {
         return initialized && !failed && !isNull(feature);
+    }
+
+    /**
+     * Record a DLSS-RR evaluation: denoise (+ upscale, once render &lt; display) the noisy path-traced
+     * color using the guide buffers, writing the result into {@code out}. Returns false (disabling RR)
+     * on failure. P4.2a: native res, no jitter, MVs already in render-pixel space (scale 1).
+     */
+    public boolean evaluate(long cmd, RtImage color, RtImage depth, RtImage motion,
+                            RtImage diffuseAlbedo, RtImage specularAlbedo, RtImage normals, RtImage out,
+                            int renderWidth, int renderHeight, int displayWidth, int displayHeight) {
+        if (!isReady()) {
+            return false;
+        }
+        try {
+            long now = System.nanoTime();
+            float frameMs = lastFrameNanos == 0 ? 16.6f
+                    : Math.clamp((now - lastFrameNanos) / 1_000_000.0f, 0.1f, 200.0f);
+            lastFrameNanos = now;
+
+            int rc = lib.evaluateDlssd(cmd, feature,
+                    color.view, color.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    depth.view, depth.image, VK10.VK_FORMAT_R32_SFLOAT,
+                    motion.view, motion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
+                    diffuseAlbedo.view, diffuseAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    specularAlbedo.view, specularAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    normals.view, normals.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    out.view, out.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    renderWidth, renderHeight, displayWidth, displayHeight,
+                    0.0f, 0.0f, 1.0f, 1.0f, resetHistory ? 1 : 0, frameMs);
+            resetHistory = false;
+            if (ngxFailed(rc)) {
+                throw new IllegalStateException("ngxshim_evaluate_dlssd failed: 0x" + Integer.toHexString(rc)
+                        + " last=0x" + Integer.toHexString(lib.lastResult()));
+            }
+            return true;
+        } catch (Throwable t) {
+            failed = true;
+            UpscalerMod.LOGGER.error("DLSS-RR evaluate failed; RT composite continues without it", t);
+            return false;
+        }
     }
 
     /**
@@ -93,6 +139,7 @@ public final class RtDlssRr {
                 featureRenderHeight = renderHeight;
                 featureDisplayWidth = displayWidth;
                 featureDisplayHeight = displayHeight;
+                resetHistory = true; // a fresh feature has no temporal history
                 UpscalerMod.LOGGER.info("DLSS-RR feature created: {}x{} -> {}x{} (quality {})",
                         renderWidth, renderHeight, displayWidth, displayHeight, quality);
             }

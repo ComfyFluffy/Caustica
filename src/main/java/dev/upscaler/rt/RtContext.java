@@ -169,7 +169,10 @@ public final class RtContext {
             VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
                     .imageType(VK10.VK_IMAGE_TYPE_2D).format(format)
                     .mipLevels(1).arrayLayers(1).samples(VK10.VK_SAMPLE_COUNT_1_BIT).tiling(VK10.VK_IMAGE_TILING_OPTIMAL)
-                    .usage(VK10.VK_IMAGE_USAGE_STORAGE_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+                    // SAMPLED so DLSS-RR can read these as input textures (color + guide buffers);
+                    // STORAGE for raygen/compute writes; TRANSFER for the world-target copies.
+                    .usage(VK10.VK_IMAGE_USAGE_STORAGE_BIT | VK10.VK_IMAGE_USAGE_SAMPLED_BIT
+                            | VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                     .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);
             ici.extent().set(width, height, 1);
             VmaAllocationCreateInfo iaci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);

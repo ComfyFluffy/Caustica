@@ -33,7 +33,8 @@ layout(binding = 1, set = 0, rgba16f) uniform image2D outImage;
 layout(binding = 3, set = 0, rgba16f) uniform image2D gNormal; // xyz world normal, w roughness
 layout(binding = 4, set = 0, rgba16f) uniform image2D gAlbedo; // rgb diffuse albedo
 layout(binding = 5, set = 0, r32f)    uniform image2D gDepth;  // r linear hit distance (<0 = sky)
-layout(binding = 6, set = 0, rg16f)   uniform image2D gMotion; // xy screen-space motion (render pixels)
+layout(binding = 6, set = 0, rg16f)   uniform image2D gMotion;    // xy screen-space motion (render pixels)
+layout(binding = 7, set = 0, rgba16f) uniform image2D gSpecAlbedo; // specular albedo (0 — diffuse-only)
 
 layout(push_constant) uniform Push {
     mat4 invViewProj;
@@ -212,6 +213,7 @@ void main() {
     imageStore(gNormal, pix, vec4(gv_normal, gv_rough));
     imageStore(gAlbedo, pix, vec4(gv_albedo, 1.0));
     imageStore(gDepth, pix, vec4(gv_depth, 0.0, 0.0, 0.0));
+    imageStore(gSpecAlbedo, pix, vec4(0.0)); // diffuse-only path tracer: no specular albedo
 
     // P4.0b motion vector: reproject this surface point through the previous frame's view-projection.
     // curNdc is the pixel centre (the ray was cast through it), so MV is just prevNdc - curNdc, scaled
