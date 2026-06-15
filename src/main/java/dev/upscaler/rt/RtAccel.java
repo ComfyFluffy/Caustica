@@ -108,10 +108,15 @@ public final class RtAccel {
         RtBuffer instanceBuffer = ctx.createBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * count,
                 org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true);
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            // Reuse a single record + transform buffer across all instances: allocating per-instance
+            // on the MemoryStack (64 KB/thread) overflows it once there are hundreds of sections.
+            VkAccelerationStructureInstanceKHR rec = VkAccelerationStructureInstanceKHR.calloc(stack);
+            java.nio.FloatBuffer xform = stack.mallocFloat(12);
             for (int i = 0; i < count; i++) {
                 Instance inst = instances.get(i);
-                VkAccelerationStructureInstanceKHR rec = VkAccelerationStructureInstanceKHR.calloc(stack);
-                rec.transform().matrix(stack.floats(inst.transform3x4()));
+                xform.clear();
+                xform.put(inst.transform3x4()).flip();
+                rec.transform().matrix(xform);
                 rec.instanceCustomIndex(i).mask(0xFF).instanceShaderBindingTableRecordOffset(0)
                         .flags(0x00000001) // VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
                         .accelerationStructureReference(inst.blasDeviceAddress());

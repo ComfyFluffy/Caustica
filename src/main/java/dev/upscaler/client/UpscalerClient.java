@@ -39,12 +39,12 @@ public final class UpscalerClient implements ClientModInitializer {
 				}
 			}
 
-			// P2: once RT is up and the player is in a world, keep a snapshot loaded around the
-			// player — (re)extract on first entry and whenever the player drifts far enough.
+			// P2: once RT is up, keep section residency synced to vanilla's loaded chunks around
+			// the player — builds newly-in-range sections, frees out-of-range ones, per tick.
 			if (rtInitDone && RtTerrain.ENABLED) {
 				RtContext ctx = RtContext.currentOrNull();
 				if (ctx != null) {
-					RtTerrain.maybeExtract(ctx);
+					RtTerrain.update(ctx);
 				}
 			}
 		});
@@ -57,6 +57,7 @@ public final class UpscalerClient implements ClientModInitializer {
 			RtContext ctx = RtContext.currentOrNull();
 			if (ctx != null) {
 				ctx.waitIdle();
+				RtTerrain.shutdown(ctx);
 			}
 			RtComposite.INSTANCE.destroy();
 			RtTriangleScene scene = RtTriangleScene.currentOrNull();

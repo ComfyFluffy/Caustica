@@ -63,9 +63,10 @@ public final class RtPipeline {
     private final long sbtStride;
     private final int missCount;
     private final int pushConstantSize;
+    private final int pushConstantStages;
     private boolean destroyed;
 
-    private RtPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int pushConstantSize) {
+    private RtPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int pushConstantSize, int pushConstantStages) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
@@ -76,6 +77,7 @@ public final class RtPipeline {
         this.sbtStride = stride;
         this.missCount = missCount;
         this.pushConstantSize = pushConstantSize;
+        this.pushConstantStages = pushConstantStages;
     }
 
     public static RtPipeline create(RtContext ctx, String rgen, String rmiss, String rchit) {
@@ -136,9 +138,11 @@ public final class RtPipeline {
             long set = pSet.get(0);
 
             VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(dsl));
+            // Push constants are visible to raygen + closest-hit (+ any-hit when present). vkCmdPushConstants
+            // must be called with exactly these stages, so store them for trace().
+            int pcStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+                    | (hasAhit ? VK_SHADER_STAGE_ANY_HIT_BIT_KHR : 0);
             if (pushConstantSize > 0) {
-                int pcStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
-                        | (hasAhit ? VK_SHADER_STAGE_ANY_HIT_BIT_KHR : 0);
                 VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack)
                         .stageFlags(pcStages)
                         .offset(0).size(pushConstantSize);
@@ -213,7 +217,7 @@ public final class RtPipeline {
             for (int g = 0; g < groupCount; g++) {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
-            return new RtPipeline(ctx, dsl, pool, set, layout, pipeline, sbt, stride, missCount, pushConstantSize);
+            return new RtPipeline(ctx, dsl, pool, set, layout, pipeline, sbt, stride, missCount, pushConstantSize, pcStages);
         }
     }
 
@@ -261,8 +265,7 @@ public final class RtPipeline {
             VK10.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
             VK10.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, stack.longs(descriptorSet), null);
             if (pushConstants != null && pushConstantSize > 0) {
-                VK10.vkCmdPushConstants(cmd, pipelineLayout,
-                        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, 0, pushConstants);
+                VK10.vkCmdPushConstants(cmd, pipelineLayout, pushConstantStages, 0, pushConstants);
             }
             VkStridedDeviceAddressRegionKHR raygen = VkStridedDeviceAddressRegionKHR.calloc(stack)
                     .deviceAddress(sbt.deviceAddress).stride(sbtStride).size(sbtStride);
