@@ -40,6 +40,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -97,7 +98,13 @@ public final class RtTerrain {
     private static final int OMM_CLASS_MIXED = -1;
     private static final int OMM_CLASS_UNSAFE = -2;
     private static final int OMM_ALPHA_CUTOFF = 128; // any-hit uses alpha >= 0.5 as visible
+    private static final byte OMM_UNKNOWN_OPAQUE_BYTE = (byte) (OMM_UNKNOWN_OPAQUE | (OMM_UNKNOWN_OPAQUE << 2)
+            | (OMM_UNKNOWN_OPAQUE << 4) | (OMM_UNKNOWN_OPAQUE << 6));
     private static final boolean OMM_STATS = Boolean.getBoolean("upscaler.rt.ommStats");
+    // A triangle's micromap depends only on (sprite, UV triple, level) — never on world position — so
+    // identical cutout faces (every leaves/grass block in view, every dirty re-extract) reuse one result.
+    // Keyed by sprite identity, so it is cleared on resource reload (markAllDirty) when the atlas changes.
+    private static final Map<OmmTriangleKey, OmmTriangleResult> OMM_TRIANGLE_CACHE = new ConcurrentHashMap<>();
     private static final long OMM_STATS_INTERVAL_NANOS = 5_000_000_000L;
     private static final AtomicLong OMM_STATS_SECTIONS = new AtomicLong();
     private static final AtomicLong OMM_STATS_CUTOUT_SECTIONS = new AtomicLong();
@@ -238,6 +245,8 @@ public final class RtTerrain {
      * until each section's rebuild swaps in. Applied on the next {@link #tick} (render thread).
      */
     public static void markAllDirty() {
+        // The atlas (and thus sprite identities + UVs) changed — drop cached per-triangle classifications.
+        clearOmmCache();
         INSTANCE.reresolveAllRequested = true;
     }
 
@@ -627,9 +636,7 @@ public final class RtTerrain {
         int microCount = 1 << (level * 2);
         int bytesPerTriangle = Math.max(1, (microCount * 2 + 7) >>> 3);
         byte[] data = new byte[triCount * bytesPerTriangle];
-        byte unknownOpaqueByte = (byte) (OMM_UNKNOWN_OPAQUE | (OMM_UNKNOWN_OPAQUE << 2)
-                | (OMM_UNKNOWN_OPAQUE << 4) | (OMM_UNKNOWN_OPAQUE << 6));
-        java.util.Arrays.fill(data, unknownOpaqueByte);
+        java.util.Arrays.fill(data, OMM_UNKNOWN_OPAQUE_BYTE);
 
         int opaqueMicroTriangles = 0;
         int transparentMicroTriangles = 0;
@@ -657,7 +664,9 @@ public final class RtTerrain {
             if (sprite.isAnimated()) {
                 animatedTris++;
             }
-            OmmMicroCounts counts = writeClassifiedMicroTriangles(data, t, bytesPerTriangle, level, sprite, indices, uvs);
+            OmmTriangleResult result = classifyTriangleCached(level, bytesPerTriangle, sprite, indices, uvs, t);
+            System.arraycopy(result.data(), 0, data, t * bytesPerTriangle, bytesPerTriangle);
+            OmmMicroCounts counts = result.counts();
             opaqueMicroTriangles += counts.opaque();
             transparentMicroTriangles += counts.transparent();
             mixedMicroTriangles += counts.mixed();
@@ -748,36 +757,53 @@ public final class RtTerrain {
     private record OmmMicroCounts(int opaque, int transparent, int mixed, int unsafe) {
     }
 
-    private static OmmMicroCounts writeClassifiedMicroTriangles(byte[] data, int tri, int bytesPerTriangle, int level,
-                                                                TextureAtlasSprite sprite, int[] indices, float[] uvs) {
-        int i0 = indices[tri * 3];
-        int i1 = indices[tri * 3 + 1];
-        int i2 = indices[tri * 3 + 2];
-        int uv0 = i0 * 2;
-        int uv1 = i1 * 2;
-        int uv2 = i2 * 2;
-        float u0 = uvs[uv0], v0 = uvs[uv0 + 1];
-        float u1 = uvs[uv1], v1 = uvs[uv1 + 1];
-        float u2 = uvs[uv2], v2 = uvs[uv2 + 1];
+    /** Cache key: a triangle's classification depends only on its sprite, UV triple, and subdivision level. */
+    private record OmmTriangleKey(TextureAtlasSprite sprite, int level,
+                                  float u0, float v0, float u1, float v1, float u2, float v2) {
+    }
+
+    /** Cached classification of one triangle: its {@code bytesPerTriangle}-sized micromap block + tallies. */
+    private record OmmTriangleResult(byte[] data, OmmMicroCounts counts) {
+    }
+
+    public static void clearOmmCache() {
+        OMM_TRIANGLE_CACHE.clear();
+    }
+
+    private static OmmTriangleResult classifyTriangleCached(int level, int bytesPerTriangle, TextureAtlasSprite sprite,
+                                                            int[] indices, float[] uvs, int tri) {
+        int uv0 = indices[tri * 3] * 2;
+        int uv1 = indices[tri * 3 + 1] * 2;
+        int uv2 = indices[tri * 3 + 2] * 2;
+        OmmTriangleKey key = new OmmTriangleKey(sprite, level,
+                uvs[uv0], uvs[uv0 + 1], uvs[uv1], uvs[uv1 + 1], uvs[uv2], uvs[uv2 + 1]);
+        return OMM_TRIANGLE_CACHE.computeIfAbsent(key, k -> classifyTriangle(level, bytesPerTriangle, k.sprite(),
+                k.u0(), k.v0(), k.u1(), k.v1(), k.u2(), k.v2()));
+    }
+
+    private static OmmTriangleResult classifyTriangle(int level, int bytesPerTriangle, TextureAtlasSprite sprite,
+                                                      float u0, float v0, float u1, float v1, float u2, float v2) {
+        byte[] data = new byte[bytesPerTriangle];
+        java.util.Arrays.fill(data, OMM_UNKNOWN_OPAQUE_BYTE);
         int grid = 1 << level;
         float invGrid = 1.0f / grid;
-        // counts[0..3] = opaque, transparent, mixed, unsafe
+        // counts[0..3] = opaque, transparent, mixed, unsafe. Triangle index 0 -> block-local offset 0.
         int[] counts = new int[4];
         for (int i = 0; i < grid; i++) {
             for (int j = 0; i + j < grid; j++) {
                 // Upright micro-triangle: corners (i,j) (i+1,j) (i,j+1).
-                classifyMicroTriangle(data, tri, bytesPerTriangle, level, sprite, u0, v0, u1, v1, u2, v2,
+                classifyMicroTriangle(data, 0, bytesPerTriangle, level, sprite, u0, v0, u1, v1, u2, v2,
                         i, j, i + 1, j, i, j + 1, invGrid,
                         (i + 1.0f / 3.0f) * invGrid, (j + 1.0f / 3.0f) * invGrid, counts);
                 // Inverted micro-triangle: corners (i+1,j) (i+1,j+1) (i,j+1).
                 if (i + j < grid - 1) {
-                    classifyMicroTriangle(data, tri, bytesPerTriangle, level, sprite, u0, v0, u1, v1, u2, v2,
+                    classifyMicroTriangle(data, 0, bytesPerTriangle, level, sprite, u0, v0, u1, v1, u2, v2,
                             i + 1, j, i + 1, j + 1, i, j + 1, invGrid,
                             (i + 2.0f / 3.0f) * invGrid, (j + 2.0f / 3.0f) * invGrid, counts);
                 }
             }
         }
-        return new OmmMicroCounts(counts[0], counts[1], counts[2], counts[3]);
+        return new OmmTriangleResult(data, new OmmMicroCounts(counts[0], counts[1], counts[2], counts[3]));
     }
 
     /**
