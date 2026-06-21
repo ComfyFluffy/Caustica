@@ -171,11 +171,10 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                 capture.addBakedQuad(pose, quad, -1); // white tint (falling blocks rarely biome-tinted)
             }
         };
-        try {
-            blockRenderer.tesselateBlock(out, 0, 0, 0, state, state.blockPos, bs, model, bs.getSeed(state.blockPos));
-        } catch (Throwable t) {
-            // skip a moving block whose meshing throws rather than failing the capture
-        }
+        // No local catch: a falling block is an entity (captured via dispatcher.submit), so a meshing
+        // throw propagates to the entity-capture handler in RtEntities, which fails loud like any other
+        // entity rather than silently dropping it.
+        blockRenderer.tesselateBlock(out, 0, 0, 0, state, state.blockPos, bs, model, bs.getSeed(state.blockPos));
     }
 
     // P5.1b-2e: falling blocks (FallingBlockEntity) render their block model here. Capture every part's

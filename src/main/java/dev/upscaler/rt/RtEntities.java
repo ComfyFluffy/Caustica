@@ -303,7 +303,10 @@ public final class RtEntities {
                 // Capture directly in rebased space so the TLAS instance transform is identity.
                 dispatcher.submit(state, cameraState, ix - rbx, iy - rby, iz - rbz, new PoseStack(), collector);
             } catch (Throwable t) {
-                continue; // non-fatal: skip an entity whose extract/submit throws
+                // Fail loud instead of skip-and-limp: a capture throw here is almost always our bug, and
+                // swallowing it leaves the entity invisible every frame plus a per-frame MC CrashReport.
+                // Propagate to composite(), which logs the full trace, disables RT, and reverts to vanilla.
+                throw new RuntimeException("RT entity capture failed", t);
             } finally {
                 collector.begin(null);
             }
@@ -473,9 +476,9 @@ public final class RtEntities {
                 }
             }
         } catch (Throwable t) {
-            capture.reset(); // a mid-capture throw could leave a partial quad — drop particles this frame
+            capture.reset();
             particleDisp.clear();
-            return;
+            throw new RuntimeException("RT particle capture failed", t); // propagate to composite() (see entity path)
         }
         particlePrev = cur;
         if (capture.isEmpty()) {
@@ -575,7 +578,7 @@ public final class RtEntities {
             // Identity pose ⇒ block-local mesh; world placement is the per-frame instance transform in emitBe.
             beDispatcher.submit(state, new PoseStack(), collector, cameraState);
         } catch (Throwable t) {
-            return;
+            throw new RuntimeException("RT block-entity capture failed", t); // propagate to composite() (see entity path)
         } finally {
             collector.begin(null);
         }

@@ -98,6 +98,8 @@ public final class RtTerrain {
     private final List<TessJob> jobs = new ArrayList<>();
     private long tessToken;
     private boolean loggedTessFailure; // log the first worker tessellation failure (should never happen)
+    private static volatile boolean loggedMeshFailure; // first per-block/fluid meshing throw (swallowed below,
+                                                       // so it never reaches the worker-task catch — log once)
     private Pending pending; // in-flight async geometry build, or null
     private RtBuffer sectionTable;
     // Static section instances (BLAS address + sectionOrigin-rebase transform, customIndex = list
@@ -443,7 +445,7 @@ public final class RtTerrain {
                         try {
                             fluidRenderer.tesselate(region, m, fluidCapture, state, fluid);
                         } catch (Throwable t) {
-                            // skip a fluid whose meshing throws rather than failing the section
+                            warnMeshOnce("fluid", t); // skip a fluid whose meshing throws, don't fail the section
                         }
                     }
                     if (state.getRenderShape() != RenderShape.MODEL) {
@@ -458,12 +460,21 @@ public final class RtTerrain {
                         capture.pos = m;
                         renderer.tesselateBlock(capture, lx, ly, lz, region, m, state, model, state.getSeed(m));
                     } catch (Throwable t) {
-                        // skip a block whose model rendering throws rather than failing the section
+                        warnMeshOnce("block model", t); // skip a block whose meshing throws, don't fail the section
                     }
                 }
             }
         }
         return mesh;
+    }
+
+    /** Surface the first per-block/fluid meshing throw (swallowed above to keep one bad block from voiding
+     *  the whole section), then stay quiet. May run on a worker thread; the flag is volatile + one-shot. */
+    private static void warnMeshOnce(String what, Throwable t) {
+        if (!loggedMeshFailure) {
+            loggedMeshFailure = true;
+            UpscalerMod.LOGGER.warn("RT terrain: {} meshing threw (skipped); first occurrence:", what, t);
+        }
     }
 
     /**
