@@ -74,6 +74,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // Resolve this submission's texture to a bindless slot; the capture stamps it on every prim.
         // Block-entity models (chests/signs/beds) texture from an atlas SPRITE: use that atlas + remap
         // the ModelPart 0..1 UVs into the sprite's region. Mobs use a full texture (sprite == null).
+        capture.currentBlockAtlas = false; // model bodies use per-type bindless _s/_n, not the block atlas
         if (sprite != null) {
             capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation());
             capture.currentHasS = false; // atlas-sourced (block-entity sprites) have no per-type _n/_s
@@ -117,10 +118,29 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         capture.currentTexSlot = sprite != null
                 ? RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation())
                 : 0;
-        capture.currentHasS = false; // baked quads (items) are atlas-sourced — no per-type _n/_s
-        capture.currentHasN = false;
+        setBlockMaterial(sprite); // block-atlas sprites (block items/falling/contained blocks) → terrain _s/_n
         capture.currentTranslucent = false; // block/item geometry is opaque (the inner content we want solid)
         capture.addBakedQuad(pose, q, tintColor(q.materialInfo().tintIndex(), tintLayers));
+    }
+
+    /**
+     * Flag the capture's LabPBR _s/_n source for the next quad. Block-like entities (block items, falling
+     * blocks, contained block displays) sample the block atlas, so their material maps live in the terrain
+     * parallel atlases (blockSpecAtlas/blockNormalAtlas) at the SAME UV — reuse {@link RtBlockMaterials}'s
+     * per-sprite presence and let world.rchit sample those (mat code 2). Non-block-atlas sprites (the item
+     * atlas, mob/BE sprite atlases) have no block-atlas material → flags stay off (current behaviour).
+     */
+    private void setBlockMaterial(TextureAtlasSprite sprite) {
+        if (sprite != null && TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
+            int flags = RtBlockMaterials.INSTANCE.ensure(sprite);
+            capture.currentBlockAtlas = true;
+            capture.currentHasS = (flags & RtBlockMaterials.HAS_S) != 0;
+            capture.currentHasN = (flags & RtBlockMaterials.HAS_N) != 0;
+        } else {
+            capture.currentBlockAtlas = false;
+            capture.currentHasS = false;
+            capture.currentHasN = false;
+        }
     }
 
     /** Whether a render type is alpha-blended (translucent) — its pipeline's color target has a blend
@@ -231,8 +251,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             @Override
             public void put(float x, float y, float z, BakedQuad quad, QuadInstance instance) {
                 capture.currentTexSlot = slot;
-                capture.currentHasS = false; // block-atlas sourced — no per-type _n/_s
-                capture.currentHasN = false;
+                setBlockMaterial(quad.materialInfo().sprite()); // block-atlas sprite → terrain _s/_n (mat code 2)
                 capture.currentTranslucent = false; // falling blocks are opaque
                 capture.addBakedQuad(pose, quad, -1); // white tint (falling blocks rarely biome-tinted)
             }

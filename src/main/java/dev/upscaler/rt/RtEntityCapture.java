@@ -33,6 +33,11 @@ public final class RtEntityCapture implements VertexConsumer {
     // Set by the collector per submission; mobs (per-type textures) may have them, atlas-sourced quads don't.
     boolean currentHasS;
     boolean currentHasN;
+    // Block-atlas geometry (dropped/held block items, falling blocks, contained block displays) samples the
+    // BLOCK atlas, so its LabPBR _s/_n live in the terrain parallel atlases (blockSpecAtlas/blockNormalAtlas)
+    // — NOT the per-type bindless arrays. When set, currentHasS/currentHasN refer to those: emitQuad encodes
+    // mat.z/mat.w as 2 (block atlas) instead of 1 (bindless entity), so world.rchit samples the right atlas.
+    boolean currentBlockAtlas;
     // Whether the current submission is an alpha-blended (translucent) render type — slime / sulfur-cube
     // shells, ghosts, … Stored per-prim in the otherwise-unused entity emission lane (normal.w); world.rahit
     // reads it and does stochastic transparency for those surfaces instead of a binary cutout, so the inner
@@ -63,6 +68,7 @@ public final class RtEntityCapture implements VertexConsumer {
         currentTexSlot = 0;
         currentHasS = false;
         currentHasN = false;
+        currentBlockAtlas = false;
         currentTranslucent = false;
         uvRemap = false;
     }
@@ -178,8 +184,11 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot (P5.1b-2b)
             prim.add(RtMaterials.ENTITY_ROUGH); // P6.1: entities default to a matte dielectric
             prim.add(0f);                       // metalness
-            prim.add(currentHasS ? 1f : 0f);    // mat.z: LabPBR _s present (P6.2c)
-            prim.add(currentHasN ? 1f : 0f);    // mat.w: LabPBR _n present (P6.2c)
+            // mat.z / mat.w: LabPBR _s / _n presence + source. 0 = none, 1 = per-type bindless entity atlas
+            // (P6.2c mobs), 2 = block atlas (block-like entities; sampled from the terrain _s/_n atlases).
+            float matSource = currentBlockAtlas ? 2f : 1f;
+            prim.add(currentHasS ? matSource : 0f); // mat.z
+            prim.add(currentHasN ? matSource : 0f); // mat.w
         }
     }
 

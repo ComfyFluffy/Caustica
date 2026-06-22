@@ -253,11 +253,19 @@ void main() {
         vec3 f0 = mix(vec3(0.04), albedo, metal);
         float emission = 0.0;
         float ao = 1.0;
-        // P6.2c LabPBR _s / _n for entities — per-type bindless arrays sampled at the same slot as albedo.
-        if (pr.mat.z > 0.5) {
+        // LabPBR _s / _n for entities. mat.z/mat.w encode the source: 2 = block atlas (block-like entities —
+        // block items / falling / contained blocks; sampled from the terrain parallel atlases at the same UV,
+        // since their geometry textures from the block atlas), 1 = per-type bindless entity arrays (P6.2c mobs).
+        if (pr.mat.z > 1.5) {
+            decodeSpec(textureLod(blockSpecAtlas, euvCoord, 0.0), albedo, rough, metal, f0, emission);
+        } else if (pr.mat.z > 0.5) {
             decodeSpec(texture(entitySpecTex[nonuniformEXT(texSlot)], euvCoord), albedo, rough, metal, f0, emission);
         }
-        if (pr.mat.w > 0.5) {
+        if (pr.mat.w > 1.5) {
+            n = perturbNormal(n, gl_HitTriangleVertexPositionsEXT[0], gl_HitTriangleVertexPositionsEXT[1],
+                    gl_HitTriangleVertexPositionsEXT[2], euv.uv[e0], euv.uv[e1], euv.uv[e2], vdir,
+                    textureLod(blockNormalAtlas, euvCoord, 0.0), ao);
+        } else if (pr.mat.w > 0.5) {
             n = perturbNormal(n, gl_HitTriangleVertexPositionsEXT[0], gl_HitTriangleVertexPositionsEXT[1],
                     gl_HitTriangleVertexPositionsEXT[2], euv.uv[e0], euv.uv[e1], euv.uv[e2], vdir,
                     texture(entityNormalTex[nonuniformEXT(texSlot)], euvCoord), ao);
