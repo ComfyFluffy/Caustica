@@ -350,8 +350,18 @@ public final class RtTerrain {
         if (!missing.isEmpty()) {
             missing.sort((a, b) -> Integer.compare(dist2(a, pcx, psy, pcz), dist2(b, pcx, psy, pcz)));
         }
-        dispatchReextract(level, reextract);
-        dispatchTessellation(level, missing);
+        DispatchContext dispatch = null;
+        if (!reextract.isEmpty()) {
+            dispatch = dispatchContext(level);
+            dispatchReextract(dispatch, reextract);
+        }
+        int dispatchSlots = Math.min(ASYNC_DISPATCH_PER_TICK, Math.max(0, MAX_INFLIGHT - inFlight.size()));
+        if (dispatchSlots > 0 && !missing.isEmpty()) {
+            if (dispatch == null) {
+                dispatch = dispatchContext(level);
+            }
+            dispatchTessellation(dispatch, missing, dispatchSlots);
+        }
         drainTessellation(ctx, prepared, removed);
 
         if (!removed.isEmpty() || !prepared.isEmpty()) {
@@ -612,24 +622,21 @@ public final class RtTerrain {
      * job so nothing mutable is shared across threads; the captured {@code region}, model sets and block
      * colors are read-only. Capped at {@link #ASYNC_DISPATCH_PER_TICK} dispatches per tick.
      */
-    private void dispatchTessellation(ClientLevel level, LongArrayList missing) {
-        if (missing.isEmpty()) {
+    private static DispatchContext dispatchContext(ClientLevel level) {
+        Minecraft mc = Minecraft.getInstance();
+        return new DispatchContext(level, new RenderRegionCache(),
+                mc.getModelManager().getBlockStateModelSet(), mc.getModelManager().getFluidStateModelSet(),
+                mc.getBlockColors());
+    }
+
+    private void dispatchTessellation(DispatchContext dispatch, LongArrayList missing, int budget) {
+        if (missing.isEmpty() || budget <= 0) {
             return;
         }
-        Minecraft mc = Minecraft.getInstance();
-        RenderRegionCache regionCache = new RenderRegionCache();
-        BlockStateModelSet modelSet = mc.getModelManager().getBlockStateModelSet();
-        FluidStateModelSet fluidModelSet = mc.getModelManager().getFluidStateModelSet();
-        BlockColors blockColors = mc.getBlockColors();
-        int budget = ASYNC_DISPATCH_PER_TICK;
-        for (LongIterator it = missing.iterator(); it.hasNext(); ) {
-            if (budget <= 0 || inFlight.size() >= MAX_INFLIGHT) {
-                break;
-            }
+        for (LongIterator it = missing.iterator(); it.hasNext() && budget > 0; ) {
             long key = it.nextLong();
             budget--;
-            dispatchSection(level, regionCache, modelSet, fluidModelSet, blockColors,
-                    key, sectionX(key), sectionY(key), sectionZ(key));
+            dispatchSection(dispatch, key, sectionX(key), sectionY(key), sectionZ(key));
         }
     }
 
@@ -639,15 +646,10 @@ public final class RtTerrain {
      * with a gap — when the new mesh is built (see {@link #startBuild} retiring the replaced geom). This
      * is what prevents the visible flicker on block updates that plain eviction would cause.
      */
-    private void dispatchReextract(ClientLevel level, LongArrayList reextract) {
+    private void dispatchReextract(DispatchContext dispatch, LongArrayList reextract) {
         if (reextract.isEmpty()) {
             return;
         }
-        Minecraft mc = Minecraft.getInstance();
-        RenderRegionCache regionCache = new RenderRegionCache();
-        BlockStateModelSet modelSet = mc.getModelManager().getBlockStateModelSet();
-        FluidStateModelSet fluidModelSet = mc.getModelManager().getFluidStateModelSet();
-        BlockColors blockColors = mc.getBlockColors();
         for (LongIterator it = reextract.iterator(); it.hasNext(); ) {
             long key = it.nextLong();
             // Skip ones the window pass freed this tick (out of view) — they're being retired, not rebuilt.
@@ -655,24 +657,22 @@ public final class RtTerrain {
             if (g == null) {
                 continue;
             }
-            dispatchSection(level, regionCache, modelSet, fluidModelSet, blockColors,
-                    key, g.sx >> 4, g.sy >> 4, g.sz >> 4);
+            dispatchSection(dispatch, key, g.sx >> 4, g.sy >> 4, g.sz >> 4);
         }
     }
 
     /** Snapshot one section on the render thread and submit its tessellation to the worker pool. */
-    private void dispatchSection(ClientLevel level, RenderRegionCache regionCache, BlockStateModelSet modelSet,
-                                 FluidStateModelSet fluidModelSet, BlockColors blockColors, long key, int sx, int sy, int sz) {
-        RenderSectionRegion region = regionCache.createRegion(level, SectionPos.asLong(sx, sy, sz));
+    private void dispatchSection(DispatchContext dispatch, long key, int sx, int sy, int sz) {
+        RenderSectionRegion region = dispatch.regionCache().createRegion(dispatch.level(), SectionPos.asLong(sx, sy, sz));
         long token = ++tessToken;
         Future<CpuSection> future = RtWorkerPool.INSTANCE.submit(() -> {
-            ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, blockColors);
+            ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, dispatch.blockColors());
             QuadCapture capture = new QuadCapture();
-            capture.blockColors = blockColors;
-            FluidRenderer fluidRenderer = new FluidRenderer(fluidModelSet);
+            capture.blockColors = dispatch.blockColors();
+            FluidRenderer fluidRenderer = new FluidRenderer(dispatch.fluidModelSet());
             FluidCapture fluidCapture = new FluidCapture();
             BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
-            return buildCpuSection(region, modelSet, renderer, capture, fluidRenderer, fluidCapture, m, sx, sy, sz);
+            return buildCpuSection(region, dispatch.modelSet(), renderer, capture, fluidRenderer, fluidCapture, m, sx, sy, sz);
         });
         inFlight.put(key, token);
         jobs.add(new TessJob(key, token, sx << 4, sy << 4, sz << 4, future));
@@ -728,6 +728,11 @@ public final class RtTerrain {
 
     /** Pure-CPU worker result: tessellated mesh plus optional opacity micromap input for its cutout bucket. */
     private record CpuSection(PackedSection packed, RtAccel.OpacityMicromapInput opacityMicromap) {
+    }
+
+    /** Per-tick render-thread snapshot dependencies shared by reextract + missing dispatch. */
+    private record DispatchContext(ClientLevel level, RenderRegionCache regionCache, BlockStateModelSet modelSet,
+                                   FluidStateModelSet fluidModelSet, BlockColors blockColors) {
     }
 
     /** Worker-packed terrain buffer payload; upload only allocates buffers and bulk-copies these arrays. */
