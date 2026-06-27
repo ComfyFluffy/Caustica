@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "dlssSdk": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782230425,
+        "narHash": "sha256-U6xH4yxv50CqjG8pqdsJaVbOkPLqrsi0mVSoElYTehQ=",
+        "owner": "NVIDIA",
+        "repo": "DLSS",
+        "rev": "a291cc7d2cc642a51566f3dfd5376f635cd1b284",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NVIDIA",
+        "ref": "v310.7.0",
+        "repo": "DLSS",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1782467914,
+        "narHash": "sha256-pGvFkM8N0xEkIIXDe5YYfbEAvHrk4IxBrjB/x8OomhE=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e73de5be04e0eff4190a1432b946d469c794e7b4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "dlssSdk": "dlssSdk",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

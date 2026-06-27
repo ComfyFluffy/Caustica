@@ -116,25 +116,51 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
 
 def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
-def requiredNgxNatives = [
-	file("native/ngx_shim/out/Release/ngxshim.dll"),
-	file("native/ngx_shim/out/Release/nvngx_dlssd.dll")
+def ngxNativeOutDir = layout.projectDirectory.dir("native/ngx_shim/out")
+def ngxNativePlatforms = [
+	[
+		name: "windows-x64",
+		includes: [
+			"ngxshim.dll",
+			"nvngx_dlssd.dll"
+		]
+	],
+	[
+		name: "linux-x64",
+		includes: [
+			"libngxshim.so",
+			"libnvidia-ngx-dlssd.so*"
+		]
+	]
 ]
 
 def bundleNgxNatives = tasks.register("bundleNgxNatives", Copy) {
 	group = "build"
-	description = "Bundles NGX shim and DLSS DLLs into the mod resources."
-	onlyIf { org.gradle.internal.os.OperatingSystem.current().windows }
-	def outDir = layout.buildDirectory.dir("generated/ngx-natives/upscaler/natives/windows-x64")
-	inputs.files(requiredNgxNatives)
-	into outDir
-	from(requiredNgxNatives)
+	description = "Bundles NGX shim and DLSS native libraries into the mod resources."
+
+	ngxNativePlatforms.each { platform ->
+		def platformFiles = fileTree(ngxNativeOutDir) {
+			include platform.includes
+		}
+		inputs.files(platformFiles).withPropertyName("ngxNatives.${platform.name}")
+		from(platformFiles) {
+			into "upscaler/natives/${platform.name}"
+		}
+	}
+	into ngxNativeGenRoot
 	doFirst {
-		delete(outDir)
-		requiredNgxNatives.each { dll ->
-			if (!dll.isFile()) {
-				throw new GradleException("Missing required NGX native ${dll}.")
+		delete(ngxNativeGenRoot)
+		def foundAny = false
+		ngxNativePlatforms.each { platform ->
+			def platformFiles = fileTree(ngxNativeOutDir) {
+				include platform.includes
+			}.files
+			if (!platformFiles.empty) {
+				foundAny = true
 			}
+		}
+		if (!foundAny) {
+			throw new GradleException("Missing NGX native libraries in ${ngxNativeOutDir.get().asFile}.")
 		}
 	}
 }

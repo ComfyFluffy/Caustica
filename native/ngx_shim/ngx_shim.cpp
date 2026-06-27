@@ -47,7 +47,11 @@ static NVSDK_NGX_Resource_VK makeImageResource(VkImageView view, VkImage image, 
 
 extern "C" {
 
+#if defined(_WIN32)
 #define NGX_SHIM_EXPORT __declspec(dllexport)
+#else
+#define NGX_SHIM_EXPORT __attribute__((visibility("default")))
+#endif
 
 // Last NVSDK_NGX_Result observed, for diagnostics from the Java side.
 NGX_SHIM_EXPORT int ngxshim_last_result() {
