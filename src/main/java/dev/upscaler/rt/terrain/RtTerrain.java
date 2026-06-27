@@ -54,6 +54,7 @@ import org.lwjgl.system.MemoryUtil;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Future;
 
 /**
@@ -82,6 +83,10 @@ public final class RtTerrain {
     // completed meshes, prepares BLASes, and submits the GPU build.
     private static final int ASYNC_DISPATCH_PER_TICK = Integer.getInteger("upscaler.rt.asyncDispatchPerTick", 64);
     private static final int SECTION_RESULTS_PER_TICK = Integer.getInteger("upscaler.rt.sectionResultsPerTick", 64);
+    private static final int ASYNC_DISPATCH_MOVING_PER_TICK = Integer.getInteger("upscaler.rt.asyncDispatchMovingPerTick",
+            Math.min(ASYNC_DISPATCH_PER_TICK, 24));
+    private static final int SECTION_RESULTS_MOVING_PER_TICK = Integer.getInteger("upscaler.rt.sectionResultsMovingPerTick",
+            Math.min(SECTION_RESULTS_PER_TICK, 24));
     // Backpressure cap: stop dispatching once this many sections are in flight. Bounds queue depth and
     // snapshot memory (each RenderSectionRegion holds 27 SectionCopies) when flying through the world.
     private static final int MAX_INFLIGHT = Integer.getInteger("upscaler.rt.maxInflightSections", 192);
@@ -92,6 +97,8 @@ public final class RtTerrain {
     // advances per composite; old TLAS/table/sections are freed this many frames after the swap.
     private static final int KEEP_FRAMES = 4;
     private static final long NO_TESS_TOKEN = Long.MIN_VALUE;
+    private static final int SECTION_TABLE_INITIAL_CAPACITY = Integer.getInteger("upscaler.rt.sectionTableInitialCapacity", 512);
+    private static final int REBASE_DISTANCE_BLOCKS = Integer.getInteger("upscaler.rt.rebaseDistanceBlocks", 128);
 
     private static final RtTerrain INSTANCE = new RtTerrain();
 
@@ -119,12 +126,18 @@ public final class RtTerrain {
     // left the window since dispatch) is dropped. `jobs` holds the outstanding worker futures.
     private final Long2LongOpenHashMap inFlight = new Long2LongOpenHashMap();
     private final List<TessJob> jobs = new ArrayList<>();
+    private final ConcurrentLinkedQueue<TessResult> completedJobs = new ConcurrentLinkedQueue<>();
     private long tessToken;
     private boolean loggedTessFailure; // log the first worker tessellation failure (should never happen)
     private static volatile boolean loggedMeshFailure; // first per-block/fluid meshing throw (swallowed below,
                                                        // so it never reaches the worker-task catch — log once)
     private Pending pending; // in-flight async geometry build, or null
     private RtBuffer sectionTable;
+    private int sectionTableCapacity;
+    private int nextSectionSlot;
+    private final LongArrayList freeSectionSlots = new LongArrayList();
+    private final ArrayList<SectionGeom> sectionSlots = new ArrayList<>();
+    private final ArrayList<RtAccel.Instance> staticInstanceList = new ArrayList<>();
     // Static section instances (BLAS address + sectionOrigin-rebase transform, customIndex = list
     // order = section-table index). Rebuilt on residency change; the per-frame TLAS in RtComposite
     // merges these with dynamic (entity) instances. RtTerrain no longer owns the traced TLAS — it
@@ -299,6 +312,7 @@ public final class RtTerrain {
         List<PreparedSection> prepared = this.prepared;
         prepared.clear();
 
+        boolean movedWindow = windowValid && (windowPcx != pcx || windowPsy != psy || windowPcz != pcz);
         syncDesiredWindow(chunkSource, pcx, psy, pcz, r, loY, hiY, removed);
 
         // Re-extract edited sections. Drain under a short lock so concurrent block updates are not lost.
@@ -312,7 +326,9 @@ public final class RtTerrain {
 
         // Tessellate + upload new sections (BLAS build deferred to rebuild's single batched submission).
         DispatchContext dispatch = null;
-        int dispatchSlots = Math.min(ASYNC_DISPATCH_PER_TICK, Math.max(0, MAX_INFLIGHT - inFlight.size()));
+        int dispatchCap = movedWindow ? ASYNC_DISPATCH_MOVING_PER_TICK : ASYNC_DISPATCH_PER_TICK;
+        int resultCap = movedWindow ? SECTION_RESULTS_MOVING_PER_TICK : SECTION_RESULTS_PER_TICK;
+        int dispatchSlots = Math.min(dispatchCap, Math.max(0, MAX_INFLIGHT - inFlight.size()));
         if (dispatchSlots > 0 && !reextract.isEmpty()) {
             dispatch = dispatchContext(level);
             dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots);
@@ -323,7 +339,7 @@ public final class RtTerrain {
             }
             dispatchTessellation(dispatch, chunkSource, dispatchSlots);
         }
-        drainTessellation(ctx, prepared, removed);
+        drainTessellation(ctx, prepared, removed, resultCap);
 
         if (!removed.isEmpty() || !prepared.isEmpty()) {
             startBuild(ctx, prepared, removed, pbx, pby, pbz);
@@ -804,17 +820,26 @@ public final class RtTerrain {
     private void dispatchSection(DispatchContext dispatch, long key, int sx, int sy, int sz) {
         RenderSectionRegion region = dispatch.regionCache().createRegion(dispatch.level(), SectionPos.asLong(sx, sy, sz));
         long token = ++tessToken;
-        Future<CpuSection> future = RtWorkerPool.INSTANCE.submit(() -> {
-            ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, dispatch.blockColors());
-            QuadCapture capture = new QuadCapture();
-            capture.blockColors = dispatch.blockColors();
-            FluidRenderer fluidRenderer = new FluidRenderer(dispatch.fluidModelSet());
-            FluidCapture fluidCapture = new FluidCapture();
-            BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
-            return buildCpuSection(region, dispatch.modelSet(), renderer, capture, fluidRenderer, fluidCapture, m, sx, sy, sz);
+        TessJob job = new TessJob(key, token, sx << 4, sy << 4, sz << 4);
+        Future<?> future = RtWorkerPool.INSTANCE.submit(() -> {
+            try {
+                ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, dispatch.blockColors());
+                QuadCapture capture = new QuadCapture();
+                capture.blockColors = dispatch.blockColors();
+                FluidRenderer fluidRenderer = new FluidRenderer(dispatch.fluidModelSet());
+                FluidCapture fluidCapture = new FluidCapture();
+                BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+                CpuSection cpu = buildCpuSection(region, dispatch.modelSet(), renderer, capture, fluidRenderer, fluidCapture, m, sx, sy, sz);
+                completedJobs.add(new TessResult(job, cpu, null));
+            } catch (Throwable t) {
+                completedJobs.add(new TessResult(job, null, t));
+                throw t;
+            }
+            return null;
         });
+        job.future = future;
         inFlight.put(key, token);
-        jobs.add(new TessJob(key, token, sx << 4, sy << 4, sz << 4, future));
+        jobs.add(job);
     }
 
     /**
@@ -822,44 +847,44 @@ public final class RtTerrain {
      * render thread. A job whose token no longer matches {@link #inFlight} is stale — its section was
      * re-dirtied / unloaded / left the window since dispatch — and is dropped without uploading.
      */
-    private void drainTessellation(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed) {
-        int budget = SECTION_RESULTS_PER_TICK;
-        for (Iterator<TessJob> it = jobs.iterator(); it.hasNext() && budget > 0; ) {
-            TessJob job = it.next();
-            if (!job.future().isDone()) {
-                continue;
+    private void drainTessellation(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed, int resultCap) {
+        int budget = resultCap;
+        int attempts = resultCap * 4;
+        while (budget > 0 && attempts-- > 0) {
+            TessResult result = completedJobs.poll();
+            if (result == null) {
+                break;
             }
-            it.remove();
-            CpuSection cpu;
-            try {
-                cpu = job.future().get();
-            } catch (Exception e) {
-                inFlight.remove(job.key());
+            TessJob job = result.job();
+            jobs.remove(job);
+            if (result.failure() != null) {
+                inFlight.remove(job.key);
                 if (!loggedTessFailure) {
                     loggedTessFailure = true;
                     UpscalerMod.LOGGER.warn("async terrain: tessellation task failed for section {},{},{}",
-                            job.sox() >> 4, job.soy() >> 4, job.soz() >> 4, e);
+                            job.sox >> 4, job.soy >> 4, job.soz >> 4, result.failure());
                 }
                 continue;
             }
-            long expected = inFlight.get(job.key());
-            boolean valid = expected == job.token();
+            long expected = inFlight.get(job.key);
+            boolean valid = expected == job.token;
             if (!valid) {
                 continue; // stale result; a newer dispatch (or none) supersedes it
             }
-            inFlight.remove(job.key());
-            PackedSection packed = cpu.packed();
+            inFlight.remove(job.key);
+            PackedSection packed = result.cpu().packed();
             if (packed == null) {
                 // Legitimately empty (air or fully-enclosed). If this was an in-place re-extract whose new
                 // state is empty, evict the old geom and retire it via the build swap (a startBuild runs
                 // because `removed` is now non-empty).
-                SectionGeom prev = resident.remove(job.key());
+                SectionGeom prev = resident.remove(job.key);
                 if (prev != null) {
                     removed.add(prev);
                 }
-                empty.add(job.key());
+                empty.add(job.key);
+                budget--;
             } else {
-                prepared.add(uploadSection(ctx, packed, cpu.opacityMicromap(), job.key(), job.sox(), job.soy(), job.soz()));
+                prepared.add(uploadSection(ctx, packed, result.cpu().opacityMicromap(), job.key, job.sox, job.soy, job.soz));
                 budget--;
             }
         }
@@ -889,88 +914,50 @@ public final class RtTerrain {
     private record Deferred(long freeFrame, Runnable free) {
     }
 
-    /** An outstanding async tessellation: {@code future} yields the section's CPU payload on a worker. */
-    private record TessJob(long key, long token, int sox, int soy, int soz, Future<CpuSection> future) {
+    /** An outstanding async tessellation; completed results are delivered through {@link #completedJobs}. */
+    private static final class TessJob {
+        final long key;
+        final long token;
+        final int sox;
+        final int soy;
+        final int soz;
+        Future<?> future;
+
+        TessJob(long key, long token, int sox, int soy, int soz) {
+            this.key = key;
+            this.token = token;
+            this.sox = sox;
+            this.soy = soy;
+            this.soz = soz;
+        }
+    }
+
+    private record TessResult(TessJob job, CpuSection cpu, Throwable failure) {
     }
 
     /** An in-flight async BLAS build: the new section geometry/instances land when {@code op} completes. */
-    private record Pending(RtContext.AsyncSubmit op, List<RtAccel.PreparedBlas> blas, RtBuffer newTable,
-                           List<RtAccel.Instance> newInstances, LongOpenHashSet newPublished, List<SectionGeom> removed, int rbx, int rby, int rbz) {
+    private record Pending(RtContext.AsyncSubmit op, List<RtAccel.PreparedBlas> blas,
+                           List<PreparedSection> prepared, List<SectionGeom> removed,
+                           boolean rebase, int rbx, int rby, int rbz) {
     }
 
     /**
-     * Start an async geometry build. The new sections are added to residency and their BLAS are built
-     * off the render thread; the previously-published instance list + table stay live and traceable
-     * (against the old, already-built BLAS) until {@link #finalizePending} swaps the result in. The
-     * TLAS is no longer built here — {@link RtComposite} rebuilds it per frame from {@link
-     * #staticInstances()} plus dynamic instances. {@code rbx/rby/rbz} is the new rebase origin.
+     * Start an async geometry build. Prepared sections are published only after their BLAS build completes;
+     * the previous section table stays immutable for in-flight frames, and the next publish copies it and
+     * patches only changed slots. The TLAS is rebuilt per frame by {@link RtComposite}.
      */
     private void startBuild(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed, int rbx, int rby, int rbz) {
-        for (PreparedSection ps : prepared) {
-            SectionGeom prev = resident.put(ps.key(), new SectionGeom(ps.positions(), ps.indices(), ps.uvs(), ps.material(), ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.waterGeom(), ps.sx(), ps.sy(), ps.sz()));
-            if (prev != null) {
-                // Re-extracted section (in-place rebuild): the old geometry stayed traced until now;
-                // retire it with the swap so there's no eviction gap and no leak.
-                removed.add(prev);
-            }
-        }
-
-        int residentCount = resident.size();
-        if (residentCount == 0) {
-            // Everything left the window: retire the current table + removed sections, go not-ready.
-            long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-            retire(freeAt, sectionTable, removed);
-            sectionTable = null;
-            staticInstances = null;
-            published.clear();
-            ready = false;
+        boolean rebase = shouldRebase(rbx, rby, rbz);
+        if (prepared.isEmpty()) {
+            applyBuildChanges(ctx, List.of(), removed, rebase, rbx, rby, rbz);
             return;
         }
-
-        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        RtBuffer newTable = pool.acquire(ctx, (long) residentCount * SECTION_ENTRY_BYTES, storage, true,
-                "terrain section table " + residentCount + " sections");
-        List<RtAccel.Instance> instances = new ArrayList<>(residentCount);
-        LongOpenHashSet newPublished = new LongOpenHashSet(residentCount);
-        int i = 0;
-        for (ObjectIterator<Long2ObjectMap.Entry<SectionGeom>> it = resident.long2ObjectEntrySet().fastIterator(); it.hasNext(); i++) {
-            Long2ObjectMap.Entry<SectionGeom> e = it.next();
-            SectionGeom g = e.getValue();
-            newPublished.add(e.getLongKey());
-            long base = newTable.mapped + (long) i * SECTION_ENTRY_BYTES;
-            MemoryUtil.memPutLong(base, g.material.deviceAddress);
-            MemoryUtil.memPutLong(base + 8, g.indices.deviceAddress);
-            MemoryUtil.memPutLong(base + 16, g.uvs.deviceAddress);
-            MemoryUtil.memPutInt(base + 24, g.triBase[0]); // hit shaders add triBase[gl_GeometryIndexEXT] to gl_PrimitiveID
-            MemoryUtil.memPutInt(base + 28, g.triBase[1]);
-            MemoryUtil.memPutInt(base + 32, g.triBase[2]);
-            MemoryUtil.memPutInt(base + 36, g.waterGeom); // gl_GeometryIndexEXT of the water geom (NO_WATER_GEOM = none)
-            // instanceCustomIndex == section-table index i (< ENTITY_BIT, so the hit shader takes the
-            // terrain path). The BLAS device address is valid now even though its contents finish
-            // building async — the instance list is only published (and traced) once the build completes.
-            float[] xform = {1, 0, 0, g.sx - rbx, 0, 1, 0, g.sy - rby, 0, 0, 1, g.sz - rbz};
-            instances.add(new RtAccel.Instance(xform, g.blas.deviceAddress, i));
-        }
-
         List<RtAccel.PreparedBlas> blasBuilds = new ArrayList<>(prepared.size());
         for (PreparedSection ps : prepared) {
             blasBuilds.add(ps.blas());
         }
-        if (blasBuilds.isEmpty()) {
-            long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-            retire(freeAt, sectionTable, removed);
-            sectionTable = newTable;
-            staticInstances = instances;
-            published = newPublished;
-            blockX = rbx;
-            blockY = rby;
-            blockZ = rbz;
-            ready = true;
-            return;
-        }
-        // BLAS-only async build; remove-only batches published above without a queue submit.
         RtContext.AsyncSubmit op = ctx.submitAsync(cmd -> RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds));
-        pending = new Pending(op, blasBuilds, newTable, instances, newPublished, removed, rbx, rby, rbz);
+        pending = new Pending(op, blasBuilds, new ArrayList<>(prepared), new ArrayList<>(removed), rebase, rbx, rby, rbz);
     }
 
     /** Swap a completed async build in: retire old table + removed sections, publish the new instances/table. */
@@ -979,15 +966,172 @@ public final class RtTerrain {
         pending = null;
         ctx.freeAsync(p.op());
         RtAccel.freeBlasScratch(pool, p.blas()); // build done -> BLAS scratch safe to reuse
+        applyBuildChanges(ctx, p.prepared(), p.removed(), p.rebase(), p.rbx(), p.rby(), p.rbz());
+    }
+
+    private boolean shouldRebase(int rbx, int rby, int rbz) {
+        return !ready || sectionTable == null || staticInstances == null
+                || Math.abs(rbx - blockX) > REBASE_DISTANCE_BLOCKS
+                || Math.abs(rby - blockY) > REBASE_DISTANCE_BLOCKS
+                || Math.abs(rbz - blockZ) > REBASE_DISTANCE_BLOCKS;
+    }
+
+    private void applyBuildChanges(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed,
+                                   boolean rebase, int rbx, int rby, int rbz) {
         long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-        retire(freeAt, sectionTable, p.removed());
-        sectionTable = p.newTable();
-        staticInstances = p.newInstances();
-        published = p.newPublished();
-        blockX = p.rbx();
-        blockY = p.rby();
-        blockZ = p.rbz();
+        int baseX = rebase ? rbx : blockX;
+        int baseY = rebase ? rby : blockY;
+        int baseZ = rebase ? rbz : blockZ;
+
+        for (SectionGeom g : removed) {
+            removePublishedSection(g);
+        }
+        retire(freeAt, null, removed);
+
+        if (!prepared.isEmpty()) {
+            ensureSectionTableCapacity(ctx, liveSlotCapacity(prepared), freeAt);
+        }
+
+        for (PreparedSection ps : prepared) {
+            SectionGeom prev = resident.get(ps.key());
+            SectionGeom g = new SectionGeom(ps.key(), ps.positions(), ps.indices(), ps.uvs(), ps.material(),
+                    ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.waterGeom(), ps.sx(), ps.sy(), ps.sz());
+            if (prev != null && prev.slot >= 0) {
+                g.slot = prev.slot;
+                g.instanceIndex = prev.instanceIndex;
+                sectionSlots.set(g.slot, g);
+                resident.put(ps.key(), g);
+                writeSectionEntry(g);
+                staticInstanceList.set(g.instanceIndex, instanceFor(g, baseX, baseY, baseZ));
+                retire(freeAt, null, List.of(prev));
+            } else {
+                g.slot = allocateSectionSlot();
+                g.instanceIndex = staticInstanceList.size();
+                sectionSlots.set(g.slot, g);
+                resident.put(ps.key(), g);
+                writeSectionEntry(g);
+                staticInstanceList.add(instanceFor(g, baseX, baseY, baseZ));
+            }
+            published.add(ps.key());
+        }
+
+        if (resident.isEmpty()) {
+            retire(freeAt, sectionTable, List.of());
+            sectionTable = null;
+            sectionTableCapacity = 0;
+            nextSectionSlot = 0;
+            freeSectionSlots.clear();
+            sectionSlots.clear();
+            staticInstanceList.clear();
+            staticInstances = null;
+            published.clear();
+            ready = false;
+            return;
+        }
+
+        if (rebase) {
+            for (int i = 0, n = staticInstanceList.size(); i < n; i++) {
+                RtAccel.Instance inst = staticInstanceList.get(i);
+                SectionGeom g = sectionSlots.get(inst.customIndex());
+                staticInstanceList.set(i, instanceFor(g, baseX, baseY, baseZ));
+            }
+            blockX = rbx;
+            blockY = rby;
+            blockZ = rbz;
+        }
+        staticInstances = staticInstanceList;
         ready = true;
+    }
+
+    private int liveSlotCapacity(List<PreparedSection> prepared) {
+        int needed = nextSectionSlot;
+        int free = freeSectionSlots.size();
+        for (PreparedSection ps : prepared) {
+            SectionGeom prev = resident.get(ps.key());
+            if (prev != null && prev.slot >= 0) {
+                needed = Math.max(needed, prev.slot + 1);
+            } else if (free > 0) {
+                free--;
+            } else {
+                needed++;
+            }
+        }
+        return needed;
+    }
+
+    private void ensureSectionTableCapacity(RtContext ctx, int minCapacity, long freeAt) {
+        int capacity = Math.max(SECTION_TABLE_INITIAL_CAPACITY, 1);
+        capacity = Math.max(capacity, sectionTableCapacity);
+        while (capacity < minCapacity) {
+            capacity <<= 1;
+        }
+        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        RtBuffer newTable = pool.acquire(ctx, (long) capacity * SECTION_ENTRY_BYTES, storage, true,
+                "terrain section table " + capacity + " slots");
+        RtBuffer oldTable = sectionTable;
+        int oldCapacity = sectionTableCapacity;
+        sectionTable = newTable;
+        sectionTableCapacity = capacity;
+        if (oldTable != null && oldCapacity > 0) {
+            MemoryUtil.memCopy(oldTable.mapped, newTable.mapped, (long) oldCapacity * SECTION_ENTRY_BYTES);
+        }
+        if (oldTable != null) {
+            retire(freeAt, oldTable, List.of());
+        }
+    }
+
+    private int allocateSectionSlot() {
+        int slot;
+        if (!freeSectionSlots.isEmpty()) {
+            slot = (int) freeSectionSlots.removeLong(freeSectionSlots.size() - 1);
+        } else {
+            slot = nextSectionSlot++;
+        }
+        while (sectionSlots.size() <= slot) {
+            sectionSlots.add(null);
+        }
+        return slot;
+    }
+
+    private void removePublishedSection(SectionGeom g) {
+        SectionGeom current = resident.get(g.key);
+        if (current == g) {
+            resident.remove(g.key);
+        }
+        published.remove(g.key);
+        if (g.instanceIndex >= 0) {
+            int removeIndex = g.instanceIndex;
+            int lastIndex = staticInstanceList.size() - 1;
+            if (removeIndex != lastIndex) {
+                RtAccel.Instance moved = staticInstanceList.get(lastIndex);
+                staticInstanceList.set(removeIndex, moved);
+                SectionGeom movedGeom = sectionSlots.get(moved.customIndex());
+                movedGeom.instanceIndex = removeIndex;
+            }
+            staticInstanceList.remove(lastIndex);
+            g.instanceIndex = -1;
+        }
+        if (g.slot >= 0) {
+            sectionSlots.set(g.slot, null);
+            freeSectionSlots.add(g.slot);
+            g.slot = -1;
+        }
+    }
+
+    private void writeSectionEntry(SectionGeom g) {
+        long base = sectionTable.mapped + (long) g.slot * SECTION_ENTRY_BYTES;
+        MemoryUtil.memPutLong(base, g.material.deviceAddress);
+        MemoryUtil.memPutLong(base + 8, g.indices.deviceAddress);
+        MemoryUtil.memPutLong(base + 16, g.uvs.deviceAddress);
+        MemoryUtil.memPutInt(base + 24, g.triBase[0]);
+        MemoryUtil.memPutInt(base + 28, g.triBase[1]);
+        MemoryUtil.memPutInt(base + 32, g.triBase[2]);
+        MemoryUtil.memPutInt(base + 36, g.waterGeom);
+    }
+
+    private static RtAccel.Instance instanceFor(SectionGeom g, int rbx, int rby, int rbz) {
+        float[] xform = {1, 0, 0, g.sx - rbx, 0, 1, 0, g.sy - rby, 0, 0, 1, g.sz - rbz};
+        return new RtAccel.Instance(xform, g.blas.deviceAddress, g.slot);
     }
 
     /** Queue old GPU resources for a frames-in-flight-safe free at {@code freeFrame}. */
@@ -1021,9 +1165,12 @@ public final class RtTerrain {
             return;
         }
         for (TessJob job : jobs) {
-            job.future().cancel(true);
+            if (job.future != null) {
+                job.future.cancel(true);
+            }
         }
         jobs.clear();
+        completedJobs.clear();
         inFlight.clear();
     }
 
@@ -1047,6 +1194,11 @@ public final class RtTerrain {
             empty.clear();
             staticInstances = null;
             published.clear();
+            sectionTableCapacity = 0;
+            nextSectionSlot = 0;
+            freeSectionSlots.clear();
+            sectionSlots.clear();
+            staticInstanceList.clear();
             removed.clear();
             prepared.clear();
             if (destroyPool) {
@@ -1058,9 +1210,11 @@ public final class RtTerrain {
         if (pending != null) {
             ctx.freeAsync(pending.op());
             RtAccel.freeBlasScratch(pool, pending.blas());
-            pool.release(pending.newTable());
-            // The new sections' BLAS were added to `resident` in startBuild, so resident's destroy
-            // below frees them; only the removed (already out of resident) need freeing here.
+            for (PreparedSection ps : pending.prepared()) {
+                SectionGeom g = new SectionGeom(ps.key(), ps.positions(), ps.indices(), ps.uvs(), ps.material(),
+                        ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.waterGeom(), ps.sx(), ps.sy(), ps.sz());
+                g.destroy(pool);
+            }
             for (SectionGeom g : pending.removed()) {
                 g.destroy(pool);
             }
@@ -1074,6 +1228,11 @@ public final class RtTerrain {
             pool.release(sectionTable);
             sectionTable = null;
         }
+        sectionTableCapacity = 0;
+        nextSectionSlot = 0;
+        freeSectionSlots.clear();
+        sectionSlots.clear();
+        staticInstanceList.clear();
         for (SectionGeom g : resident.values()) {
             g.destroy(pool);
         }
@@ -1120,6 +1279,7 @@ public final class RtTerrain {
 
     /** GPU residency for one section: geometry buffers + BLAS + world section origin. */
     private static final class SectionGeom {
+        final long key;
         final RtBuffer positions;
         final RtBuffer indices;
         final RtBuffer uvs;
@@ -1131,8 +1291,12 @@ public final class RtTerrain {
         final int sx;
         final int sy;
         final int sz;
+        int slot = -1;
+        int instanceIndex = -1;
 
-        SectionGeom(RtBuffer positions, RtBuffer indices, RtBuffer uvs, RtBuffer material, RtAccel blas, RtBuffer blasBacking, int[] triBase, int waterGeom, int sx, int sy, int sz) {
+        SectionGeom(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs, RtBuffer material,
+                    RtAccel blas, RtBuffer blasBacking, int[] triBase, int waterGeom, int sx, int sy, int sz) {
+            this.key = key;
             this.positions = positions;
             this.indices = indices;
             this.uvs = uvs;
