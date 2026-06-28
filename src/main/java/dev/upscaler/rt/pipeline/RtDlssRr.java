@@ -23,6 +23,9 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Stream;
 
 /**
  * DLSS Ray Reconstruction backend for the RT renderer. Runs the DLSSD (Ray Reconstruction) feature
@@ -35,9 +38,7 @@ public final class RtDlssRr {
         return UpscalerConfig.Rt.DlssRr.ENABLED.value();
     }
 
-    private static final String SHIM_DLL = "ngxshim.dll";
-    private static final String RR_DLL = "nvngx_dlssd.dll";
-    private static final String BUNDLED_NATIVE_DIR = "/upscaler/natives/windows-x64/";
+    private static final PlatformNatives PLATFORM_NATIVES = PlatformNatives.current();
     // DLSS feature flags. IsHDR (bit 0): color is linear HDR (rgba16f) — RR requires it ("HDR Color
     // required"). MVLowRes (bit 1): motion vectors are at render/input resolution, not display — RR
     // requires it ("Low resolution Motion Vectors required"). AutoExposure (bit 6): in HDR mode DLSS
@@ -184,13 +185,19 @@ public final class RtDlssRr {
         if (initialized) {
             return;
         }
-        Path shim = locate(SHIM_DLL);
+        if (!PLATFORM_NATIVES.supported) {
+            throw new IllegalStateException("DLSS-RR NGX natives are not bundled for "
+                    + PLATFORM_NATIVES.platformDir);
+        }
+        Path shim = locateShim();
         if (shim == null) {
-            throw new IllegalStateException(SHIM_DLL + " not found (bundled natives or -Dupscaler.ngx.path)");
+            throw new IllegalStateException(PLATFORM_NATIVES.shimName
+                    + " not found (bundled natives or -Dupscaler.ngx.path)");
         }
         Path nativesDir = shim.getParent();
-        if (nativesDir != null && !Files.isRegularFile(nativesDir.resolve(RR_DLL))) {
-            UpscalerMod.LOGGER.warn("{} not found next to {}; DLSS-RR availability will fail", RR_DLL, SHIM_DLL);
+        if (nativesDir != null && !hasFeatureLibrary(nativesDir)) {
+            UpscalerMod.LOGGER.warn("{} not found next to {}; DLSS-RR availability will fail",
+                    PLATFORM_NATIVES.featureDescription(), PLATFORM_NATIVES.shimName);
         }
 
         lib = NgxLibrary.load(shim);
@@ -294,28 +301,31 @@ public final class RtDlssRr {
         dst.setAtIndex(ValueLayout.JAVA_FLOAT, 15, m.m33());
     }
 
-    private static Path locate(String name) {
+    private static Path locateShim() {
         String override = UpscalerConfig.Ngx.PATH.get();
-        if (override != null && name.equals(SHIM_DLL)) {
+        if (override != null && !override.isBlank()) {
             Path p = Path.of(override);
+            if (Files.isDirectory(p)) {
+                p = p.resolve(PLATFORM_NATIVES.shimName);
+            }
             return Files.isRegularFile(p) ? p : null;
         }
-        if (name.equals(SHIM_DLL)) {
-            Path bundled = extractBundledNatives();
-            if (bundled != null) {
-                return bundled;
-            }
+        Path bundled = extractBundledNatives();
+        if (bundled != null) {
+            return bundled;
         }
         return null;
     }
 
     private static Path extractBundledNatives() {
-        Path dir = FabricLoader.getInstance().getGameDir().resolve("upscaler-ngx").resolve("natives");
+        Path dir = FabricLoader.getInstance().getGameDir().resolve("upscaler-ngx")
+                .resolve("natives").resolve(PLATFORM_NATIVES.platformDir);
         try {
             Files.createDirectories(dir);
-            boolean hasShim = extractBundledNative(SHIM_DLL, dir.resolve(SHIM_DLL));
-            extractBundledNative(RR_DLL, dir.resolve(RR_DLL));
-            return hasShim && Files.isRegularFile(dir.resolve(SHIM_DLL)) ? dir.resolve(SHIM_DLL) : null;
+            boolean hasShim = extractBundledNative(PLATFORM_NATIVES.shimName, dir.resolve(PLATFORM_NATIVES.shimName));
+            extractBundledFeatureLibraries(dir);
+            return hasShim && Files.isRegularFile(dir.resolve(PLATFORM_NATIVES.shimName))
+                    ? dir.resolve(PLATFORM_NATIVES.shimName) : null;
         } catch (IOException e) {
             UpscalerMod.LOGGER.warn("Could not extract bundled NGX natives to {}", dir, e);
             return null;
@@ -323,7 +333,7 @@ public final class RtDlssRr {
     }
 
     private static boolean extractBundledNative(String name, Path dst) throws IOException {
-        String resource = BUNDLED_NATIVE_DIR + name;
+        String resource = PLATFORM_NATIVES.resourceDir() + name;
         try (InputStream in = RtDlssRr.class.getResourceAsStream(resource)) {
             if (in == null) {
                 return false;
@@ -336,11 +346,81 @@ public final class RtDlssRr {
         }
     }
 
+    private static void extractBundledFeatureLibraries(Path dir) throws IOException {
+        if (PLATFORM_NATIVES.exactFeatureName != null) {
+            extractBundledNative(PLATFORM_NATIVES.exactFeatureName, dir.resolve(PLATFORM_NATIVES.exactFeatureName));
+            return;
+        }
+        for (String name : bundledFeatureLibraryNames()) {
+            extractBundledNative(name, dir.resolve(name));
+        }
+    }
+
+    private static List<String> bundledFeatureLibraryNames() {
+        List<String> names = new ArrayList<>();
+        FabricLoader.getInstance().getModContainer("upscaler").ifPresent(container -> {
+            String nativeDir = "upscaler/natives/" + PLATFORM_NATIVES.platformDir;
+            for (Path root : container.getRootPaths()) {
+                Path dir = root.resolve(nativeDir);
+                if (!Files.isDirectory(dir)) {
+                    continue;
+                }
+                try (Stream<Path> files = Files.list(dir)) {
+                    files.map(path -> path.getFileName().toString())
+                            .filter(PLATFORM_NATIVES::isFeatureLibrary)
+                            .forEach(names::add);
+                } catch (IOException e) {
+                    UpscalerMod.LOGGER.warn("Could not list bundled NGX natives in {}", dir, e);
+                }
+            }
+        });
+        return names;
+    }
+
+    private static boolean hasFeatureLibrary(Path dir) {
+        if (PLATFORM_NATIVES.exactFeatureName != null) {
+            return Files.isRegularFile(dir.resolve(PLATFORM_NATIVES.exactFeatureName));
+        }
+        try (Stream<Path> files = Files.list(dir)) {
+            return files.map(path -> path.getFileName().toString()).anyMatch(PLATFORM_NATIVES::isFeatureLibrary);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     private static boolean sameBytes(Path path, byte[] bytes) throws IOException {
         try {
             return Files.size(path) == bytes.length && Arrays.equals(Files.readAllBytes(path), bytes);
         } catch (NoSuchFileException e) {
             return false;
+        }
+    }
+
+    private record PlatformNatives(String platformDir, String shimName, String exactFeatureName,
+                                   String featureNamePrefix, boolean supported) {
+        private static PlatformNatives current() {
+            String os = System.getProperty("os.name", "").toLowerCase();
+            String arch = System.getProperty("os.arch", "").toLowerCase();
+            boolean x64 = arch.equals("x86_64") || arch.equals("amd64");
+            if (os.contains("win") && x64) {
+                return new PlatformNatives("windows-x64", "ngxshim.dll", "nvngx_dlssd.dll", null, true);
+            }
+            if (os.contains("linux") && x64) {
+                return new PlatformNatives("linux-x64", "libngxshim.so", null, "libnvidia-ngx-dlssd.so", true);
+            }
+            return new PlatformNatives(os + "/" + arch, System.mapLibraryName("ngxshim"), null, null, false);
+        }
+
+        private String resourceDir() {
+            return "/upscaler/natives/" + platformDir + "/";
+        }
+
+        private boolean isFeatureLibrary(String name) {
+            return exactFeatureName != null ? exactFeatureName.equals(name) : name.startsWith(featureNamePrefix);
+        }
+
+        private String featureDescription() {
+            return exactFeatureName != null ? exactFeatureName : featureNamePrefix + "*";
         }
     }
 }

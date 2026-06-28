@@ -28,6 +28,7 @@
           jdk = pkgs.jdk25;
 
           runtimeLibs = with pkgs; [
+            flite
             alsa-lib
             libGL
             libx11
