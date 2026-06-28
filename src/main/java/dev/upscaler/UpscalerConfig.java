@@ -618,6 +618,13 @@ public final class UpscalerConfig {
              * is the prerequisite for keeping UI out of the world tonemap once HDR presentation lands.
              */
             public static final BooleanSetting UI_OVERLAY = bool("upscaler.rt.hdr.uiOverlay", false);
+            /**
+             * Phase 2 step B: create Minecraft's swapchain in scRGB (R16G16B16A16_SFLOAT /
+             * EXTENDED_SRGB_LINEAR) instead of SDR, when the surface advertises it. Default off, falls back to
+             * SDR when unavailable. NOTE: until the HDR compositor (step C) writes correct scRGB content, the
+             * presented image will look wrong with this on — it only proves the swapchain path.
+             */
+            public static final BooleanSetting SCRGB_SWAPCHAIN = bool("upscaler.rt.hdr.scrgbSwapchain", false);
 
             private Hdr() {
             }
