@@ -1,4 +1,5 @@
 .gradle/
+.idea/
 build/
 run/
 out/
@@ -7,3 +8,4 @@ out/
 # SPIR-V is generated from shaders/rt/* by the compileShaders gradle task; never tracked.
 *.spv
 third_party/
+bin/
