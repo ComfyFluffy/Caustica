@@ -30,6 +30,18 @@ loom {
 			runDir = "run"
 			// java.lang.foreign restricted methods (FFM bindings to amd_fidelityfx_vk.dll)
 			vmArg "--enable-native-access=ALL-UNNAMED"
+
+            // NVIDIA NGX (DLSS) allocates ~1MB on the stack during init, which overflows Java's default 1MB thread stack.
+            // pass -Xss here directly so the main render thread is resized before the VM parses JAVA_TOOL_OPTIONS.
+            vmArg "-Xss16m"
+
+            // NixOS fix: Gradle forks drop the dev-shell's LD_LIBRARY_PATH.
+            // We manually add the driver path so NGX can successfully dlopen libnvidia-ngx.so.1.
+            if (file("/run/opengl-driver/lib").exists()) {
+                def inherited = System.getenv("LD_LIBRARY_PATH")
+                environmentVariable "LD_LIBRARY_PATH",
+                        inherited ? "/run/opengl-driver/lib:${inherited}" : "/run/opengl-driver/lib"
+            }
 		}
 
 		server {
@@ -116,19 +128,26 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
 
 def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
-def ngxNativeOutDir = layout.projectDirectory.dir("native/ngx_shim/out")
+def ngxNativeConfig = (findProperty("ngxNativeConfig") ?: "release").toString().toLowerCase(java.util.Locale.ROOT)
+def ngxNativeRoot = layout.buildDirectory.dir("native/ngx_shim").get().asFile
+def ngxShimOutDir = new File(ngxNativeRoot, ngxNativeConfig)
+def ngxVendorRoot = new File(ngxNativeRoot, "vendor")
 def ngxNativePlatforms = [
 	[
 		name: "windows-x64",
-		includes: [
-			"ngxshim.dll",
+		shimIncludes: [
+			"ngxshim.dll"
+		],
+		vendorIncludes: [
 			"nvngx_dlssd.dll"
 		]
 	],
 	[
 		name: "linux-x64",
-		includes: [
-			"libngxshim.so",
+		shimIncludes: [
+			"libngxshim.so"
+		],
+		vendorIncludes: [
 			"libnvidia-ngx-dlssd.so*"
 		]
 	]
@@ -139,28 +158,45 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives", Copy) {
 	description = "Bundles NGX shim and DLSS native libraries into the mod resources."
 
 	ngxNativePlatforms.each { platform ->
-		def platformFiles = fileTree(ngxNativeOutDir) {
-			include platform.includes
+		def platformShimFiles = fileTree(ngxShimOutDir) {
+			include platform.shimIncludes
 		}
-		inputs.files(platformFiles).withPropertyName("ngxNatives.${platform.name}")
-		from(platformFiles) {
+		def platformVendorFiles = fileTree(new File(ngxVendorRoot, platform.name)) {
+			include platform.vendorIncludes
+		}
+		inputs.files(platformShimFiles).withPropertyName("ngxNatives.${platform.name}.shim")
+		inputs.files(platformVendorFiles).withPropertyName("ngxNatives.${platform.name}.vendor")
+		from(platformShimFiles) {
+			into "upscaler/natives/${platform.name}"
+		}
+		from(platformVendorFiles) {
 			into "upscaler/natives/${platform.name}"
 		}
 	}
 	into ngxNativeGenRoot
 	doFirst {
 		delete(ngxNativeGenRoot)
-		def foundAny = false
+		def foundShim = false
+		def foundVendor = false
 		ngxNativePlatforms.each { platform ->
-			def platformFiles = fileTree(ngxNativeOutDir) {
-				include platform.includes
+			def platformShimFiles = fileTree(ngxShimOutDir) {
+				include platform.shimIncludes
 			}.files
-			if (!platformFiles.empty) {
-				foundAny = true
+			def platformVendorFiles = fileTree(new File(ngxVendorRoot, platform.name)) {
+				include platform.vendorIncludes
+			}.files
+			if (!platformShimFiles.empty) {
+				foundShim = true
+			}
+			if (!platformVendorFiles.empty) {
+				foundVendor = true
 			}
 		}
-		if (!foundAny) {
-			throw new GradleException("Missing NGX native libraries in ${ngxNativeOutDir.get().asFile}.")
+		if (!foundShim) {
+			throw new GradleException("Missing NGX shim library in ${ngxShimOutDir}.")
+		}
+		if (!foundVendor) {
+			throw new GradleException("Missing NGX vendor libraries in ${ngxVendorRoot}.")
 		}
 	}
 }
