@@ -5,6 +5,23 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
+get_filename_component(NGX_SHIM_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(NGX_SHIM_OUTPUT_ROOT "${NGX_SHIM_REPO_ROOT}/build/native/ngx_shim"
+    CACHE PATH "Directory for built NGX shim artifacts")
+set(NGX_SHIM_OUTPUT_DIR "${NGX_SHIM_OUTPUT_ROOT}/$<LOWER_CASE:$<CONFIG>>")
+
+function(ngxshim_set_artifact_dirs target)
+  set_target_properties(${target} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${NGX_SHIM_OUTPUT_DIR}"
+      LIBRARY_OUTPUT_DIRECTORY "${NGX_SHIM_OUTPUT_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${NGX_SHIM_OUTPUT_DIR}")
+endfunction()
+
 if(NOT DEFINED ENV{DLSS_SDK})
   message(FATAL_ERROR "DLSS_SDK environment variable is not set")
 endif()
@@ -30,7 +47,5 @@ endif()
 target_link_libraries(ngxshim PRIVATE "${NGX_STATIC_LIB}" ${CMAKE_DL_LIBS})
 
 set_target_properties(ngxshim PROPERTIES
-    OUTPUT_NAME "ngxshim"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/out"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/out"
-    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/out")
+    OUTPUT_NAME "ngxshim")
+ngxshim_set_artifact_dirs(ngxshim)
