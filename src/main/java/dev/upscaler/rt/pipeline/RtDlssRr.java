@@ -18,6 +18,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Files;
@@ -270,12 +271,18 @@ public final class RtDlssRr {
         return (result & 0xFFF00000) == 0xBAD00000;
     }
 
+    // Native wchar_t width differs by platform: 2 bytes (UTF-16) on Windows, 4 bytes (UTF-32) on
+    // Linux/macOS. Encode to the platform's wchar_t width accordingly.
+    private static final boolean WCHAR_IS_UTF16 =
+            System.getProperty("os.name", "").toLowerCase().contains("win");
+    private static final Charset WCHAR_CHARSET =
+            WCHAR_IS_UTF16 ? StandardCharsets.UTF_16LE : Charset.forName("UTF-32LE");
+    private static final int WCHAR_SIZE = WCHAR_IS_UTF16 ? 2 : 4;
+
     private static MemorySegment wideString(Arena arena, String s) {
-        byte[] utf16 = s.getBytes(StandardCharsets.UTF_16LE);
-        MemorySegment seg = arena.allocate(utf16.length + 2L);
-        MemorySegment.copy(utf16, 0, seg, ValueLayout.JAVA_BYTE, 0, utf16.length);
-        seg.set(ValueLayout.JAVA_BYTE, utf16.length, (byte) 0);
-        seg.set(ValueLayout.JAVA_BYTE, utf16.length + 1, (byte) 0);
+        byte[] data = s.getBytes(WCHAR_CHARSET);
+        MemorySegment seg = arena.allocate((long) data.length + WCHAR_SIZE);
+        MemorySegment.copy(data, 0, seg, ValueLayout.JAVA_BYTE, 0, data.length);
         return seg;
     }
 
