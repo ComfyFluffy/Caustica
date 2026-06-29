@@ -18,6 +18,22 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+
+// Lightweight diagnostic logging. The shim is loaded into the JVM via FFM and a
+// crash here surfaces only as a bare SIGSEGV on the Java side, so we can trace every
+// exported entry/exit to stderr (unbuffered + flushed) to localize the fault. This is
+// off by default (it logs per-frame in evaluate); set NGXSHIM_VERBOSE=1 to enable it
+// and the NGX core's own verbose logging sink.
+static const bool g_verbose = std::getenv("NGXSHIM_VERBOSE") != nullptr;
+#define NGX_LOG(...)                                       \
+    do {                                                   \
+        if (g_verbose) {                                   \
+            std::fprintf(stderr, "[ngx_shim] " __VA_ARGS__); \
+            std::fprintf(stderr, "\n");                    \
+            std::fflush(stderr);                           \
+        }                                                  \
+    } while (0)
 
 // A fixed GUID-like project id (NGX requires GUID-like ids for CUSTOM engine).
 static const char* kProjectId = "b6f1e9c2-7a44-4d1e-9b3a-1f2c3d4e5a6b";
@@ -25,6 +41,20 @@ static const char* kProjectId = "b6f1e9c2-7a44-4d1e-9b3a-1f2c3d4e5a6b";
 static NVSDK_NGX_Parameter* g_capabilityParams = nullptr;
 static VkDevice g_device = VK_NULL_HANDLE;
 static int g_lastResult = 0;
+
+// Logging sink wired into NVSDK_NGX_FeatureCommonInfo so the (closed) NGX core/SDK pipes its own
+// init diagnostics back to us. NGX init crashes deep inside the driver core on this setup; the core's
+// last log line before the fault is the best clue to *why*. Flush every line so nothing is lost.
+static void NVSDK_CONV ngxshim_log_callback(const char* message,
+                                            NVSDK_NGX_Logging_Level level,
+                                            NVSDK_NGX_Feature component) {
+    std::fprintf(stderr, "[ngx_core L%d C%d] %s", (int) level, (int) component, message ? message : "(null)");
+    size_t n = message ? std::strlen(message) : 0;
+    if (n == 0 || message[n - 1] != '\n') {
+        std::fprintf(stderr, "\n");
+    }
+    std::fflush(stderr);
+}
 
 struct DlssFeature {
     NVSDK_NGX_Handle* handle;
@@ -63,13 +93,16 @@ NGX_SHIM_EXPORT int ngxshim_last_result() {
 // the names newline-joined into outBuf. wantDevice != 0 -> device extensions,
 // else instance extensions. Returns the count, or -1 on failure.
 NGX_SHIM_EXPORT int ngxshim_required_extensions(int wantDevice, char* outBuf, int bufLen) {
+    NGX_LOG("required_extensions: enter wantDevice=%d outBuf=%p bufLen=%d", wantDevice, (void*) outBuf, bufLen);
     unsigned int instanceCount = 0, deviceCount = 0;
     const char** instanceExts = nullptr;
     const char** deviceExts = nullptr;
 
     NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_RequiredExtensions(&instanceCount, &instanceExts, &deviceCount, &deviceExts);
     g_lastResult = (int) r;
+    NGX_LOG("required_extensions: RequiredExtensions r=0x%08x instanceCount=%u deviceCount=%u", (unsigned) r, instanceCount, deviceCount);
     if (NVSDK_NGX_FAILED(r)) {
+        NGX_LOG("required_extensions: FAILED, returning -1");
         return -1;
     }
 
@@ -89,6 +122,7 @@ NGX_SHIM_EXPORT int ngxshim_required_extensions(int wantDevice, char* outBuf, in
     if (pos < bufLen) {
         outBuf[pos] = 0;
     }
+    NGX_LOG("required_extensions: exit count=%u bytesWritten=%d", count, pos);
     return (int) count;
 }
 
@@ -98,6 +132,9 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
                                  VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device,
                                  void* getInstanceProcAddr, void* getDeviceProcAddr,
                                  const wchar_t* featureDllPath) {
+    NGX_LOG("init: enter appId=%llu dataPath=%p instance=%p physicalDevice=%p device=%p getInstanceProcAddr=%p getDeviceProcAddr=%p featureDllPath=%p",
+            appId, (void*) dataPath, (void*) instance, (void*) physicalDevice, (void*) device,
+            getInstanceProcAddr, getDeviceProcAddr, (void*) featureDllPath);
     g_device = device;
 
     NVSDK_NGX_FeatureCommonInfo info;
@@ -106,6 +143,15 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
     info.PathListInfo.Path = paths;
     info.PathListInfo.Length = featureDllPath ? 1u : 0u;
 
+    // Route the NGX core/SDK's own logging to our callback at the most verbose level so we capture
+    // exactly what it does (and the last thing it does before crashing) during init.
+    if (g_verbose) {
+        info.LoggingInfo.LoggingCallback = &ngxshim_log_callback;
+        info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
+        info.LoggingInfo.DisableOtherLoggingSinks = false;
+    }
+
+    NGX_LOG("init: calling NVSDK_NGX_VULKAN_Init_with_ProjectID");
     NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(
             kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", dataPath,
             instance, physicalDevice, device,
@@ -113,22 +159,28 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
             (PFN_vkGetDeviceProcAddr) getDeviceProcAddr,
             &info, NVSDK_NGX_Version_API);
     g_lastResult = (int) r;
+    NGX_LOG("init: Init_with_ProjectID r=0x%08x", (unsigned) r);
     if (NVSDK_NGX_FAILED(r)) {
+        NGX_LOG("init: FAILED init, returning 0x%08x", (unsigned) r);
         return (int) r;
     }
 
+    NGX_LOG("init: calling NVSDK_NGX_VULKAN_GetCapabilityParameters");
     r = NVSDK_NGX_VULKAN_GetCapabilityParameters(&g_capabilityParams);
     g_lastResult = (int) r;
+    NGX_LOG("init: GetCapabilityParameters r=0x%08x g_capabilityParams=%p", (unsigned) r, (void*) g_capabilityParams);
     return (int) r;
 }
 
 // 1 if DLSS Super Resolution is available on this system, else 0.
 NGX_SHIM_EXPORT int ngxshim_dlss_available() {
+    NGX_LOG("dlss_available: enter g_capabilityParams=%p", (void*) g_capabilityParams);
     if (!g_capabilityParams) {
         return 0;
     }
     int available = 0;
     NVSDK_NGX_Parameter_GetI(g_capabilityParams, NVSDK_NGX_Parameter_SuperSampling_Available, &available);
+    NGX_LOG("dlss_available: exit available=%d", available);
     return available;
 }
 
@@ -137,6 +189,7 @@ NGX_SHIM_EXPORT int ngxshim_dlss_available() {
 NGX_SHIM_EXPORT int ngxshim_query_optimal(unsigned int displayWidth, unsigned int displayHeight, int quality,
                                           unsigned int* outRenderWidth, unsigned int* outRenderHeight,
                                           float* outSharpness) {
+    NGX_LOG("query_optimal: enter display=%ux%u quality=%d g_capabilityParams=%p", displayWidth, displayHeight, quality, (void*) g_capabilityParams);
     if (!g_capabilityParams) {
         return -1;
     }
@@ -145,6 +198,8 @@ NGX_SHIM_EXPORT int ngxshim_query_optimal(unsigned int displayWidth, unsigned in
             g_capabilityParams, displayWidth, displayHeight, (NVSDK_NGX_PerfQuality_Value) quality,
             outRenderWidth, outRenderHeight, &maxW, &maxH, &minW, &minH, outSharpness);
     g_lastResult = (int) r;
+    NGX_LOG("query_optimal: exit r=0x%08x render=%ux%u", (unsigned) r,
+            outRenderWidth ? *outRenderWidth : 0u, outRenderHeight ? *outRenderHeight : 0u);
     return (int) r;
 }
 
@@ -156,9 +211,12 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlss(VkCommandBuffer cmd,
                                           unsigned int renderWidth, unsigned int renderHeight,
                                           unsigned int displayWidth, unsigned int displayHeight,
                                           int quality, int featureFlags, int renderPreset) {
+    NGX_LOG("create_dlss: enter cmd=%p render=%ux%u display=%ux%u quality=%d featureFlags=0x%x renderPreset=%d",
+            (void*) cmd, renderWidth, renderHeight, displayWidth, displayHeight, quality, featureFlags, renderPreset);
     NVSDK_NGX_Parameter* params = nullptr;
     NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_AllocateParameters(&params);
     g_lastResult = (int) r;
+    NGX_LOG("create_dlss: AllocateParameters r=0x%08x params=%p", (unsigned) r, (void*) params);
     if (NVSDK_NGX_FAILED(r)) {
         return nullptr;
     }
@@ -183,8 +241,10 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlss(VkCommandBuffer cmd,
     createParams.InFeatureCreateFlags = featureFlags;
 
     NVSDK_NGX_Handle* handle = nullptr;
+    NGX_LOG("create_dlss: calling NGX_VULKAN_CREATE_DLSS_EXT");
     r = NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &handle, params, &createParams);
     g_lastResult = (int) r;
+    NGX_LOG("create_dlss: CREATE_DLSS_EXT r=0x%08x handle=%p", (unsigned) r, (void*) handle);
     if (NVSDK_NGX_FAILED(r)) {
         NVSDK_NGX_VULKAN_DestroyParameters(params);
         return nullptr;
@@ -194,6 +254,7 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlss(VkCommandBuffer cmd,
     feature->handle = handle;
     feature->params = params;
     feature->ownsParams = true; // allocated above; release destroys it
+    NGX_LOG("create_dlss: exit feature=%p", (void*) feature);
     return feature;
 }
 
@@ -209,10 +270,16 @@ NGX_SHIM_EXPORT int ngxshim_evaluate(VkCommandBuffer cmd, void* feature,
                                      unsigned int displayWidth, unsigned int displayHeight,
                                      float jitterX, float jitterY, float mvScaleX, float mvScaleY,
                                      int reset, float frameTimeMs) {
+    NGX_LOG("evaluate: enter cmd=%p feature=%p render=%ux%u display=%ux%u jitter=(%.3f,%.3f) mvScale=(%.3f,%.3f) reset=%d frameTimeMs=%.3f",
+            (void*) cmd, feature, renderWidth, renderHeight, displayWidth, displayHeight,
+            jitterX, jitterY, mvScaleX, mvScaleY, reset, frameTimeMs);
     DlssFeature* f = (DlssFeature*) feature;
     if (!f) {
+        NGX_LOG("evaluate: null feature, returning -1");
         return -1;
     }
+    NGX_LOG("evaluate: handle=%p params=%p colorView=%p depthView=%p mvView=%p outputView=%p",
+            (void*) f->handle, (void*) f->params, (void*) colorView, (void*) depthView, (void*) mvView, (void*) outputView);
 
     NVSDK_NGX_Resource_VK color = makeImageResource(colorView, colorImage, colorFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK depth = makeImageResource(depthView, depthImage, depthFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_DEPTH_BIT, false);
@@ -234,18 +301,22 @@ NGX_SHIM_EXPORT int ngxshim_evaluate(VkCommandBuffer cmd, void* feature,
     eval.InRenderSubrectDimensions.Height = renderHeight;
     eval.InFrameTimeDeltaInMsec = frameTimeMs;
 
+    NGX_LOG("evaluate: calling NGX_VULKAN_EVALUATE_DLSS_EXT");
     NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, f->handle, f->params, &eval);
     g_lastResult = (int) r;
+    NGX_LOG("evaluate: EVALUATE_DLSS_EXT r=0x%08x", (unsigned) r);
     return (int) r;
 }
 
 // 1 if DLSS Ray Reconstruction (denoising) is available on this system, else 0.
 NGX_SHIM_EXPORT int ngxshim_dlssd_available() {
+    NGX_LOG("dlssd_available: enter g_capabilityParams=%p", (void*) g_capabilityParams);
     if (!g_capabilityParams) {
         return 0;
     }
     int available = 0;
     NVSDK_NGX_Parameter_GetI(g_capabilityParams, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &available);
+    NGX_LOG("dlssd_available: exit available=%d", available);
     return available;
 }
 
@@ -256,11 +327,14 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
                                            unsigned int renderWidth, unsigned int renderHeight,
                                            unsigned int displayWidth, unsigned int displayHeight,
                                            int quality, int featureFlags, int renderPreset) {
+    NGX_LOG("create_dlssd: enter cmd=%p render=%ux%u display=%ux%u quality=%d featureFlags=0x%x renderPreset=%d g_device=%p",
+            (void*) cmd, renderWidth, renderHeight, displayWidth, displayHeight, quality, featureFlags, renderPreset, (void*) g_device);
     // DLSS Ray Reconstruction must be created with the capability parameter block (it carries the
     // snippet/preset callbacks the feature needs); a fresh AllocateParameters block fails with
     // FAIL_InvalidParameter. The block is shared (freed at shutdown), so the feature does not own it.
     NVSDK_NGX_Parameter* params = g_capabilityParams;
     if (!params) {
+        NGX_LOG("create_dlssd: no capability params, returning null");
         g_lastResult = (int) NVSDK_NGX_Result_FAIL_NotInitialized;
         return nullptr;
     }
@@ -293,8 +367,10 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     createParams.InFeatureCreateFlags = featureFlags;
 
     NVSDK_NGX_Handle* handle = nullptr;
+    NGX_LOG("create_dlssd: calling NGX_VULKAN_CREATE_DLSSD_EXT1 perfQuality=%d", (int) createParams.InPerfQualityValue);
     r = NGX_VULKAN_CREATE_DLSSD_EXT1(g_device, cmd, 1, 1, &handle, params, &createParams);
     g_lastResult = (int) r;
+    NGX_LOG("create_dlssd: CREATE_DLSSD_EXT1 r=0x%08x handle=%p", (unsigned) r, (void*) handle);
     if (NVSDK_NGX_FAILED(r)) {
         return nullptr; // params is the shared capability block; do not destroy it
     }
@@ -303,6 +379,7 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     feature->handle = handle;
     feature->params = params;
     feature->ownsParams = false; // shared capability block, freed at shutdown
+    NGX_LOG("create_dlssd: exit feature=%p", (void*) feature);
     return feature;
 }
 
@@ -327,10 +404,17 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
                                            float jitterX, float jitterY, float mvScaleX, float mvScaleY,
                                            int reset, float frameTimeMs,
                                            float* worldToViewMatrix, float* viewToClipMatrix) {
+    NGX_LOG("evaluate_dlssd: enter cmd=%p feature=%p render=%ux%u display=%ux%u jitter=(%.3f,%.3f) mvScale=(%.3f,%.3f) reset=%d frameTimeMs=%.3f",
+            (void*) cmd, feature, renderWidth, renderHeight, displayWidth, displayHeight,
+            jitterX, jitterY, mvScaleX, mvScaleY, reset, frameTimeMs);
     DlssFeature* f = (DlssFeature*) feature;
     if (!f) {
+        NGX_LOG("evaluate_dlssd: null feature, returning -1");
         return -1;
     }
+    NGX_LOG("evaluate_dlssd: handle=%p params=%p color=%p depth=%p mv=%p diffuse=%p specular=%p normals=%p specMotion=%p output=%p",
+            (void*) f->handle, (void*) f->params, (void*) colorView, (void*) depthView, (void*) mvView,
+            (void*) diffuseAlbedoView, (void*) specularAlbedoView, (void*) normalsView, (void*) specularMotionView, (void*) outputView);
     (void) specularHitDistanceView;
     (void) specularHitDistanceImage;
     (void) specularHitDistanceFormat;
@@ -369,32 +453,40 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     eval.InRenderSubrectDimensions.Height = renderHeight;
     eval.InFrameTimeDeltaInMsec = frameTimeMs;
 
+    NGX_LOG("evaluate_dlssd: calling NGX_VULKAN_EVALUATE_DLSSD_EXT");
     NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSSD_EXT(cmd, f->handle, f->params, &eval);
     g_lastResult = (int) r;
+    NGX_LOG("evaluate_dlssd: EVALUATE_DLSSD_EXT r=0x%08x", (unsigned) r);
     return (int) r;
 }
 
 NGX_SHIM_EXPORT void ngxshim_release(void* feature) {
+    NGX_LOG("release: enter feature=%p", feature);
     DlssFeature* f = (DlssFeature*) feature;
     if (!f) {
         return;
     }
     if (f->handle) {
+        NGX_LOG("release: releasing handle=%p", (void*) f->handle);
         NVSDK_NGX_VULKAN_ReleaseFeature(f->handle);
     }
     if (f->params && f->ownsParams) {
+        NGX_LOG("release: destroying owned params=%p", (void*) f->params);
         NVSDK_NGX_VULKAN_DestroyParameters(f->params);
     }
     std::free(f);
+    NGX_LOG("release: exit");
 }
 
 NGX_SHIM_EXPORT void ngxshim_shutdown(VkDevice device) {
+    NGX_LOG("shutdown: enter device=%p g_device=%p g_capabilityParams=%p", (void*) device, (void*) g_device, (void*) g_capabilityParams);
     if (g_capabilityParams) {
         NVSDK_NGX_VULKAN_DestroyParameters(g_capabilityParams);
         g_capabilityParams = nullptr;
     }
     NVSDK_NGX_VULKAN_Shutdown1(device ? device : g_device);
     g_device = VK_NULL_HANDLE;
+    NGX_LOG("shutdown: exit");
 }
 
 } // extern "C"
