@@ -27,6 +27,14 @@
           lib = pkgs.lib;
           jdk = pkgs.jdk25;
           llvm = pkgs.llvmPackages_latest;
+          vulkanSdk = pkgs.symlinkJoin {
+            name = "vulkan-sdk";
+            paths = [
+              pkgs.glslang
+              pkgs.spirv-tools
+              pkgs.vulkan-headers
+            ];
+          };
 
           runtimeLibs = with pkgs; [
             flite
@@ -91,29 +99,9 @@
               export RANLIB=llvm-ranlib
               export CMAKE_GENERATOR=Ninja
               export JAVA_HOME="${jdk.home}"
-              export VULKAN_SDK="$PWD/third_party/nix-vulkan-sdk"
-              export DLSS_SDK="$PWD/third_party/nix-dlss-sdk"
-              export PATH="$VULKAN_SDK/bin:$DLSS_SDK:$PATH"
-
-              # The Gradle shader task and NGX CMake file expect the Windows
-              # Vulkan SDK directory shape: $VULKAN_SDK/bin and $VULKAN_SDK/include.
-              mkdir -p "$VULKAN_SDK/bin" "$VULKAN_SDK/include" "$DLSS_SDK"
-              ln -sfn "${pkgs.glslang}/bin/glslangValidator" "$VULKAN_SDK/bin/glslangValidator"
-              ln -sfn "${pkgs.spirv-tools}/bin/spirv-val" "$VULKAN_SDK/bin/spirv-val"
-              for header in "${pkgs.vulkan-headers}/include/vulkan/"*; do
-                ln -sfn "$header" "$VULKAN_SDK/include/$(basename "$header")"
-              done
-              ln -sfn "${dlssSdk}/include" "$DLSS_SDK"
-              ln -sfn "${dlssSdk}/lib" "$DLSS_SDK"
-
-              ngx_vendor_out="$PWD/build/native/ngx_shim/vendor/linux-x64"
-              mkdir -p "$ngx_vendor_out"
-              rm -f "$ngx_vendor_out"/libnvidia-ngx-dlss.so* "$ngx_vendor_out"/libnvidia-ngx-dlssg.so*
-              for ngx_lib in "$DLSS_SDK"/lib/Linux_*/rel/libnvidia-ngx-dlssd.so*; do
-                if [ -e "$ngx_lib" ]; then
-                  install -m 0755 "$ngx_lib" "$ngx_vendor_out/$(basename "$ngx_lib")"
-                fi
-              done
+              export VULKAN_SDK="${vulkanSdk}"
+              export DLSS_SDK="${dlssSdk}"
+              export PATH="$VULKAN_SDK/bin:$PATH"
 
               echo "dlss-mod dev shell"
               echo "  Java:       $JAVA_HOME"
@@ -121,7 +109,6 @@
               echo "  C++ compiler: $CXX"
               echo "  DLSS_SDK:   $DLSS_SDK"
               echo "  VULKAN_SDK: $VULKAN_SDK"
-              echo "  NGX vendor: $ngx_vendor_out"
             '';
           };
         }
