@@ -34,7 +34,7 @@ layout(binding = 1, set = 0, rgba16f) uniform image2D outImage;
 // the linear primary-ray hit distance for now (converted to the DLSS depth convention in P4.2).
 layout(binding = 3, set = 0, rgba16f) uniform image2D gNormal; // xyz world normal, w roughness
 layout(binding = 4, set = 0, rgba16f) uniform image2D gAlbedo; // rgb diffuse albedo
-layout(binding = 5, set = 0, r32f)    uniform image2D gDepth;  // r linear hit distance (<0 = sky)
+layout(binding = 5, set = 0, r32f)    uniform image2D gDepth;  // r HW reversed-Z depth (near=1, far/sky~0)
 layout(binding = 6, set = 0, rg16f)   uniform image2D gMotion;    // xy screen-space motion (render pixels)
 layout(binding = 7, set = 0, rgba16f) uniform image2D gSpecAlbedo; // specular albedo (0 — diffuse-only)
 layout(binding = 8, set = 0, rg16f)   uniform image2D gSpecMotion; // reflection motion vectors for RR
@@ -64,6 +64,7 @@ struct WorldPush {
     vec4 moonUv;               // 304 sky: vanilla moon sprite UV rect (rgen ignores — padding)
     vec4 waterParams;          // 320 W1/W2: xyz = camera-biome water tint (start-submerged absorption); w = wave time (s)
     vec4 waterAnchor;          // 336 W1: xy = world-stable wave-domain anchor (terrain origin mod 4096); zw unused
+    mat4 curViewProj;          // 352 forward camera-relative view-projection (= inverse(invViewProj)); HW depth + water MV
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WorldPushRef { WorldPush v; };
 layout(push_constant) uniform PushAddr { uint64_t worldPushAddr; } pcAddr;
@@ -777,12 +778,7 @@ void main() {
     vec3 dir = normalize(farP - nearP);
 
     // Camera forward (unit view direction at the unjittered screen centre). Used below to convert the
-    // slant ray distance into linear view-space depth (perpendicular distance from the camera plane),
-    // which is what DLSS-RR's Depth_Type_Linear expects.
-    vec4 cFarH = pc.invViewProj * vec4(0.0, 0.0, 0.0, 1.0);
-    vec4 cNearH = pc.invViewProj * vec4(0.0, 0.0, 1.0, 1.0);
-    vec3 camForward = normalize(cFarH.xyz / cFarH.w - cNearH.xyz / cNearH.w);
-
+    // (see the HW-depth guide below).
     uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (pc.frameIndex * 2654435761u);
 
     uint spp = max(pc.spp, 1u);
@@ -793,11 +789,12 @@ void main() {
     }
     frameRadiance /= float(spp);
 
-    // Linear view-space depth for DLSS-RR (P4.3): perpendicular distance from the camera plane to the
-    // first hit = camera-relative hit projected onto the view direction. Non-inverted (near 0, far
-    // large), so DLSS feature flag DepthInverted stays unset. Sky's far gv_hitCamRel -> large depth.
+    // Hardware (non-linear, reversed-Z) depth for DLSS-RR + Frame Generation: project the camera-relative
+    // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
+    // would write. Reversed-Z (near=1, far=0), so DLSS gets the DepthInverted flag; sky's far hit -> ~0.
     // Depth follows the primary surface (water included); only the MV tracks the refracted hit.
-    gv_depth = dot(gv_hitCamRel, camForward);
+    vec4 curClip = pc.curViewProj * vec4(gv_hitCamRel, 1.0);
+    gv_depth = curClip.w > 0.0 ? curClip.z / curClip.w : 0.0;
 
     // P4.0a guide buffers: first-hit attributes for the denoiser / DLSS-RR (written every frame).
     imageStore(gNormal, pix, vec4(gv_normal, gv_rough));
@@ -824,8 +821,8 @@ void main() {
     // bit-exact zero when static and needs no Snell solve for the previous surface point. The constant
     // per-frame refraction offset (hit's current projection vs jndc) cancels out of prev - current.
     if (gv_motionUseRefracted) {
-        vec4 curClip = inverse(pc.invViewProj) * vec4(gv_motionHitCamRel, 1.0);
-        curNdc = curClip.xy / curClip.w;
+        vec4 curClipRefr = pc.curViewProj * vec4(gv_motionHitCamRel, 1.0);
+        curNdc = curClipRefr.xy / curClipRefr.w;
     }
     vec2 motion = (prevNdc - curNdc) * 0.5 * size;
     imageStore(gMotion, pix, vec4(motion, 0.0, 0.0));
@@ -840,7 +837,7 @@ void main() {
         } else if (pc.debugView == 2u) {
             dbg = gv_albedo;                        // diffuse albedo
         } else if (pc.debugView == 3u) {
-            dbg = vec3(min(gv_depth / 64.0, 1.0)); // linear view depth, 64-block normalize (sky -> white)
+            dbg = vec3(gv_depth); // HW reversed-Z depth, already [0,1] (near=white, far/sky=black)
         } else if (pc.debugView == 4u) {
             dbg = vec3(gv_rough);                   // roughness
         } else if (pc.debugView == 6u) {

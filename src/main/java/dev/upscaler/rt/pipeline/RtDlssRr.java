@@ -7,26 +7,13 @@ import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.accel.RtImage;
 import dev.upscaler.mixin.GpuDeviceAccessor;
 import dev.upscaler.ngx.NgxLibrary;
-import net.fabricmc.loader.api.FabricLoader;
+import dev.upscaler.ngx.NgxRuntime;
 import org.joml.Matrix4fc;
-import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK10;
-import org.lwjgl.vulkan.VkInstance;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.NoSuchFileException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.stream.Stream;
 
 /**
  * DLSS Ray Reconstruction backend for the RT renderer. Runs the DLSSD (Ray Reconstruction) feature
@@ -39,17 +26,18 @@ public final class RtDlssRr {
         return UpscalerConfig.Rt.DlssRr.ENABLED.value();
     }
 
-    private static final PlatformNatives PLATFORM_NATIVES = PlatformNatives.current();
     // DLSS feature flags. IsHDR (bit 0): color is linear HDR (rgba16f) — RR requires it ("HDR Color
     // required"). MVLowRes (bit 1): motion vectors are at render/input resolution, not display — RR
-    // requires it ("Low resolution Motion Vectors required"). AutoExposure (bit 6): in HDR mode DLSS
-    // needs the scene exposure (exposure texture or auto-estimate); without it the output is black, so
-    // let DLSS estimate exposure from the color itself. MVs are unjittered and depth is linear, so no
-    // MV_JITTERED / DEPTH_INVERTED.
+    // requires it ("Low resolution Motion Vectors required"). DepthInverted (bit 3): the depth guide is
+    // HW reversed-Z (near=1, far=0). AutoExposure (bit 6): in HDR mode DLSS needs the scene exposure
+    // (exposure texture or auto-estimate); without it the output is black, so let DLSS estimate exposure
+    // from the color itself. MVs are unjittered, so no MV_JITTERED.
     private static final int FEATURE_FLAG_IS_HDR = 1 << 0;
     private static final int FEATURE_FLAG_MV_LOW_RES = 1 << 1;
+    private static final int FEATURE_FLAG_DEPTH_INVERTED = 1 << 3;
     private static final int FEATURE_FLAG_AUTO_EXPOSURE = 1 << 6;
-    private static final int FEATURE_FLAGS = FEATURE_FLAG_IS_HDR | FEATURE_FLAG_MV_LOW_RES | FEATURE_FLAG_AUTO_EXPOSURE;
+    private static final int FEATURE_FLAGS = FEATURE_FLAG_IS_HDR | FEATURE_FLAG_MV_LOW_RES
+            | FEATURE_FLAG_DEPTH_INVERTED | FEATURE_FLAG_AUTO_EXPOSURE;
     // 0 = let the RR DLL pick its per-mode default preset.
     private static int renderPreset() {
         return UpscalerConfig.Rt.DlssRr.PRESET.value();
@@ -62,7 +50,6 @@ public final class RtDlssRr {
     private NgxLibrary lib;
     private MemorySegment feature = MemorySegment.NULL;
     private boolean initialized;
-    private boolean ngxInitialized;
     private boolean failed;
     private boolean loggedAvailable;
 
@@ -125,7 +112,7 @@ public final class RtDlssRr {
                         worldToViewMatrix, viewToClipMatrix);
             }
             resetHistory = false;
-            if (ngxFailed(rc)) {
+            if (NgxRuntime.ngxFailed(rc)) {
                 throw new IllegalStateException("ngxshim_evaluate_dlssd failed: 0x" + Integer.toHexString(rc)
                         + " last=0x" + Integer.toHexString(lib.lastResult()));
             }
@@ -186,63 +173,30 @@ public final class RtDlssRr {
         if (initialized) {
             return;
         }
-        if (!PLATFORM_NATIVES.supported) {
-            throw new IllegalStateException("DLSS-RR NGX natives are not bundled for "
-                    + PLATFORM_NATIVES.platformDir);
+        // NGX init/shutdown is owned by the shared NgxRuntime so RR and Frame Generation can coexist
+        // (releasing the RR feature must not tear NGX down while FG still holds a handle).
+        lib = NgxRuntime.INSTANCE.acquire(device);
+        if (lib == null) {
+            throw new IllegalStateException("NGX runtime unavailable; DLSS-RR cannot initialize");
         }
-        Path shim = locateShim();
-        if (shim == null) {
-            throw new IllegalStateException(PLATFORM_NATIVES.shimName
-                    + " not found (bundled natives or -Dupscaler.ngx.path)");
+        boolean available = lib.dlssdAvailable();
+        if (!loggedAvailable) {
+            loggedAvailable = true;
+            UpscalerMod.LOGGER.info("DLSS Ray Reconstruction available: {}", available);
         }
-        Path nativesDir = shim.getParent();
-        if (nativesDir != null && !hasFeatureLibrary(nativesDir)) {
-            UpscalerMod.LOGGER.warn("{} not found next to {}; DLSS-RR availability will fail",
-                    PLATFORM_NATIVES.featureDescription(), PLATFORM_NATIVES.shimName);
-        }
-
-        lib = NgxLibrary.load(shim);
-
-        Path dataPath = FabricLoader.getInstance().getGameDir().resolve("upscaler-ngx");
-        try {
-            Files.createDirectories(dataPath);
-        } catch (Exception e) {
-            UpscalerMod.LOGGER.warn("Could not create NGX data path {}", dataPath, e);
-        }
-
-        VkInstance instance = device.vkDevice().getPhysicalDevice().getInstance();
-        try (Arena arena = Arena.ofConfined()) {
-            long gdpa;
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                gdpa = VK10.vkGetInstanceProcAddr(instance, stack.ASCII("vkGetDeviceProcAddr"));
-            }
-            int rc = lib.init(0L, wideString(arena, dataPath.toString()),
-                    instance.address(), device.vkDevice().getPhysicalDevice().address(), device.vkDevice().address(),
-                    0L, gdpa, wideString(arena, nativesDir == null ? "" : nativesDir.toString()));
-            if (ngxFailed(rc)) {
-                throw new IllegalStateException("ngxshim_init failed: 0x" + Integer.toHexString(rc)
-                        + " last=0x" + Integer.toHexString(lib.lastResult()));
-            }
-            ngxInitialized = true;
-            boolean available = lib.dlssdAvailable();
-            if (!loggedAvailable) {
-                loggedAvailable = true;
-                UpscalerMod.LOGGER.info("DLSS Ray Reconstruction available: {}", available);
-            }
-            if (!available) {
-                throw new IllegalStateException("DLSS Ray Reconstruction is not available on this system");
-            }
+        if (!available) {
+            throw new IllegalStateException("DLSS Ray Reconstruction is not available on this system");
         }
         initialized = true;
     }
 
+    /**
+     * Release the RR feature. Does NOT shut down NGX — that is the shared {@link NgxRuntime}'s job at device
+     * teardown ({@code NgxRuntime.shutdown()} in {@code UpscalerClient.shutdownRt}), so FG can keep using NGX.
+     */
     public void destroy() {
         if (((GpuDeviceAccessor) RenderSystem.getDevice()).upscaler$getBackend() instanceof VulkanDevice device) {
             releaseFeature(device);
-            if (lib != null && ngxInitialized) {
-                lib.shutdown(device.vkDevice().address());
-                ngxInitialized = false;
-            }
         }
         initialized = false;
         lib = null;
@@ -266,26 +220,6 @@ public final class RtDlssRr {
         return segment == null || segment.equals(MemorySegment.NULL);
     }
 
-    /** NVSDK_NGX_Result: failure when top 12 bits == 0xBAD. */
-    private static boolean ngxFailed(int result) {
-        return (result & 0xFFF00000) == 0xBAD00000;
-    }
-
-    // Native wchar_t width differs by platform: 2 bytes (UTF-16) on Windows, 4 bytes (UTF-32) on
-    // Linux/macOS. Encode to the platform's wchar_t width accordingly.
-    private static final boolean WCHAR_IS_UTF16 =
-            System.getProperty("os.name", "").toLowerCase().contains("win");
-    private static final Charset WCHAR_CHARSET =
-            WCHAR_IS_UTF16 ? StandardCharsets.UTF_16LE : Charset.forName("UTF-32LE");
-    private static final int WCHAR_SIZE = WCHAR_IS_UTF16 ? 2 : 4;
-
-    private static MemorySegment wideString(Arena arena, String s) {
-        byte[] data = s.getBytes(WCHAR_CHARSET);
-        MemorySegment seg = arena.allocate((long) data.length + WCHAR_SIZE);
-        MemorySegment.copy(data, 0, seg, ValueLayout.JAVA_BYTE, 0, data.length);
-        return seg;
-    }
-
     private static void putNgxLeftMultiplyMatrix(Matrix4fc m, MemorySegment dst) {
         // NGX wants row-major matrices used with left-multiplied row vectors. Our JOML/GLSL matrices are
         // used with column vectors, so the equivalent NGX matrix is the transpose; JOML's normal storage
@@ -306,128 +240,5 @@ public final class RtDlssRr {
         dst.setAtIndex(ValueLayout.JAVA_FLOAT, 13, m.m31());
         dst.setAtIndex(ValueLayout.JAVA_FLOAT, 14, m.m32());
         dst.setAtIndex(ValueLayout.JAVA_FLOAT, 15, m.m33());
-    }
-
-    private static Path locateShim() {
-        String override = UpscalerConfig.Ngx.PATH.get();
-        if (override != null && !override.isBlank()) {
-            Path p = Path.of(override);
-            if (Files.isDirectory(p)) {
-                p = p.resolve(PLATFORM_NATIVES.shimName);
-            }
-            return Files.isRegularFile(p) ? p : null;
-        }
-        Path bundled = extractBundledNatives();
-        if (bundled != null) {
-            return bundled;
-        }
-        return null;
-    }
-
-    private static Path extractBundledNatives() {
-        Path dir = FabricLoader.getInstance().getGameDir().resolve("upscaler-ngx")
-                .resolve("natives").resolve(PLATFORM_NATIVES.platformDir);
-        try {
-            Files.createDirectories(dir);
-            boolean hasShim = extractBundledNative(PLATFORM_NATIVES.shimName, dir.resolve(PLATFORM_NATIVES.shimName));
-            extractBundledFeatureLibraries(dir);
-            return hasShim && Files.isRegularFile(dir.resolve(PLATFORM_NATIVES.shimName))
-                    ? dir.resolve(PLATFORM_NATIVES.shimName) : null;
-        } catch (IOException e) {
-            UpscalerMod.LOGGER.warn("Could not extract bundled NGX natives to {}", dir, e);
-            return null;
-        }
-    }
-
-    private static boolean extractBundledNative(String name, Path dst) throws IOException {
-        String resource = PLATFORM_NATIVES.resourceDir() + name;
-        try (InputStream in = RtDlssRr.class.getResourceAsStream(resource)) {
-            if (in == null) {
-                return false;
-            }
-            byte[] bytes = in.readAllBytes();
-            if (!sameBytes(dst, bytes)) {
-                Files.write(dst, bytes);
-            }
-            return true;
-        }
-    }
-
-    private static void extractBundledFeatureLibraries(Path dir) throws IOException {
-        if (PLATFORM_NATIVES.exactFeatureName != null) {
-            extractBundledNative(PLATFORM_NATIVES.exactFeatureName, dir.resolve(PLATFORM_NATIVES.exactFeatureName));
-            return;
-        }
-        for (String name : bundledFeatureLibraryNames()) {
-            extractBundledNative(name, dir.resolve(name));
-        }
-    }
-
-    private static List<String> bundledFeatureLibraryNames() {
-        List<String> names = new ArrayList<>();
-        FabricLoader.getInstance().getModContainer("upscaler").ifPresent(container -> {
-            String nativeDir = "upscaler/natives/" + PLATFORM_NATIVES.platformDir;
-            for (Path root : container.getRootPaths()) {
-                Path dir = root.resolve(nativeDir);
-                if (!Files.isDirectory(dir)) {
-                    continue;
-                }
-                try (Stream<Path> files = Files.list(dir)) {
-                    files.map(path -> path.getFileName().toString())
-                            .filter(PLATFORM_NATIVES::isFeatureLibrary)
-                            .forEach(names::add);
-                } catch (IOException e) {
-                    UpscalerMod.LOGGER.warn("Could not list bundled NGX natives in {}", dir, e);
-                }
-            }
-        });
-        return names;
-    }
-
-    private static boolean hasFeatureLibrary(Path dir) {
-        if (PLATFORM_NATIVES.exactFeatureName != null) {
-            return Files.isRegularFile(dir.resolve(PLATFORM_NATIVES.exactFeatureName));
-        }
-        try (Stream<Path> files = Files.list(dir)) {
-            return files.map(path -> path.getFileName().toString()).anyMatch(PLATFORM_NATIVES::isFeatureLibrary);
-        } catch (IOException e) {
-            return false;
-        }
-    }
-
-    private static boolean sameBytes(Path path, byte[] bytes) throws IOException {
-        try {
-            return Files.size(path) == bytes.length && Arrays.equals(Files.readAllBytes(path), bytes);
-        } catch (NoSuchFileException e) {
-            return false;
-        }
-    }
-
-    private record PlatformNatives(String platformDir, String shimName, String exactFeatureName,
-                                   String featureNamePrefix, boolean supported) {
-        private static PlatformNatives current() {
-            String os = System.getProperty("os.name", "").toLowerCase();
-            String arch = System.getProperty("os.arch", "").toLowerCase();
-            boolean x64 = arch.equals("x86_64") || arch.equals("amd64");
-            if (os.contains("win") && x64) {
-                return new PlatformNatives("windows-x64", "ngxshim.dll", "nvngx_dlssd.dll", null, true);
-            }
-            if (os.contains("linux") && x64) {
-                return new PlatformNatives("linux-x64", "libngxshim.so", null, "libnvidia-ngx-dlssd.so", true);
-            }
-            return new PlatformNatives(os + "/" + arch, System.mapLibraryName("ngxshim"), null, null, false);
-        }
-
-        private String resourceDir() {
-            return "/upscaler/natives/" + platformDir + "/";
-        }
-
-        private boolean isFeatureLibrary(String name) {
-            return exactFeatureName != null ? exactFeatureName.equals(name) : name.startsWith(featureNamePrefix);
-        }
-
-        private String featureDescription() {
-            return exactFeatureName != null ? exactFeatureName : featureNamePrefix + "*";
-        }
     }
 }

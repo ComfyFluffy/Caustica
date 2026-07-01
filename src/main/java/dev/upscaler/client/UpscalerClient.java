@@ -47,6 +47,11 @@ public final class UpscalerClient implements ClientModInitializer {
 					// until we're in a world with the block atlas loaded, or once already created.
 					RtComposite.INSTANCE.ensureResourcesReady(ctx);
 					RtTerrain.update(ctx);
+					// Log DLSS-FG availability once when frame generation is enabled (capability query only;
+					// the present-loop integration that consumes it is built separately).
+					if (dev.upscaler.rt.pipeline.RtDlssFg.enabled()) {
+						dev.upscaler.rt.pipeline.RtDlssFg.INSTANCE.probeAvailabilityOnce();
+					}
 				}
 			}
 		});
@@ -76,6 +81,13 @@ public final class UpscalerClient implements ClientModInitializer {
 			RtEntities.INSTANCE.shutdown();
 		}
 		RtComposite.INSTANCE.destroy();
+		dev.upscaler.rt.pipeline.RtDlssFg.INSTANCE.destroy();
+		if (ctx != null) {
+			dev.upscaler.rt.RtFramePresenter.INSTANCE.destroy(ctx.device());
+			dev.upscaler.rt.RtReflex.INSTANCE.destroy(ctx.device().vkDevice());
+		}
+		// Shut NGX down once, after every feature (RR + FG) has been released above.
+		dev.upscaler.ngx.NgxRuntime.INSTANCE.shutdown();
 		if (ctx != null) {
 			ctx.destroy();
 		}

@@ -131,6 +131,18 @@ def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
 def ngxNativeConfig = (findProperty("ngxNativeConfig") ?: "release").toString().toLowerCase(java.util.Locale.ROOT)
 def ngxNativeRoot = layout.buildDirectory.dir("native/ngx_shim").get().asFile
 def ngxShimOutDir = new File(ngxNativeRoot, ngxNativeConfig)
+def currentNgxPlatform = {
+	def os = org.gradle.internal.os.OperatingSystem.current()
+	def arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT)
+	def x64 = arch == "x86_64" || arch == "amd64"
+	if (os.windows && x64) {
+		return "windows-x64"
+	}
+	if (os.linux && x64) {
+		return "linux-x64"
+	}
+	return null
+}()
 def ngxNativePlatforms = [
 	[
 		name: "windows-x64",
@@ -139,7 +151,8 @@ def ngxNativePlatforms = [
 		],
 		vendorRoot: { dlssSdkRoot -> new File(dlssSdkRoot, "lib/Windows_x86_64/rel") },
 		vendorIncludes: [
-			"nvngx_dlssd.dll"
+			"nvngx_dlssd.dll",
+			"nvngx_dlssg.dll"
 		]
 	],
 	[
@@ -149,10 +162,31 @@ def ngxNativePlatforms = [
 		],
 		vendorRoot: { dlssSdkRoot -> new File(dlssSdkRoot, "lib/Linux_x86_64/rel") },
 		vendorIncludes: [
-			"libnvidia-ngx-dlssd.so*"
+			"libnvidia-ngx-dlssd.so*",
+			"libnvidia-ngx-dlssg.so*"
 		]
 	]
 ]
+def ngxNativePlatformByName = ngxNativePlatforms.collectEntries { platform -> [(platform.name): platform] }
+def requestedNgxPlatformsRaw = (findProperty("ngxPlatforms") ?: "current").toString()
+		.split(",")
+		.collect { it.trim() }
+		.findAll { !it.isEmpty() }
+def selectedNgxNativePlatforms
+if (requestedNgxPlatformsRaw.size() == 1 && requestedNgxPlatformsRaw[0].equalsIgnoreCase("all")) {
+	selectedNgxNativePlatforms = ngxNativePlatforms
+} else if (requestedNgxPlatformsRaw.size() == 1 && requestedNgxPlatformsRaw[0].equalsIgnoreCase("current")) {
+	if (currentNgxPlatform == null || !ngxNativePlatformByName.containsKey(currentNgxPlatform)) {
+		throw new GradleException("No NGX native platform is configured for this host.")
+	}
+	selectedNgxNativePlatforms = [ngxNativePlatformByName[currentNgxPlatform]]
+} else {
+	def unknownPlatforms = requestedNgxPlatformsRaw.findAll { !ngxNativePlatformByName.containsKey(it) }
+	if (!unknownPlatforms.empty) {
+		throw new GradleException("Unknown NGX platform(s): ${unknownPlatforms.join(', ')}")
+	}
+	selectedNgxNativePlatforms = requestedNgxPlatformsRaw.collect { ngxNativePlatformByName[it] }
+}
 
 def dlssSdkEnv = providers.environmentVariable("DLSS_SDK")
 def dlssSdkRootProvider = dlssSdkEnv.map { file(it) }
@@ -161,7 +195,7 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives", Copy) {
 	group = "build"
 	description = "Bundles NGX shim and DLSS native libraries into the mod resources."
 
-	ngxNativePlatforms.each { platform ->
+	selectedNgxNativePlatforms.each { platform ->
 		def platformShimFiles = fileTree(ngxShimOutDir) {
 			include platform.shimIncludes
 		}
@@ -180,31 +214,32 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives", Copy) {
 	into ngxNativeGenRoot
 	doFirst {
 		delete(ngxNativeGenRoot)
-		def foundShim = false
-		def foundVendor = false
+		def missing = []
 		def dlssSdkRoot = dlssSdkRootProvider.orNull
 		if (dlssSdkRoot == null) {
 			throw new GradleException("DLSS_SDK environment variable is not set.")
 		}
-		ngxNativePlatforms.each { platform ->
+		selectedNgxNativePlatforms.each { platform ->
 			def platformShimFiles = fileTree(ngxShimOutDir) {
 				include platform.shimIncludes
 			}.files
-			def platformVendorFiles = fileTree(platform.vendorRoot(dlssSdkRoot)) {
-				include platform.vendorIncludes
-			}.files
-			if (!platformShimFiles.empty) {
-				foundShim = true
-			}
-			if (!platformVendorFiles.empty) {
-				foundVendor = true
+			if (platformShimFiles.empty) {
+				missing += "${platform.name} shim library in ${ngxShimOutDir}"
 			}
 		}
-		if (!foundShim) {
-			throw new GradleException("Missing NGX shim library in ${ngxShimOutDir}.")
+		selectedNgxNativePlatforms.each { platform ->
+			def platformVendorRoot = platform.vendorRoot(dlssSdkRoot)
+			def missingVendorIncludes = platform.vendorIncludes.findAll { vendorInclude ->
+				fileTree(platformVendorRoot) {
+					include vendorInclude
+				}.files.empty
+			}
+			if (!missingVendorIncludes.empty) {
+				missing += "${platform.name} vendor libraries ${missingVendorIncludes.join(', ')} in ${platformVendorRoot}"
+			}
 		}
-		if (!foundVendor) {
-			throw new GradleException("Missing NGX vendor libraries in ${dlssSdkRoot}.")
+		if (!missing.empty) {
+			throw new GradleException("Missing NGX native inputs:\n - " + missing.join("\n - "))
 		}
 	}
 }

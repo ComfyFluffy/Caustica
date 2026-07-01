@@ -1,6 +1,7 @@
 package dev.upscaler.mixin;
 
 import com.mojang.blaze3d.systems.CommandEncoderBackend;
+import com.mojang.blaze3d.systems.GpuSurface;
 import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
@@ -8,9 +9,21 @@ import com.mojang.blaze3d.vulkan.VulkanGpuSurface;
 import dev.upscaler.UpscalerConfig;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.RtComposite;
+import dev.upscaler.rt.RtDeviceBringup;
+import dev.upscaler.rt.RtFramePresenter;
 import dev.upscaler.rt.RtHdr;
+import dev.upscaler.rt.RtReflex;
 import it.unimi.dsi.fastutil.longs.LongList;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.KHRSwapchain;
+import org.lwjgl.vulkan.VkAllocationCallbacks;
+import org.lwjgl.vulkan.VkDevice;
+import org.lwjgl.vulkan.VkPresentIdKHR;
+import org.lwjgl.vulkan.VkPresentInfoKHR;
+import org.lwjgl.vulkan.VkQueue;
 import org.lwjgl.vulkan.VkSurfaceFormatKHR;
+import org.lwjgl.vulkan.VkSwapchainCreateInfoKHR;
+import org.lwjgl.vulkan.VkSwapchainLatencyCreateInfoNV;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -18,8 +31,11 @@ import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+import java.nio.LongBuffer;
 
 /**
  * HDR Phase 0 capability logging + Phase 2 step B scRGB swapchain selection.
@@ -47,6 +63,13 @@ public abstract class VulkanGpuSurfaceMixin {
 	@Shadow
 	@Final
 	private long surface;
+
+	@Shadow
+	@Final
+	private org.lwjgl.vulkan.VkQueue presentQueue;
+
+	@Shadow
+	private long swapchain;
 
 	@Shadow
 	@Final
@@ -118,6 +141,87 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
+	 * Reflex Phase 1a: chain {@code VkSwapchainLatencyCreateInfoNV{latencyModeEnable=true}} into the
+	 * swapchain's pNext at creation. Per spec {@code vkSetLatencySleepModeNV} (not called yet — lands with
+	 * the sleep loop) only takes effect on a swapchain created with this flag, so it has to be set here,
+	 * before there's any other reason to touch swapchain creation. Preserves whatever pNext was already
+	 * there (currently nothing else chains one). The extra struct is stack-allocated and only needs to
+	 * survive this call — Vulkan reads pNext chains synchronously during {@code vkCreateSwapchainKHR}, it
+	 * doesn't retain the pointer afterward, so freeing it when this method's stack frame pops is safe even
+	 * though {@code pCreateInfo} isn't touched again after this point in {@code configure()}. No-op (calls
+	 * through unchanged) when Reflex isn't enabled + device-supported.
+	 */
+	@Redirect(method = "configure",
+			at = @At(value = "INVOKE",
+					target = "Lorg/lwjgl/vulkan/KHRSwapchain;vkCreateSwapchainKHR(Lorg/lwjgl/vulkan/VkDevice;Lorg/lwjgl/vulkan/VkSwapchainCreateInfoKHR;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Ljava/nio/LongBuffer;)I"))
+	private int upscaler$createSwapchainWithReflex(VkDevice device, VkSwapchainCreateInfoKHR pCreateInfo,
+			VkAllocationCallbacks pAllocator, LongBuffer pSwapchain) {
+		if (!RtDeviceBringup.reflexEnabled()) {
+			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+		}
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
+			latency.pNext(pCreateInfo.pNext());
+			latency.latencyModeEnable(true);
+			pCreateInfo.pNext(latency.address());
+			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+		}
+	}
+
+	/**
+	 * Reflex Phase 1b: (re)apply the sleep-mode config for the just-(re)configured swapchain. Per spec this
+	 * is scoped to a specific swapchain object, so it must be re-called whenever {@code configure()} builds a
+	 * new one (e.g. resize) — {@link RtReflex#applySleepMode} is idempotent (no-op if unchanged), so calling
+	 * it unconditionally here is cheap. No-op when Reflex isn't enabled + device-supported.
+	 */
+	@Inject(method = "configure", at = @At("TAIL"))
+	private void upscaler$applyReflexSleepMode(GpuSurface.Configuration config, CallbackInfo ci) {
+		if (RtDeviceBringup.reflexEnabled()) {
+			RtReflex.INSTANCE.applySleepMode(this.device.vkDevice(), this.swapchain);
+		}
+	}
+
+	/**
+	 * Reflex Phase 1b: PRESENT_START/END markers around the real frame's present, plus (when
+	 * {@code VK_KHR_present_id} is enabled) chaining a {@code VkPresentIdKHR} onto it so the marker's
+	 * {@code presentID} correlates with this exact present call. The FG-generated extra presents
+	 * ({@link RtFramePresenter}) are deliberately NOT marked/present-id'd — Reflex paces/measures the real
+	 * frame only. No-op passthrough unless Reflex has successfully applied sleep mode for this swapchain.
+	 */
+	@Redirect(method = "present",
+			at = @At(value = "INVOKE",
+					target = "Lorg/lwjgl/vulkan/KHRSwapchain;vkQueuePresentKHR(Lorg/lwjgl/vulkan/VkQueue;Lorg/lwjgl/vulkan/VkPresentInfoKHR;)I"))
+	private int upscaler$presentWithReflex(VkQueue queue, VkPresentInfoKHR presentInfo) {
+		boolean reflexActive = RtReflex.enabled() && this.swapchain == RtReflex.INSTANCE.appliedSwapchain();
+		if (!reflexActive) {
+			return KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
+		}
+		VkDevice vkDevice = this.device.vkDevice();
+		// Own counter (not currentSimFrameId()): Minecraft can present outside the normal tick loop (e.g.
+		// Minecraft.setScreenAndShow's synchronous redraw when opening a world), so presentID must advance on
+		// every actual vkQueuePresentKHR call, not just once per sleep()/runTick — otherwise a stale, already-
+		// used id gets resent and VUID-VkPresentIdKHR-presentIds-04999 fires.
+		long presentId = RtReflex.INSTANCE.advancePresentId();
+		RtReflex.INSTANCE.marker(vkDevice, this.swapchain, RtReflex.MARKER_RENDERSUBMIT_END, presentId);
+		RtReflex.INSTANCE.marker(vkDevice, this.swapchain, RtReflex.MARKER_PRESENT_START, presentId);
+		int result;
+		if (RtDeviceBringup.presentIdEnabled()) {
+			try (MemoryStack stack = MemoryStack.stackPush()) {
+				VkPresentIdKHR vkPresentId = VkPresentIdKHR.calloc(stack).sType$Default()
+						.pNext(presentInfo.pNext())
+						.swapchainCount(1)
+						.pPresentIds(stack.longs(presentId));
+				presentInfo.pNext(vkPresentId.address());
+				result = KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
+			}
+		} else {
+			result = KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
+		}
+		RtReflex.INSTANCE.marker(vkDevice, this.swapchain, RtReflex.MARKER_PRESENT_END, presentId);
+		return result;
+	}
+
+	/**
 	 * Step C — world-only HDR present. When the RT renderer has a fresh scRGB HDR image and the swapchain is
 	 * scRGB, blit that image straight into the swapchain instead of Minecraft's SDR main target. Replaces the
 	 * vanilla blit entirely (the SDR target + its UI are bypassed for now; UI compositing is a later step).
@@ -153,5 +257,37 @@ public abstract class VulkanGpuSurfaceMixin {
 	@Unique
 	private static long upscaler$vkImageView(GpuTextureView view) {
 		return view instanceof com.mojang.blaze3d.vulkan.VulkanGpuTextureView v ? v.vkImageView() : 0L;
+	}
+
+	/**
+	 * DLSS Frame Generation (slice 2): after Minecraft blits the real frame into its acquired swapchain image
+	 * (but before {@code present()} shows it), present the generated frame(s) into additional swapchain images
+	 * via {@link RtFramePresenter}, so the display order is generated-then-real. Runs only on the normal
+	 * present path — the HDR/scRGB present hooks cancel {@code blitFromTexture} at HEAD, so this TAIL is
+	 * skipped there (HDR+FG deferred). Iteration 1 duplicates the final frame (no DLSSG eval yet).
+	 */
+	@Inject(method = "blitFromTexture", at = @At("TAIL"))
+	private void upscaler$presentGeneratedFrames(CommandEncoderBackend commandEncoder, GpuTextureView textureView, CallbackInfo ci) {
+		if (this.currentImageIndex < 0 || !RtFramePresenter.INSTANCE.isActive()) {
+			return;
+		}
+		long srcImage = textureView.texture() instanceof com.mojang.blaze3d.vulkan.VulkanGpuTexture t ? t.vkImage() : 0L;
+		long srcView = upscaler$vkImageView(textureView);
+		if (srcImage == 0L) {
+			return;
+		}
+		int generatedCount = dev.upscaler.rt.pipeline.RtDlssFg.INSTANCE.effectiveMultiFrameCount();
+		RtFramePresenter.INSTANCE.prepareExtraFrames((VulkanCommandEncoder) commandEncoder, this.device,
+				this.swapchain, this.swapchainImages, this.presentSemaphores,
+				this.swapchainWidth, this.swapchainHeight,
+				srcView, srcImage, textureView.getWidth(0), textureView.getHeight(0), generatedCount);
+	}
+
+	// Present the FG-generated frame(s) acquired/recorded at blitFromTexture TAIL — at present() HEAD, after
+	// Minecraft.java's encoder.submit() has flushed (so our present semaphores are signaled) and before MC
+	// presents the real frame, giving display order generated-then-real.
+	@Inject(method = "present", at = @At("HEAD"))
+	private void upscaler$flushGeneratedPresents(CallbackInfo ci) {
+		RtFramePresenter.INSTANCE.flushPendingPresents(this.swapchain, this.presentQueue);
 	}
 }

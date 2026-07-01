@@ -29,6 +29,10 @@ public final class NgxLibrary {
 	private final MethodHandle dlssdAvailable;
 	private final MethodHandle createDlssd;
 	private final MethodHandle evaluateDlssd;
+	private final MethodHandle dlssgAvailable;
+	private final MethodHandle dlssgMultiFrameCountMax;
+	private final MethodHandle createDlssg;
+	private final MethodHandle evaluateDlssg;
 	private final MethodHandle release;
 	private final MethodHandle shutdown;
 	private final MethodHandle lastResult;
@@ -86,6 +90,32 @@ public final class NgxLibrary {
 						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
 						ValueLayout.JAVA_INT, ValueLayout.JAVA_FLOAT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+		// DLSS Frame Generation (DLSSG). Optional: a stale shim without these exports still loads (FG off).
+		this.dlssgAvailable = optionalHandle(lookup, "ngxshim_dlssg_available",
+				FunctionDescriptor.of(ValueLayout.JAVA_INT));
+		this.dlssgMultiFrameCountMax = optionalHandle(lookup, "ngxshim_dlssg_multi_frame_count_max",
+				FunctionDescriptor.of(ValueLayout.JAVA_INT));
+		// void* ngxshim_create_dlssg(cmd, u32 w, u32 h, u32 rw, u32 rh, int nativeBackbufferFormat)
+		this.createDlssg = optionalHandle(lookup, "ngxshim_create_dlssg",
+				FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+		// int ngxshim_evaluate_dlssg(cmd, feature, [backbuffer/depth/mvec/hudless/ui/outInterp/outReal: view,img,fmt]*7,
+		//   w,h, mvecDepthW, mvecDepthH, mfCount, mfIndex, mvScaleX, mvScaleY, depthInv, hdr, camMotion, reset, 4 matrices)
+		this.evaluateDlssg = optionalHandle(lookup, "ngxshim_evaluate_dlssg",
+				FunctionDescriptor.of(ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.ADDRESS,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+						ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+						ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
 		this.release = handle(lookup, "ngxshim_release",
 				FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
 		this.shutdown = handle(lookup, "ngxshim_shutdown",
@@ -102,6 +132,13 @@ public final class NgxLibrary {
 		return LINKER.downcallHandle(
 				lookup.find(name).orElseThrow(() -> new IllegalStateException("ngxshim missing export " + name)),
 				desc);
+	}
+
+	// For exports added later than the core ABI (e.g. DLSSG): a stale locally-built ngxshim.dll (the DLL is
+	// not rebuilt by gradle, only copied) must still load so DLSS-RR keeps working — the newer feature just
+	// reports unavailable. Returns null when the symbol is absent.
+	private static MethodHandle optionalHandle(SymbolLookup lookup, String name, FunctionDescriptor desc) {
+		return lookup.find(name).map(sym -> LINKER.downcallHandle(sym, desc)).orElse(null);
 	}
 
 	public int requiredExtensions(boolean wantDevice, MemorySegment outBuf, int bufLen) {
@@ -219,6 +256,75 @@ public final class NgxLibrary {
 					worldToViewMatrix, viewToClipMatrix);
 		} catch (Throwable t) {
 			throw new RuntimeException("ngxshim_evaluate_dlssd failed", t);
+		}
+	}
+
+	/** Whether the loaded shim exposes the DLSSG ABI at all (false for a stale shim built before FG). */
+	public boolean hasDlssg() {
+		return dlssgAvailable != null && createDlssg != null && evaluateDlssg != null;
+	}
+
+	public boolean dlssgAvailable() {
+		if (dlssgAvailable == null) {
+			return false;
+		}
+		try {
+			return ((int) this.dlssgAvailable.invokeExact()) != 0;
+		} catch (Throwable t) {
+			throw new RuntimeException("ngxshim_dlssg_available failed", t);
+		}
+	}
+
+	public int dlssgMultiFrameCountMax() {
+		if (dlssgMultiFrameCountMax == null) {
+			return 0;
+		}
+		try {
+			return (int) this.dlssgMultiFrameCountMax.invokeExact();
+		} catch (Throwable t) {
+			throw new RuntimeException("ngxshim_dlssg_multi_frame_count_max failed", t);
+		}
+	}
+
+	public MemorySegment createDlssg(long cmd, int width, int height, int renderWidth, int renderHeight,
+	                                 int nativeBackbufferFormat) {
+		try {
+			return (MemorySegment) this.createDlssg.invokeExact(cmd, width, height, renderWidth, renderHeight,
+					nativeBackbufferFormat);
+		} catch (Throwable t) {
+			throw new RuntimeException("ngxshim_create_dlssg failed", t);
+		}
+	}
+
+	public int evaluateDlssg(long cmd, MemorySegment feature,
+	                         long backbufferView, long backbufferImage, int backbufferFormat,
+	                         long depthView, long depthImage, int depthFormat,
+	                         long mvecView, long mvecImage, int mvecFormat,
+	                         long hudlessView, long hudlessImage, int hudlessFormat,
+	                         long uiView, long uiImage, int uiFormat,
+	                         long outputInterpView, long outputInterpImage, int outputInterpFormat,
+	                         long outputRealView, long outputRealImage, int outputRealFormat,
+	                         int width, int height, int mvecDepthWidth, int mvecDepthHeight,
+	                         int multiFrameCount, int multiFrameIndex,
+	                         float mvecScaleX, float mvecScaleY,
+	                         int depthInverted, int colorBuffersHDR, int cameraMotionIncluded, int reset,
+	                         MemorySegment cameraViewToClip, MemorySegment clipToCameraView,
+	                         MemorySegment clipToPrevClip, MemorySegment prevClipToClip) {
+		try {
+			return (int) this.evaluateDlssg.invokeExact(cmd, feature,
+					backbufferView, backbufferImage, backbufferFormat,
+					depthView, depthImage, depthFormat,
+					mvecView, mvecImage, mvecFormat,
+					hudlessView, hudlessImage, hudlessFormat,
+					uiView, uiImage, uiFormat,
+					outputInterpView, outputInterpImage, outputInterpFormat,
+					outputRealView, outputRealImage, outputRealFormat,
+					width, height, mvecDepthWidth, mvecDepthHeight,
+					multiFrameCount, multiFrameIndex, mvecScaleX, mvecScaleY,
+					depthInverted, colorBuffersHDR, cameraMotionIncluded, reset,
+					cameraViewToClip, clipToCameraView, clipToPrevClip, prevClipToClip);
+		} catch (Throwable t) {
+			throw new RuntimeException("ngxshim_evaluate_dlssg failed", t);
 		}
 	}
 

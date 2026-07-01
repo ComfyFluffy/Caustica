@@ -15,6 +15,10 @@
 #include "nvsdk_ngx_helpers_vk.h"
 #include "nvsdk_ngx_helpers_dlssd.h"
 #include "nvsdk_ngx_helpers_dlssd_vk.h"
+#include "nvsdk_ngx_defs_dlssg.h"
+#include "nvsdk_ngx_params_dlssg.h"
+#include "nvsdk_ngx_helpers_dlssg.h"
+#include "nvsdk_ngx_helpers_dlssg_vk.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -321,8 +325,9 @@ NGX_SHIM_EXPORT int ngxshim_dlssd_available() {
 }
 
 // Creates a DLSS Ray Reconstruction (DLSSD) feature. Configured for our path tracer: DL-unified
-// denoise, roughness packed into normals.w, and linear depth (we feed view-distance, not HW depth).
-// renderPreset is an NVSDK_NGX_RayReconstruction_Hint_Render_Preset value (0 = DLL default).
+// denoise, roughness packed into normals.w, and HW (non-linear, reversed-Z) depth — the rgen writes
+// ndc z/w, shared with Frame Generation. renderPreset is an NVSDK_NGX_RayReconstruction_Hint_Render_Preset
+// value (0 = DLL default).
 NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
                                            unsigned int renderWidth, unsigned int renderHeight,
                                            unsigned int displayWidth, unsigned int displayHeight,
@@ -354,7 +359,7 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     std::memset(&createParams, 0, sizeof(createParams));
     createParams.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
     createParams.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed; // roughness from normals.w
-    createParams.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_Linear;        // we feed linear view depth
+    createParams.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;            // rgen writes ndc reversed-Z depth
     createParams.InWidth = renderWidth;
     createParams.InHeight = renderHeight;
     createParams.InTargetWidth = displayWidth;
@@ -418,8 +423,6 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     (void) specularHitDistanceView;
     (void) specularHitDistanceImage;
     (void) specularHitDistanceFormat;
-    (void) worldToViewMatrix;
-    (void) viewToClipMatrix;
 
     NVSDK_NGX_Resource_VK color = makeImageResource(colorView, colorImage, colorFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK depth = makeImageResource(depthView, depthImage, depthFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
@@ -441,8 +444,9 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     eval.pInNormals = &normals;
     eval.pInMotionVectorsReflections = &specularMotion;
     eval.pInSpecularHitDistance = nullptr;
-    eval.pInWorldToViewMatrix = nullptr;
-    eval.pInViewToClipMatrix = nullptr;
+    // HW depth needs the projection so DLSS can linearize it (jitter-free; NGX left-multiply layout).
+    eval.pInWorldToViewMatrix = worldToViewMatrix;
+    eval.pInViewToClipMatrix = viewToClipMatrix;
     // pInRoughness left null: InRoughnessMode_Packed reads roughness from normals.w.
     eval.InJitterOffsetX = jitterX;
     eval.InJitterOffsetY = jitterY;
@@ -457,6 +461,130 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     NVSDK_NGX_Result r = NGX_VULKAN_EVALUATE_DLSSD_EXT(cmd, f->handle, f->params, &eval);
     g_lastResult = (int) r;
     NGX_LOG("evaluate_dlssd: EVALUATE_DLSSD_EXT r=0x%08x", (unsigned) r);
+    return (int) r;
+}
+
+// 1 if DLSS Frame Generation is available on this system, else 0.
+NGX_SHIM_EXPORT int ngxshim_dlssg_available() {
+    if (!g_capabilityParams) {
+        return 0;
+    }
+    int available = 0;
+    NVSDK_NGX_Parameter_GetI(g_capabilityParams, NVSDK_NGX_Parameter_FrameGeneration_Available, &available);
+    return available;
+}
+
+// Maximum multi-frame-generation count the driver/DLL supports (1 = 2x only). 0 if unknown.
+NGX_SHIM_EXPORT unsigned int ngxshim_dlssg_multi_frame_count_max() {
+    if (!g_capabilityParams) {
+        return 0;
+    }
+    unsigned int maxCount = 0;
+    NVSDK_NGX_Parameter_GetUI(g_capabilityParams, NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maxCount);
+    return maxCount;
+}
+
+// Creates a DLSS Frame Generation (DLSSG) feature. Width/Height are the backbuffer (present) size;
+// render size is the upscaled-but-pre-FG size (== backbuffer when no dynamic-res). nativeBackbufferFormat
+// is the VkFormat of the presented swapchain image. Like DLSSD, FG must be created with the shared
+// capability parameter block (it carries the snippet callbacks), so the feature does not own it.
+NGX_SHIM_EXPORT void* ngxshim_create_dlssg(VkCommandBuffer cmd,
+                                           unsigned int width, unsigned int height,
+                                           unsigned int renderWidth, unsigned int renderHeight,
+                                           int nativeBackbufferFormat) {
+    NVSDK_NGX_Parameter* params = g_capabilityParams;
+    if (!params) {
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_NotInitialized;
+        return nullptr;
+    }
+
+    NVSDK_NGX_DLSSG_Create_Params createParams;
+    std::memset(&createParams, 0, sizeof(createParams));
+    createParams.Width = width;
+    createParams.Height = height;
+    createParams.NativeBackbufferFormat = (unsigned int) nativeBackbufferFormat;
+    createParams.RenderWidth = renderWidth;
+    createParams.RenderHeight = renderHeight;
+    createParams.DynamicResolutionScaling = false;
+
+    NVSDK_NGX_Handle* handle = nullptr;
+    NVSDK_NGX_Result r = NGX_VK_CREATE_DLSSG(cmd, 1, 1, &handle, params, &createParams);
+    g_lastResult = (int) r;
+    if (NVSDK_NGX_FAILED(r)) {
+        return nullptr; // params is the shared capability block; do not destroy it
+    }
+
+    DlssFeature* feature = (DlssFeature*) std::malloc(sizeof(DlssFeature));
+    feature->handle = handle;
+    feature->params = params;
+    feature->ownsParams = false; // shared capability block, freed at shutdown
+    return feature;
+}
+
+// Records a DLSS Frame Generation evaluation: generate one interpolated frame (index multiFrameIndex of
+// multiFrameCount) into outputInterp from the final backbuffer + hardware depth + motion vectors. Optional
+// resources (hudless, ui, outputReal) are skipped when their view handle is 0. Matrices are 16-float
+// row-major (NGX left-multiply convention) and MUST be jitter-free; pass null to leave a matrix zeroed.
+// depthInverted/colorBuffersHDR/cameraMotionIncluded/reset are 0/1 flags. Each call generates ONE frame;
+// the caller presents generated frame(s) then the real frame with its own pacing.
+NGX_SHIM_EXPORT int ngxshim_evaluate_dlssg(VkCommandBuffer cmd, void* feature,
+                                           VkImageView backbufferView, VkImage backbufferImage, int backbufferFormat,
+                                           VkImageView depthView, VkImage depthImage, int depthFormat,
+                                           VkImageView mvecView, VkImage mvecImage, int mvecFormat,
+                                           VkImageView hudlessView, VkImage hudlessImage, int hudlessFormat,
+                                           VkImageView uiView, VkImage uiImage, int uiFormat,
+                                           VkImageView outputInterpView, VkImage outputInterpImage, int outputInterpFormat,
+                                           VkImageView outputRealView, VkImage outputRealImage, int outputRealFormat,
+                                           unsigned int width, unsigned int height,
+                                           unsigned int mvecDepthWidth, unsigned int mvecDepthHeight,
+                                           unsigned int multiFrameCount, unsigned int multiFrameIndex,
+                                           float mvecScaleX, float mvecScaleY,
+                                           int depthInverted, int colorBuffersHDR, int cameraMotionIncluded, int reset,
+                                           float* cameraViewToClip, float* clipToCameraView,
+                                           float* clipToPrevClip, float* prevClipToClip) {
+    DlssFeature* f = (DlssFeature*) feature;
+    if (!f) {
+        return -1;
+    }
+
+    NVSDK_NGX_Resource_VK backbuffer = makeImageResource(backbufferView, backbufferImage, backbufferFormat, width, height, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK depth = makeImageResource(depthView, depthImage, depthFormat, mvecDepthWidth, mvecDepthHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK mvec = makeImageResource(mvecView, mvecImage, mvecFormat, mvecDepthWidth, mvecDepthHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK hudless = makeImageResource(hudlessView, hudlessImage, hudlessFormat, width, height, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK ui = makeImageResource(uiView, uiImage, uiFormat, width, height, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK outputInterp = makeImageResource(outputInterpView, outputInterpImage, outputInterpFormat, width, height, VK_IMAGE_ASPECT_COLOR_BIT, true);
+    NVSDK_NGX_Resource_VK outputReal = makeImageResource(outputRealView, outputRealImage, outputRealFormat, width, height, VK_IMAGE_ASPECT_COLOR_BIT, true);
+
+    NVSDK_NGX_VK_DLSSG_Eval_Params eval;
+    std::memset(&eval, 0, sizeof(eval));
+    eval.pBackbuffer = &backbuffer;
+    eval.pDepth = &depth;
+    eval.pMVecs = &mvec;
+    eval.pHudless = hudlessView ? &hudless : nullptr;
+    eval.pUI = uiView ? &ui : nullptr;
+    eval.pUIAlpha = nullptr;
+    eval.pBidirectionalDistortionField = nullptr;
+    eval.pOutputInterpFrame = &outputInterp;
+    eval.pOutputRealFrame = outputRealView ? &outputReal : nullptr;
+    eval.pOutputDisableInterpolation = nullptr;
+
+    // Default-construct so the SDK's in-class defaults apply (multiFrameCount=1, etc.), then override.
+    NVSDK_NGX_DLSSG_Opt_Eval_Params opt{};
+    opt.multiFrameCount = multiFrameCount;
+    opt.multiFrameIndex = multiFrameIndex;
+    opt.mvecScale[0] = mvecScaleX;
+    opt.mvecScale[1] = mvecScaleY;
+    opt.depthInverted = depthInverted != 0;
+    opt.colorBuffersHDR = colorBuffersHDR != 0;
+    opt.cameraMotionIncluded = cameraMotionIncluded != 0;
+    opt.reset = reset != 0;
+    if (cameraViewToClip) std::memcpy(opt.cameraViewToClip, cameraViewToClip, sizeof(opt.cameraViewToClip));
+    if (clipToCameraView) std::memcpy(opt.clipToCameraView, clipToCameraView, sizeof(opt.clipToCameraView));
+    if (clipToPrevClip) std::memcpy(opt.clipToPrevClip, clipToPrevClip, sizeof(opt.clipToPrevClip));
+    if (prevClipToClip) std::memcpy(opt.prevClipToClip, prevClipToClip, sizeof(opt.prevClipToClip));
+
+    NVSDK_NGX_Result r = NGX_VK_EVALUATE_DLSSG(cmd, f->handle, f->params, &eval, &opt);
+    g_lastResult = (int) r;
     return (int) r;
 }
 

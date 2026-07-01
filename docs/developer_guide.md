@@ -62,6 +62,21 @@ cmake -S native/ngx_shim -B build/cmake/ngx_shim/release -DCMAKE_BUILD_TYPE=Rele
 cmake --build build/cmake/ngx_shim/release
 ```
 
+## Native Bundling
+
+Gradle bundles NGX natives for the current host platform by default:
+
+```bash
+./gradlew build
+```
+
+Release builds that already have both platform shims available can request a
+cross-platform native bundle:
+
+```bash
+./gradlew build -PngxPlatforms=windows-x64,linux-x64
+```
+
 Run the Vulkan RT/DLSS-RR client with:
 
 ```bash

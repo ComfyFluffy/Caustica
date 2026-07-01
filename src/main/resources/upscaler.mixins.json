@@ -12,6 +12,7 @@
 		"GuiRendererMixin",
 		"LevelRendererMixin",
 		"LevelExtractorMixin",
+		"MinecraftMixin",
 		"MinecraftReloadMixin",
 		"OptionsSubScreenAccessor",
 		"ParticleEngineAccessor",

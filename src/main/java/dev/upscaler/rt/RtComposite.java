@@ -44,6 +44,7 @@ import dev.upscaler.rt.material.RtBlockMaterials;
 import dev.upscaler.rt.material.RtEntityMaterials;
 import dev.upscaler.rt.material.RtMaterials;
 import dev.upscaler.rt.pipeline.RtDisplayPipeline;
+import dev.upscaler.rt.pipeline.RtDlssFg;
 import dev.upscaler.rt.pipeline.RtDlssRr;
 import dev.upscaler.rt.pipeline.RtHdrCompositePipeline;
 import dev.upscaler.rt.pipeline.RtSdrPresentPipeline;
@@ -85,7 +86,7 @@ public final class RtComposite {
     // + dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
     // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
     // + W1/W2 water: waterParams(@320) xyz=camera-biome tint, w=wave time; waterAnchor(@336) xy=wave anchor
-    private static final int WORLD_PUSH_SIZE = 352;
+    private static final int WORLD_PUSH_SIZE = 416;
     private static final int GUIDE_COUNT = 6; // RR guide buffers bound at world-pipeline bindings 3..8
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
@@ -194,6 +195,15 @@ public final class RtComposite {
     // raw-copied (washed). Lazily created; the image is sized to the swapchain.
     private RtSdrPresentPipeline sdrPresentPipeline;
     private RtImage sdrPresentImage;
+    // DLSS Frame Generation: per-generated-frame interpolated output images (backbuffer size/format), and
+    // the jitter-free reprojection matrices derived from the MV view-projections each frame.
+    private RtImage[] fgInterp = new RtImage[0];
+    private int fgInterpW = -1;
+    private int fgInterpH = -1;
+    private boolean fgReset = true;
+    private final Matrix4f fgClipToPrev = new Matrix4f();
+    private final Matrix4f fgPrevToClip = new Matrix4f();
+    private final Matrix4f fgMatTmp = new Matrix4f();
     // Guide buffers (first-hit attributes for DLSS-RR): normal+roughness, albedo, depth, motion,
     // specular albedo, and reflection motion.
     private RtImage gNormal;
@@ -656,6 +666,7 @@ public final class RtComposite {
             RtBuffer pushBuf = pushRing[pushSlot];
             ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
             frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert().get(0, push);
+            mvCurProjView.get(352, push); // forward camera-relative view-projection: HW depth guide + water MV
             push.putFloat(64, (float) (camX - terrain.blockX));
             push.putFloat(68, (float) (camY - terrain.blockY));
             push.putFloat(72, (float) (camZ - terrain.blockZ));
@@ -967,6 +978,14 @@ public final class RtComposite {
             sdrPresentImage.destroy();
             sdrPresentImage = null;
         }
+        for (RtImage img : fgInterp) {
+            if (img != null) {
+                img.destroy();
+            }
+        }
+        fgInterp = new RtImage[0];
+        fgInterpW = -1;
+        fgInterpH = -1;
         if (worldPipeline != null) {
             worldPipeline.destroy();
             worldPipeline = null;
@@ -1261,5 +1280,95 @@ public final class RtComposite {
         region.get(0).dstOffsets(1).set(dst.width, dst.height, 1);
         VK10.vkCmdBlitImage(cmd, src.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                 dst.image, VK10.VK_IMAGE_LAYOUT_GENERAL, region, VK10.VK_FILTER_LINEAR);
+    }
+
+    /**
+     * DLSS Frame Generation: record the DLSSG evaluate for generated frame {@code index} of {@code count}
+     * (backbuffer = the final frame; HW depth = {@code gDepth}; motion = {@code gMotion}) into Minecraft's
+     * command encoder, returning the interpolated output image (backbuffer size) for {@link RtFramePresenter}
+     * to blit into a generated swapchain image. On {@code index == 1} it ensures the feature (created in its
+     * own synchronous submit), the per-index output images, and the jitter-free reprojection matrices.
+     * Returns {@code null} (caller falls back to duplicating the real frame for this one frame, no session
+     * impact) when there's simply no captured RT frame to interpolate from right now — routine and expected
+     * on menu/loading/transition frames, since {@link RtFramePresenter#isActive} only gates on being in a
+     * world, not on RT having actually produced a frame this tick. Throws instead for failures that should
+     * never happen once RT is actively producing frames (DLSSG feature creation failing, an out-of-range
+     * index, the evaluate itself failing) — the caller treats those as fatal and disables FG for the
+     * session, same as any other FG present-record failure, rather than silently degrading to duplicated
+     * (non-interpolated) frames forever with no visible sign anything is wrong. Rotation-only matrices;
+     * camera translation is carried by the mvecs (cameraMotionIncluded).
+     */
+    public RtImage fgInterpolate(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
+            int swapW, int swapH, int index, int count) {
+        if (failed || gDepth == null || gMotion == null || !frameCaptured) {
+            return null;
+        }
+        RtContext ctx = RtContext.currentOrNull();
+        if (ctx == null) {
+            return null;
+        }
+        final int fmt = VK10.VK_FORMAT_R8G8B8A8_UNORM; // Minecraft's main render target format
+        if (index == 1) {
+            if (!ensureFgFeature(ctx, swapW, swapH, renderW, renderH, fmt)) {
+                throw new IllegalStateException("DLSSG feature not ready (ensureFgFeature failed)");
+            }
+            ensureFgInterp(ctx, count, swapW, swapH, fmt);
+            // clipToPrevClip = prevVP * inverse(curVP); prevClipToClip = curVP * inverse(prevVP). Both from
+            // the (rotation-only, camera-relative) MV view-projections, so jitter-free.
+            fgMatTmp.set(mvCurProjView).invert();
+            fgClipToPrev.set(mvPrevProjView).mul(fgMatTmp);
+            fgMatTmp.set(mvPrevProjView).invert();
+            fgPrevToClip.set(mvCurProjView).mul(fgMatTmp);
+        }
+        if (index < 1 || index > fgInterp.length || fgInterp[index - 1] == null) {
+            throw new IllegalStateException(
+                    "fgInterpolate index " + index + " out of range for fgInterp[" + fgInterp.length + "]");
+        }
+        RtImage out = fgInterp[index - 1];
+        VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
+        boolean ok = RtDlssFg.INSTANCE.evaluate(cmd.address(),
+                backbufferView, backbufferImage, fmt,
+                gDepth.view, gDepth.image, VK10.VK_FORMAT_R32_SFLOAT,
+                gMotion.view, gMotion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
+                out.view, out.image, fmt,
+                swapW, swapH, renderW, renderH, count, index, 1.0f, 1.0f,
+                true /* depthInverted (reversed-Z) */, false /* colorBuffersHDR (SDR path) */,
+                true /* cameraMotionIncluded (in mvecs) */, fgReset,
+                fgClipToPrev, fgPrevToClip);
+        VK10.vkEndCommandBuffer(cmd);
+        fgReset = false;
+        if (!ok) {
+            throw new IllegalStateException("ngxshim_evaluate_dlssg failed (RtDlssFg.evaluate returned false)");
+        }
+        enc.execute(cmd);
+        return out;
+    }
+
+    private boolean ensureFgFeature(RtContext ctx, int w, int h, int rw, int rh, int fmt) {
+        if (RtDlssFg.INSTANCE.featureReadyFor(w, h, rw, rh, fmt)) {
+            return true;
+        }
+        // Create the feature in its own submit + wait (not folded into MC's frame submit).
+        ctx.submitSync(c -> RtDlssFg.INSTANCE.ensureFeature(c.address(), w, h, rw, rh, fmt));
+        fgReset = true; // fresh feature has no temporal history
+        return RtDlssFg.INSTANCE.featureReadyFor(w, h, rw, rh, fmt);
+    }
+
+    private void ensureFgInterp(RtContext ctx, int count, int w, int h, int fmt) {
+        if (fgInterp.length == count && fgInterpW == w && fgInterpH == h
+                && (count == 0 || fgInterp[0] != null)) {
+            return;
+        }
+        for (RtImage img : fgInterp) {
+            if (img != null) {
+                img.destroy();
+            }
+        }
+        fgInterp = new RtImage[count];
+        for (int i = 0; i < count; i++) {
+            fgInterp[i] = ctx.createStorageImage(w, h, fmt, "FG interp " + i + " " + w + "x" + h);
+        }
+        fgInterpW = w;
+        fgInterpH = h;
     }
 }

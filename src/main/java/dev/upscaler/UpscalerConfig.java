@@ -556,6 +556,33 @@ public final class UpscalerConfig {
             }
         }
 
+        /** DLSS Frame Generation. Default off; gated additionally by hardware/driver availability. */
+        public static final class Fg {
+            public static final BooleanSetting ENABLED = bool("upscaler.rt.fg", false);
+            // Frames generated per rendered frame: 1 = 2x (one interpolated), 2 = 3x, etc. Clamped at
+            // runtime to the driver's reported DLSSG.MultiFrameCountMax.
+            public static final IntSetting MULTI_FRAME_COUNT = intAtLeast("upscaler.rt.fg.multiFrameCount", 1, 1);
+
+            private Fg() {
+            }
+        }
+
+        /**
+         * NVIDIA Reflex ({@code VK_NV_low_latency2}). Default off; gated additionally by device support.
+         * Phase 0 (extension + capability probe only, see {@code RtDeviceBringup}/{@code RtReflex}) — the
+         * per-frame sleep call + latency markers + the swapchain {@code VkSwapchainLatencyCreateInfoNV} the
+         * spec requires for {@code vkSetLatencySleepModeNV} to take effect land in a later phase.
+         */
+        public static final class Reflex {
+            public static final BooleanSetting ENABLED = bool("upscaler.rt.reflex", false);
+            public static final BooleanSetting LOW_LATENCY_BOOST = bool("upscaler.rt.reflex.boost", false);
+            // 0 = no framerate cap (Reflex just paces submission, doesn't limit fps).
+            public static final IntSetting MINIMUM_INTERVAL_US = intAtLeast("upscaler.rt.reflex.minIntervalUs", 0, 0);
+
+            private Reflex() {
+            }
+        }
+
         public static final class Exposure {
             public static final StringSetting MODE = string("upscaler.rt.exposure.mode", "auto", Exposure::sanitizeMode);
             public static final FloatSetting FIXED = exposureScale("upscaler.rt.exposure.fixed", 1.1f);

@@ -3,9 +3,12 @@ package dev.upscaler.mixin;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vulkan.VulkanDevice;
 import dev.upscaler.client.VanillaRenderController;
 import dev.upscaler.client.WorldRenderScaler;
 import dev.upscaler.rt.RtComposite;
+import dev.upscaler.rt.RtReflex;
 import dev.upscaler.rt.RtUiOverlay;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.GameRenderer;
@@ -43,6 +46,16 @@ public abstract class GameRendererMixin {
 		// Clear the stale HDR-present flag every frame: composite() only runs while a level renders, so on
 		// menu frames it would otherwise stay true from the last world frame and present a black HDR image.
 		RtComposite.INSTANCE.beginFrame();
+		// Reflex RENDERSUBMIT_START: render-graph recording begins here; RENDERSUBMIT_END is set at
+		// VulkanGpuSurface.present() HEAD (VulkanGpuSurfaceMixin), just before the real present.
+		if (RtReflex.enabled()) {
+			long swapchain = RtReflex.INSTANCE.appliedSwapchain();
+			if (swapchain != 0L
+					&& ((GpuDeviceAccessor) RenderSystem.getDevice()).upscaler$getBackend() instanceof VulkanDevice device) {
+				RtReflex.INSTANCE.marker(device.vkDevice(), swapchain, RtReflex.MARKER_RENDERSUBMIT_START,
+						RtReflex.INSTANCE.currentSimFrameId());
+			}
+		}
 	}
 
 	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V",
