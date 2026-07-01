@@ -191,28 +191,22 @@ if (requestedNgxPlatformsRaw.size() == 1 && requestedNgxPlatformsRaw[0].equalsIg
 def dlssSdkEnv = providers.environmentVariable("DLSS_SDK")
 def dlssSdkRootProvider = dlssSdkEnv.map { file(it) }
 
-def bundleNgxNatives = tasks.register("bundleNgxNatives", Copy) {
+def bundleNgxNatives = tasks.register("bundleNgxNatives") {
 	group = "build"
 	description = "Bundles NGX shim and DLSS native libraries into the mod resources."
 
 	selectedNgxNativePlatforms.each { platform ->
-		def platformShimFiles = fileTree(ngxShimOutDir) {
+		inputs.files(fileTree(ngxShimOutDir) {
 			include platform.shimIncludes
-		}
-		def platformVendorFiles = fileTree(platform.vendorRoot(dlssSdkRootProvider.getOrElse(file("__missing_dlss_sdk__")))) {
+		}).withPropertyName("ngxNatives.${platform.name}.shim")
+		inputs.files(fileTree(platform.vendorRoot(dlssSdkRootProvider.getOrElse(file("__missing_dlss_sdk__")))) {
 			include platform.vendorIncludes
-		}
-		inputs.files(platformShimFiles).withPropertyName("ngxNatives.${platform.name}.shim")
-		inputs.files(platformVendorFiles).withPropertyName("ngxNatives.${platform.name}.vendor")
-		from(platformShimFiles) {
-			into "upscaler/natives/${platform.name}"
-		}
-		from(platformVendorFiles) {
-			into "upscaler/natives/${platform.name}"
-		}
+		}).withPropertyName("ngxNatives.${platform.name}.vendor")
 	}
-	into ngxNativeGenRoot
-	doFirst {
+	outputs.dir(ngxNativeGenRoot)
+	outputs.upToDateWhen { false }
+
+	doLast {
 		delete(ngxNativeGenRoot)
 		def missing = []
 		def dlssSdkRoot = dlssSdkRootProvider.orNull
@@ -240,6 +234,21 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives", Copy) {
 		}
 		if (!missing.empty) {
 			throw new GradleException("Missing NGX native inputs:\n - " + missing.join("\n - "))
+		}
+
+		copy {
+			selectedNgxNativePlatforms.each { platform ->
+				from(fileTree(ngxShimOutDir) {
+					include platform.shimIncludes
+				}) {
+					into "upscaler/natives/${platform.name}"
+				}
+				from(fileTree(platform.vendorRoot(dlssSdkRoot))) {
+					include platform.vendorIncludes
+					into "upscaler/natives/${platform.name}"
+				}
+			}
+			into ngxNativeGenRoot
 		}
 	}
 }
