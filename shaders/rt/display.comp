@@ -47,8 +47,8 @@ vec3 agxDefaultContrast(vec3 x) {
 }
 
 vec3 applyLook(vec3 color) {
-    const float contrast = 1.05;   // try 1.15, 1.25, 1.4
-    const float saturation = 1.4; // try 1.05-1.15 if AgX feels grey
+    const float contrast = 1.04;   // try 1.15, 1.25, 1.4
+    const float saturation = 1.05; // try 1.05-1.15 if AgX feels grey
 
     color = clamp((color - 0.5) * contrast + 0.5, 0.0, 1.0);
 
