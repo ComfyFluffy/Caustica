@@ -72,7 +72,7 @@ processResources {
 	}
 }
 
-// Compile the RT GLSL shaders (shaders/rt/*) to SPIR-V at build time instead of tracking the .spv.
+// Compile the GLSL shaders (shaders/**) to SPIR-V at build time instead of tracking the .spv.
 // The .spv are pure build output of the GLSL; generating them here makes stale binaries impossible
 // and gives incremental up-to-date checks. Requires the Vulkan SDK's glslangValidator (+ spirv-val);
 // located via the VULKAN_SDK env var (set by the SDK installer) with a PATH fallback.
@@ -103,7 +103,8 @@ abstract class CompileShaders extends DefaultTask {
 		def outDirFile = outDir.get().asFile
 		outDirFile.mkdirs()
 		outDirFile.listFiles().findAll { it.isFile() && it.name.endsWith(".spv") }.each { it.delete() }
-		def stages = ~/.*\.(rgen|rchit|rahit|rmiss|rcall|comp|vert|frag)$/
+		def stageIncludes = ["**/*.rgen", "**/*.rchit", "**/*.rahit", "**/*.rmiss", "**/*.rcall",
+				"**/*.comp", "**/*.vert", "**/*.frag"]
 		def compileOne = { File src, File spv, List<String> defines ->
 			execOps.exec {
 				// -g (OpLine/OpSource debug info), not -gVS: the NonSemantic.Shader.DebugInfo form (-gVS)
@@ -117,7 +118,17 @@ abstract class CompileShaders extends DefaultTask {
 				commandLine spirvVal.get(), "--target-env", "vulkan1.2", spv.absolutePath
 			}
 		}
-		srcDir.get().asFile.listFiles().findAll { it.isFile() && it.name ==~ stages }.each { src ->
+		def shaderFiles = srcDir.get().asFileTree.matching {
+			include stageIncludes
+		}.files.sort { it.absolutePath }
+		def duplicateOutputs = shaderFiles
+				.groupBy { "${it.name}.spv" }
+				.findAll { entry -> entry.value.size() > 1 }
+		if (!duplicateOutputs.isEmpty()) {
+			throw new GradleException("Duplicate shader output name(s): "
+					+ duplicateOutputs.collect { entry -> "${entry.key} from ${entry.value*.path.join(', ')}" }.join("; "))
+		}
+		shaderFiles.each { src ->
 			def spv = new File(outDirFile, "${src.name}.spv")
 			compileOne(src, spv, [])
 			if (src.name == "world.rgen") {
@@ -129,8 +140,8 @@ abstract class CompileShaders extends DefaultTask {
 
 def compileShaders = tasks.register("compileShaders", CompileShaders) {
 	group = "build"
-	description = "Compiles shaders/rt/*.{rgen,rchit,rahit,rmiss,comp} to SPIR-V and validates them."
-	srcDir = file("shaders/rt")
+	description = "Compiles shaders/** shader sources to SPIR-V and validates them."
+	srcDir = file("shaders")
 	outDir = layout.buildDirectory.dir("generated/shaders/candela/rt")
 	glslang = resolveVulkanTool("glslangValidator")
 	spirvVal = resolveVulkanTool("spirv-val")
