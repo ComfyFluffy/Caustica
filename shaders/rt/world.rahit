@@ -15,7 +15,7 @@
 struct Prim {
     vec4 normal;
     vec4 tint;
-    // P6.1: {rough, metal, hasS, hasN} for solid/cutout — the array stride must match world.rchit / the
+    // {rough, metal, hasS, hasN} for solid/cutout — the array stride must match world.rchit / the
     // uploaded buffer (48 B). TRANSLUCENT-bucket prims repurpose this lane for a precomputed whole-sprite
     // average {r, g, b, a} instead (RtTerrain.emit()/translucentAvgColor) — see BUCKET_TRANSLUCENT below.
     vec4 mat;
@@ -29,7 +29,7 @@ struct EntityGeom {
     uint64_t primAddr;
     uint64_t idxAddr;
     uint64_t uvAddr;
-    uint64_t dispAddr; // P5.1c-2: MV data (unused here; the any-hit only needs primAddr)
+    uint64_t dispAddr; // MV data; unused here because any-hit only needs primAddr
     vec4 rigidDisp;
 };
 

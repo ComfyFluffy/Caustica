@@ -7,8 +7,8 @@ layout(binding = 1, set = 0, rgba16f) uniform readonly image2D rtImage; // HDR R
 layout(binding = 2, set = 0, r32f) uniform readonly image2D exposureImage; // 1x1 linear exposure scale
 layout(binding = 3, set = 0, rgba16f) uniform writeonly image2D hdrImage; // PQ-encoded ([0,1], ST.2084) HDR display
 
-// HDR display parameters. hdrEnabled gates the parallel PQ write; the SDR AgX path always runs so the
-// existing copy-to-main-target presentation is unchanged while HDR is being brought up.
+// HDR display parameters. hdrEnabled gates the parallel PQ write; the SDR AgX path always runs because
+// vanilla main-target presentation still consumes LDR.
 layout(push_constant) uniform Push {
     int hdrEnabled;        // 0 = SDR only, 1 = also write the PQ HDR image
     float paperWhiteNits;  // absolute nits SDR paper white maps to
@@ -16,8 +16,8 @@ layout(push_constant) uniform Push {
 } pc;
 
 // Tonemap seam: map HDR RT radiance to displayable LDR before copying back to the main target.
-// P3.1 emits true HDR (sun NEE + multi-bounce can exceed 1), so exposure is applied here from the
-// compositor-owned 1x1 image before the AgX view transform. DLSS-RR still consumes HDR pre-tonemap.
+// The path tracer emits true HDR radiance, so exposure is applied from the compositor-owned 1x1 image
+// before the AgX view transform. DLSS-RR still consumes HDR pre-tonemap.
 
 const mat3 AGX_INSET = mat3(
     0.842479062253094, 0.042328242261012, 0.042375654905705,
@@ -97,8 +97,7 @@ const mat3 BT709_TO_BT2020 = mat3(
 // HDR display mapping: map exposed scene-linear radiance to absolute nits, then PQ-encode (ST.2084) for
 // direct presentation to a PQ/HDR10 swapchain. SDR-range values (<= 1.0 after exposure) stay identity so
 // paper white lands exactly at paperWhiteNits. Highlights above 1.0 roll off smoothly and asymptote to
-// `headroom`, i.e. the brightest pixels approach peakNits. This is a deliberately simple, tunable first-pass
-// curve; the final highlight shoulder handling can be refined later. No SDR clamp here — that is the point.
+// `headroom`, i.e. the brightest pixels approach peakNits. No SDR clamp here — that is the point.
 vec3 tonemapHdr(vec3 hdr, float exposure) {
     vec3 c = max(hdr * exposure, vec3(0.0));
     vec3 lo = min(c, vec3(1.0));

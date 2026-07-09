@@ -3,12 +3,10 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-// Ray miss = sky. The dynamic sky now lives HERE (it moved out of world.rgen): post-P6.4 the per-frame
-// data is a BDA buffer addressed by an 8-byte push constant, so widening the push range to the MISS
-// stage (RtPipeline pcStages) is the whole cost of giving this shader `pc` — the old "rmiss can't see
-// the push" blocker (gotcha #9) is gone. The shader computes the full sky (atmosphere gradient + sun
-// disc + moon disc with procedural phase + stars) into payload.albedo; raygen reads it back for both the
-// accumulated radiance and the bounce-0 denoiser guides, exactly like the pre-P6.3 era.
+// Ray miss = sky. Per-frame sky data comes from the WorldPush BDA buffer addressed by an 8-byte push
+// constant. Gotcha: the ray-tracing pipeline must include MISS in pcStages or this shader cannot read `pc`.
+// The shader writes full sky radiance (atmosphere gradient + sun disc + moon phase disc + stars) into
+// payload.albedo; raygen consumes that value for both accumulated radiance and bounce-0 denoiser guides.
 //
 // Celestial discs (sun/moon) are gated by a packed payload flag, which raygen sets per-ray from the path
 // state: true on the primary ray and after every specular/dielectric bounce (so the sun/moon show up in
