@@ -31,6 +31,7 @@ changes while the renderer is being built.
 - A GPU and driver with Vulkan ray tracing support
 - NVIDIA RTX GPU and supported driver for DLSS features
 - HDR-capable display and OS HDR mode for HDR output
+- On Linux, an HDR-capable Wayland compositor and a native Wayland session for HDR output
 - Install LabPBR resource pack like [SPBR](https://modrinth.com/resourcepack/spbr) for better visuals
 
 ## Installation
@@ -50,6 +51,7 @@ changes while the renderer is being built.
   `-XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC`
 - Frame Generation is experimental and needs to be enabled by modifying the configuration file.
 - HDR output requires an HDR swapchain and a correctly configured HDR display.
+- When HDR is enabled on Linux, Caustica selects GLFW's native Wayland backend automatically. X11/XWayland surfaces generally do not expose the required HDR10/PQ format.
 - If Minecraft falls back to OpenGL after a crash, re-enable the Vulkan backend
   before using Caustica again.
 

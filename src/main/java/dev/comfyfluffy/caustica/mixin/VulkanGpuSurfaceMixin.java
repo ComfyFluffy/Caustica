@@ -128,7 +128,8 @@ public abstract class VulkanGpuSurfaceMixin {
 				return;
 			}
 		}
-		CausticaMod.LOGGER.warn("HDR: PQ swapchain requested but HDR10_ST2084 not advertised by the surface; using SDR (enable Windows HDR / check VK_EXT_swapchain_colorspace)");
+		CausticaMod.LOGGER.warn("HDR: PQ swapchain requested but HDR10_ST2084 was not advertised by the surface; "
+				+ "using SDR (enable OS/display HDR; on Linux use a native Wayland session with HDR enabled in the compositor)");
 	}
 
 	/** Replace the hardcoded {@code imageColorSpace(0)} with the PQ color space when one was selected. */

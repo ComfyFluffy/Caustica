@@ -13,7 +13,7 @@ import dev.comfyfluffy.caustica.CausticaMod;
 /**
  * HDR display support — capability detection/logging. This class does not change any rendering behavior; it
  * only enumerates and logs what the swapchain surface can present so the swapchain-ownership code knows
- * whether HDR10 (PQ) is actually available on this driver + monitor + Windows-HDR state.
+ * whether HDR10 (PQ) is actually available on this driver, window system, compositor, and monitor.
  *
  * <p>Important: extended color spaces (scRGB linear, HDR10 PQ, …) are only reported by
  * {@code vkGetPhysicalDeviceSurfaceFormatsKHR} when the instance was created with
@@ -89,9 +89,9 @@ public final class RtHdr {
                         i, f.format(), formatName(f.format()), cs, colorSpaceName(cs), hdr ? "  <-- HDR-capable" : "");
             }
             if (anyHdr) {
-                CausticaMod.LOGGER.info("HDR: at least one HDR-capable color space is exposed; PQ/HDR10 presentation is feasible once the swapchain is owned by the mod.");
+                CausticaMod.LOGGER.info("HDR: at least one HDR-capable color space is exposed; PQ/HDR10 presentation is available.");
             } else {
-                CausticaMod.LOGGER.info("HDR: only SDR (SRGB_NONLINEAR) color spaces exposed. This is expected on a stock Minecraft Vulkan instance — VK_EXT_swapchain_colorspace must be enabled at instance-creation time (a later phase) before extended color spaces appear here.");
+                CausticaMod.LOGGER.warn("HDR: only SDR color spaces are exposed by this Vulkan surface. Enable OS/display HDR; on Linux, use native Wayland with HDR enabled in the compositor.");
             }
         } catch (Throwable t) {
             CausticaMod.LOGGER.warn("HDR: surface capability enumeration failed: {}", t.toString());

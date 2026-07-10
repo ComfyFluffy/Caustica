@@ -9,6 +9,7 @@
 		"CommandEncoderAccessor",
 		"GameRendererMixin",
 		"GpuDeviceAccessor",
+		"GlxMixin",
 		"GuiRendererMixin",
 		"LevelRendererMixin",
 		"LevelExtractorMixin",
