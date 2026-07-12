@@ -51,6 +51,8 @@ public final class RtContext {
     private final VkDevice vk;
     private final long vma;
     private final VulkanQueue graphicsQueue;
+    private final VulkanQueue computeQueue;
+    private final RtGpuExecutor gpuExecutor;
     private final int shaderGroupHandleSize;
     private final int shaderGroupBaseAlignment;
     private final int accelerationStructureScratchAlignment;
@@ -61,9 +63,11 @@ public final class RtContext {
         this.vk = device.vkDevice();
         this.vma = vma;
         this.graphicsQueue = device.graphicsQueue();
+        this.computeQueue = device.computeQueue();
         this.shaderGroupHandleSize = handleSize;
         this.shaderGroupBaseAlignment = baseAlign;
         this.accelerationStructureScratchAlignment = scratchAlign;
+        this.gpuExecutor = new RtGpuExecutor(this);
     }
 
     /** The RT context for the current Vulkan device, or null if RT/Vulkan isn't available. */
@@ -131,6 +135,10 @@ public final class RtContext {
         return vma;
     }
 
+    public RtGpuExecutor gpuExecutor() {
+        return gpuExecutor;
+    }
+
     public int shaderGroupHandleSize() {
         return shaderGroupHandleSize;
     }
@@ -150,10 +158,23 @@ public final class RtContext {
 
     /** Create a VMA buffer; {@code SHADER_DEVICE_ADDRESS} is always added so it has a device address. */
     public RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label) {
+        return createBuffer(size, usage, hostVisible, label, false);
+    }
+
+    /** Create a buffer shared by the graphics and async-compute families when those families differ. */
+    public RtBuffer createAsyncBuffer(long size, int usage, boolean hostVisible, String label) {
+        return createBuffer(size, usage, hostVisible, label, true);
+    }
+
+    private RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label, boolean asyncShared) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCreateInfo bci = VkBufferCreateInfo.calloc(stack).sType$Default()
                     .size(size).usage(usage | VK12.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
                     .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE);
+            if (asyncShared && graphicsQueue.queueFamilyIndex() != computeQueue.queueFamilyIndex()) {
+                bci.sharingMode(VK10.VK_SHARING_MODE_CONCURRENT)
+                        .pQueueFamilyIndices(stack.ints(graphicsQueue.queueFamilyIndex(), computeQueue.queueFamilyIndex()));
+            }
             VmaAllocationCreateInfo aci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
             if (hostVisible) {
                 aci.flags(Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT);
@@ -329,61 +350,12 @@ public final class RtContext {
         }
     }
 
-    /** An async submission: the command buffer + its fence, owned until {@link #freeAsync}. */
-    public record AsyncSubmit(VkCommandBuffer cmd, long fence) {
-    }
-
-    /**
-     * Record + submit a one-shot command buffer <b>without waiting</b>; poll with {@link #isAsyncDone}
-     * and release with {@link #freeAsync} once done. For per-frame geometry builds that must not stall
-     * the render thread (unlike {@link #submitSync}). The command buffer + fence stay alive until freed.
-     */
-    public synchronized AsyncSubmit submitAsync(Consumer<VkCommandBuffer> record) {
-        ensurePool();
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
-                    .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
-            PointerBuffer pCmd = stack.mallocPointer(1);
-            check(VK10.vkAllocateCommandBuffers(vk, ai, pCmd), "vkAllocateCommandBuffers(async)");
-            VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), vk);
-            RtDebugLabels.name(this, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "submitAsync command buffer");
-
-            VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()
-                    .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-            check(VK10.vkBeginCommandBuffer(cmd, bi), "vkBeginCommandBuffer(async)");
-            record.accept(cmd);
-            check(VK10.vkEndCommandBuffer(cmd), "vkEndCommandBuffer(async)");
-
-            VkFenceCreateInfo fci = VkFenceCreateInfo.calloc(stack).sType$Default();
-            LongBuffer pFence = stack.mallocLong(1);
-            check(VK10.vkCreateFence(vk, fci, null, pFence), "vkCreateFence(async)");
-            long fence = pFence.get(0);
-            RtDebugLabels.name(this, VK10.VK_OBJECT_TYPE_FENCE, fence, "submitAsync fence");
-
-            VkSubmitInfo si = VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(cmd));
-            check(VK10.vkQueueSubmit(graphicsQueue.vkQueue(), si, fence), "vkQueueSubmit(async)");
-            return new AsyncSubmit(cmd, fence);
-        }
-    }
-
-    /** True once the async submission's GPU work has completed. */
-    public boolean isAsyncDone(AsyncSubmit op) {
-        return VK10.vkGetFenceStatus(vk, op.fence()) == VK10.VK_SUCCESS;
-    }
-
-    /** Free an async submission's fence + command buffer; only after {@link #isAsyncDone} is true. */
-    public synchronized void freeAsync(AsyncSubmit op) {
-        VK10.vkDestroyFence(vk, op.fence(), null);
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VK10.vkFreeCommandBuffers(vk, commandPool, stack.pointers(op.cmd()));
-        }
-    }
-
     public void waitIdle() {
-        VK10.vkDeviceWaitIdle(vk);
+        check(VK10.vkDeviceWaitIdle(vk), "vkDeviceWaitIdle");
     }
 
     public void destroy() {
+        gpuExecutor.shutdown();
         if (commandPool != 0L) {
             VK10.vkDestroyCommandPool(vk, commandPool, null);
             commandPool = 0L;

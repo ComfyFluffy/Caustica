@@ -26,13 +26,13 @@ final class RtSectionBuilder {
         // Terrain sections are long-lived and stream only as the residency window changes. Keep their
         // resources as direct VMA allocations so an eviction returns the allocation to VMA instead of
         // retaining the peak render-distance working set in the per-frame buffer cache.
-        RtBuffer positions = ctx.createBuffer((long) packed.positions().length * Float.BYTES, asInput, true,
+        RtBuffer positions = ctx.createAsyncBuffer((long) packed.positions().length * Float.BYTES, asInput, true,
                 label + " positions");
-        RtBuffer indices = ctx.createBuffer((long) packed.indices().length * Integer.BYTES, asInput | storage, true,
+        RtBuffer indices = ctx.createAsyncBuffer((long) packed.indices().length * Integer.BYTES, asInput | storage, true,
                 label + " indices");
-        RtBuffer uvs = ctx.createBuffer((long) packed.uvs().length * Float.BYTES, storage, true,
+        RtBuffer uvs = ctx.createAsyncBuffer((long) packed.uvs().length * Float.BYTES, storage, true,
                 label + " uvs");
-        RtBuffer material = ctx.createBuffer((long) packed.material().length * Float.BYTES, storage, true,
+        RtBuffer material = ctx.createAsyncBuffer((long) packed.material().length * Float.BYTES, storage, true,
                 label + " material");
 
         resolveMaterials(packed.material(), packed.materialSprites());
@@ -40,6 +40,10 @@ final class RtSectionBuilder {
         MemoryUtil.memIntBuffer(indices.mapped, packed.indices().length).put(packed.indices());
         MemoryUtil.memFloatBuffer(uvs.mapped, packed.uvs().length).put(packed.uvs());
         MemoryUtil.memFloatBuffer(material.mapped, packed.material().length).put(packed.material());
+        positions.flush();
+        indices.flush();
+        uvs.flush();
+        material.flush();
 
         RtAccel.PreparedBlas blas = RtAccel.prepareTerrainBlas(ctx, positions, vertCount, indices,
                 packed.bucketTris(), ommInput, label + " BLAS");

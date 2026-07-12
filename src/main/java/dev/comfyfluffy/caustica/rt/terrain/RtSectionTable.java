@@ -65,6 +65,7 @@ final class RtSectionTable {
         if (oldTable != null && oldCapacity > 0) {
             MemoryUtil.memCopy(oldTable.mapped, newTable.mapped,
                     (long) oldCapacity * SECTION_ENTRY_BYTES);
+            newTable.flush(0L, (long) oldCapacity * SECTION_ENTRY_BYTES);
         }
         return oldTable;
     }
@@ -125,6 +126,7 @@ final class RtSectionTable {
         MemoryUtil.memPutInt(base + 20, geom.triBase[1]);
         MemoryUtil.memPutInt(base + 24, geom.triBase[2]);
         MemoryUtil.memPutInt(base + 28, geom.triBase[3]);
+        buffer.flush((long) geom.slot * SECTION_ENTRY_BYTES, SECTION_ENTRY_BYTES);
     }
 
     RtAccel.Instance instanceFor(SectionGeom geom, int rbx, int rby, int rbz) {

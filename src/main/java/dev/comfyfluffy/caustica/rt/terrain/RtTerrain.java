@@ -11,6 +11,7 @@ import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
@@ -427,7 +428,7 @@ public final class RtTerrain {
         if (level == null || mc.player == null) {
             return;
         }
-        boolean buildDone = pending != null && ctx.isAsyncDone(pending.op);
+        boolean buildDone = pending != null && ctx.gpuExecutor().isDone(pending.op);
         if (pending != null && !buildDone) {
             return; // one GPU build in flight at a time; workers keep meshing their queue meanwhile
         }
@@ -1289,7 +1290,7 @@ public final class RtTerrain {
     }
 
     /** An in-flight async BLAS build: the new section geometry/instances land when {@code op} completes. */
-    private record Pending(RtContext.AsyncSubmit op, List<RtAccel.PreparedBlas> blas,
+    private record Pending(RtGpuExecutor.Build op, List<RtAccel.PreparedBlas> blas,
                            List<PreparedSection> prepared, List<SectionGeom> removed,
                            boolean rebase, int rbx, int rby, int rbz) {
     }
@@ -1309,7 +1310,7 @@ public final class RtTerrain {
         for (PreparedSection ps : prepared) {
             blasBuilds.add(ps.blas());
         }
-        RtContext.AsyncSubmit op = ctx.submitAsync(cmd -> RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds));
+        RtGpuExecutor.Build op = ctx.gpuExecutor().submit(cmd -> RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds));
         pending = new Pending(op, blasBuilds, new ArrayList<>(prepared), new ArrayList<>(removed), rebase, rbx, rby, rbz);
     }
 
@@ -1317,9 +1318,10 @@ public final class RtTerrain {
     private void finalizePending(RtContext ctx) {
         Pending p = pending;
         pending = null;
-        ctx.freeAsync(p.op());
+        ctx.gpuExecutor().free(p.op());
         RtAccel.freeBlasScratch(p.blas()); // build done -> BLAS scratch safe to destroy
         applyBuildChanges(ctx, p.prepared(), p.removed(), p.rebase(), p.rbx(), p.rby(), p.rbz());
+        ctx.gpuExecutor().markPublished(p.op());
     }
 
     private boolean shouldRebase(int rbx, int rby, int rbz) {
@@ -1521,7 +1523,7 @@ public final class RtTerrain {
         }
         ctx.waitIdle();
         if (pending != null) {
-            ctx.freeAsync(pending.op());
+            ctx.gpuExecutor().free(pending.op());
             RtAccel.freeBlasScratch(pending.blas());
             for (PreparedSection ps : pending.prepared()) {
                 SectionGeom g = new SectionGeom(ps.key(), ps.positions(), ps.indices(), ps.uvs(), ps.material(),

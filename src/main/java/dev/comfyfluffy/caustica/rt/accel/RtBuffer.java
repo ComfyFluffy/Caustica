@@ -39,4 +39,17 @@ public final class RtBuffer {
             destroyed = true;
         }
     }
+
+    /** Flush host writes for non-coherent allocations; VMA treats coherent memory as a no-op. */
+    public void flush() {
+        flush(0L, size);
+    }
+
+    /** Flush a written byte range; VMA handles non-coherent atom alignment internally. */
+    public void flush(long offset, long length) {
+        if (!hostVisible) {
+            throw new IllegalStateException("Cannot flush a non-host-visible buffer");
+        }
+        Vma.vmaFlushAllocation(vma, allocation, offset, length);
+    }
 }

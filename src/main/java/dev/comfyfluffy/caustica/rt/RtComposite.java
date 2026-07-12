@@ -896,7 +896,10 @@ public final class RtComposite {
         if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
             throw new IllegalStateException("vkEndCommandBuffer(rt composite) failed");
         }
+        RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
+        long graphicsUse = gpuExecutor.beginGraphicsTerrainUse(encoder);
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
+        gpuExecutor.endGraphicsTerrainUse(encoder, graphicsUse);
     }
 
     /**
