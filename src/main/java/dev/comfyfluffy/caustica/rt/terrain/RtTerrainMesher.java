@@ -87,7 +87,7 @@ final class RtTerrainMesher {
      * Tessellate one section to a section-local CPU mesh and precompute pure-CPU sidecar data such as
      * the terrain opacity micromap. <b>Pure CPU + snapshot reads only</b> — no Vulkan, no shared mutable
      * state — so this is the unit a worker thread runs. Terrain LabPBR sprite references are carried to
-     * upload, where the render thread resolves them through the material atlas.
+     * buffer preparation; the render thread resolves them through the material atlas at publication.
      * Returns the mesh (possibly empty — caller checks {@code idx}).
      */
     static CpuSection buildCpuSection(BlockAndTintGetter region, BlockStateModelSet modelSet,
@@ -205,7 +205,7 @@ final class RtTerrainMesher {
     record CpuSection(PackedSection packed, RtAccel.OpacityMicromapInput opacityMicromap) {
     }
 
-    /** Worker-packed terrain buffer payload; upload only allocates buffers and bulk-copies these arrays. */
+    /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays. */
     record PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
                                  TextureAtlasSprite[] materialSprites,
                                  int[] bucketTris, int[] triBase) {
@@ -259,7 +259,7 @@ final class RtTerrainMesher {
      * buckets so the BLAS can flag solid blocks {@code VK_GEOMETRY_OPAQUE_BIT}, keep true alpha cutout in
      * an any-hit bucket, and route translucent/water through closest-hit-only records for radiance but
      * any-hit records for shadow tint/pass-through. The buckets are concatenated in {@code BUCKET_*} order
-     * into the packed section buffers at upload, so each geometry's triangles occupy a contiguous range.
+     * into the packed section buffers during preparation, so each geometry's triangles occupy a contiguous range.
      */
     private static final class SectionMesh {
         // Conservative worker-side starting capacities. These trade a little transient RAM for avoiding the

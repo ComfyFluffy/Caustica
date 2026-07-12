@@ -49,7 +49,7 @@ public final class RtFrameStats {
                     "frame.displayMap",
                     "frame.copyOutput"
             },
-            new String[] {"sectionsSnapshotted", "sectionCopies", "sectionsUploaded", "entitiesCaptured", "refits",
+            new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted", "entitiesCaptured", "refits",
                     "entityReuse", "vmaBufferCreates"},
             true);
 

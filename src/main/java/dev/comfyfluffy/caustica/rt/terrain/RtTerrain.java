@@ -96,12 +96,12 @@ import dev.comfyfluffy.caustica.rt.terrain.RtSectionTable.SectionGeom;
 public final class RtTerrain {
     // The render thread snapshots and publishes; workers mesh, allocate/fill, prepare BLAS/OMM objects,
     // and enqueue builds. The streaming pass is bounded so render-thread bookkeeping stays flat.
-    private static int asyncDispatchPerTick() {
-        return CausticaConfig.Rt.Terrain.ASYNC_DISPATCH_PER_TICK.value();
+    private static int asyncDispatchPerPass() {
+        return CausticaConfig.Rt.Terrain.ASYNC_DISPATCH_PER_PASS.value();
     }
 
-    private static int sectionResultsPerTick() {
-        return CausticaConfig.Rt.Terrain.SECTION_RESULTS_PER_TICK.value();
+    private static int completionResultsPerPass() {
+        return CausticaConfig.Rt.Terrain.COMPLETION_RESULTS_PER_PASS.value();
     }
 
     // Backlog (missing + queued re-extracts + in-flight jobs) at which the dynamic budget reaches max.
@@ -269,8 +269,8 @@ public final class RtTerrain {
     }
 
     /**
-     * Per-render-frame streaming pass, driven by {@link RtComposite#composite}: finalize a completed BLAS
-     * build, dispatch snapshots to the worker pool and drain finished uploads — all bounded by
+     * Per-render-frame streaming pass, driven by {@link RtComposite#composite}: publish completed builds
+     * and dispatch immutable snapshots to workers — all bounded by
      * {@code caustica.rt.streamBudgetMs} of wall clock so the cost is a flat slice of every frame instead
      * of a 20 TPS burst.
      */
@@ -444,7 +444,7 @@ public final class RtTerrain {
 
         // Drain completed GPU builds first — publication is visible fill progress, so it gets priority.
         try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.drainCompletion")) {
-            drainTessellation(ctx, prepared, removed, sectionResultsPerTick(), deadline);
+            drainTessellation(ctx, prepared, removed, completionResultsPerPass(), deadline);
         }
 
         // Snapshot and dispatch new worker-owned section builds with the remaining budget.
@@ -453,7 +453,7 @@ public final class RtTerrain {
             int countSlots = Math.max(0, maxInflight() - inFlight.size());
             int nativeSlots = (int) Math.max(0L,
                     (maxInflightNativeBytes() - inFlightNativeBytes) / NATIVE_RESERVATION_BYTES);
-            int dispatchSlots = Math.min(asyncDispatchPerTick(), Math.min(countSlots, nativeSlots));
+            int dispatchSlots = Math.min(asyncDispatchPerPass(), Math.min(countSlots, nativeSlots));
             if (dispatchSlots > 0 && !playerReextract.isEmpty() && System.nanoTime() < deadline) {
                 dispatch = dispatchContext(ctx, level);
                 dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots, deadline,
@@ -1132,7 +1132,7 @@ public final class RtTerrain {
         int attempts = resultCap * 4;
         boolean first = true;
         while (budget > 0 && attempts-- > 0) {
-            // Always take at least one result so uploads make progress even when dispatch ate the whole
+            // Always take at least one result so publication progresses even when dispatch ate the whole
             // budget (inFlight backpressure then shifts the budget to draining on the next frames).
             if (!first && System.nanoTime() >= deadline) {
                 break;
@@ -1171,7 +1171,7 @@ public final class RtTerrain {
                     ctx.gpuExecutor().free(result.build());
                     RtSectionBuilder.resolveMaterials(built);
                     ctx.gpuExecutor().markPublished(result.build());
-                    RtFrameStats.FRAME.count("sectionsUploaded", 1);
+                    RtFrameStats.FRAME.count("terrainBuildsCompleted", 1);
                 } catch (Throwable t) {
                     RtSectionBuilder.destroy(built);
                     if (dirtyGroup != NO_DIRTY_GROUP) {
@@ -1525,8 +1525,12 @@ public final class RtTerrain {
     private void clear(RtContext ctx, boolean shutdown) {
         cancelJobs(ctx);
         cancelAllDirtyGroups();
-        ctx.waitIdle();
-        ctx.gpuExecutor().flushDestroysAfterDeviceIdle();
+        if (shutdown) {
+            ctx.waitIdle();
+            ctx.gpuExecutor().flushDestroysAfterDeviceIdle();
+        } else {
+            ctx.gpuExecutor().waitForLatestGraphicsAndFlush();
+        }
         table.destroyRecycledGenerations();
         snapshots.clear();
         synchronized (dirtyLock) {

@@ -155,6 +155,17 @@ public final class RtGpuExecutor {
         }
     }
 
+    /** Wait only for terrain's latest graphics use, then execute every now-safe retirement. */
+    public void waitForLatestGraphicsAndFlush() {
+        checkDestroyFailure();
+        long target = latestGraphicsUseValue();
+        if (target != 0L) {
+            waitTimeline(graphicsTimeline, target);
+        }
+        processDestroyJobs();
+        checkDestroyFailure();
+    }
+
     /** Caller has made the device idle; all queued destruction is now unconditionally safe. */
     public void flushDestroysAfterDeviceIdle() {
         Throwable failure = destroyFailure;

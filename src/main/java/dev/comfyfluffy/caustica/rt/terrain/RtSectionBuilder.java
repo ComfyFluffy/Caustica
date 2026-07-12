@@ -8,7 +8,7 @@ import dev.comfyfluffy.caustica.rt.terrain.RtTerrainMesher.PackedSection;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import org.lwjgl.system.MemoryUtil;
 
-/** Worker-owned terrain buffer upload and BLAS preparation. */
+/** Worker-owned terrain buffer allocation/fill and BLAS preparation. */
 final class RtSectionBuilder {
     private RtSectionBuilder() {
     }
@@ -90,7 +90,7 @@ final class RtSectionBuilder {
         prepared.positions.destroy();
     }
 
-    /** A section uploaded with a prepared, not-yet-built BLAS. */
+    /** Worker-owned native section state paired with its prepared BLAS. */
     record PreparedSection(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs,
                            RtBuffer material, RtAccel.PreparedBlas blas, int[] triBase,
                            TextureAtlasSprite[] materialSprites, int sx, int sy, int sz) {
