@@ -38,8 +38,6 @@ import net.minecraft.client.renderer.block.FluidRenderer;
 import net.minecraft.client.renderer.block.FluidStateModelSet;
 import net.minecraft.client.renderer.block.ModelBlockRenderer;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
-import net.minecraft.client.renderer.chunk.RenderRegionCache;
-import net.minecraft.client.renderer.chunk.RenderSectionRegion;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
@@ -78,14 +76,15 @@ import java.util.concurrent.Future;
  * buffer itself is retained only for the BLAS build (per-triangle corner UVs mean shading never needs
  * an index-buffer read — lever B), so its address isn't duplicated into this table.
  *
- * <p>Tessellation reads only an immutable snapshot ({@link RenderSectionRegion}, captured on the render
- * thread via {@link RenderRegionCache} exactly as vanilla's chunk compiler does). CPU meshing runs on
+ * <p>Tessellation reads only an immutable snapshot ({@link RtSectionSnapshots.Region}, palette-only
+ * copies captured on the render thread and cached persistently across passes — see
+ * {@link RtSectionSnapshots}). CPU meshing runs on
  * {@link RtWorkerPool}; snapshotting, GPU upload, BLAS prepare and queue submission stay on the render
  * thread. The BLAS build itself is an async GPU submit, and frees are deferred frames-in-flight-safe
  * (no {@code waitIdle} on the hot path).
  */
 public final class RtTerrain {
-    // CPU tessellation runs on RtWorkerPool. The render thread snapshots RenderSectionRegions, uploads
+    // CPU tessellation runs on RtWorkerPool. The render thread snapshots section neighbourhoods, uploads
     // completed meshes, prepares BLASes, and submits the GPU build. Those render-thread pieces run as one
     // "streaming pass" per render frame (driven by RtComposite), bounded by a wall-clock budget so the
     // per-frame cost is flat instead of the old 20 TPS burst; the counts below are per-pass ceilings.
@@ -118,7 +117,7 @@ public final class RtTerrain {
     }
 
     // Backpressure cap: stop dispatching once this many sections are in flight. Bounds queue depth and
-    // snapshot memory (each RenderSectionRegion holds 27 SectionCopies) when flying through the world.
+    // snapshot memory (each in-flight region pins 27 cached section snapshots) when flying through the world.
     private static int maxInflight() {
         return CausticaConfig.Rt.Terrain.MAX_INFLIGHT_SECTIONS.value();
     }
@@ -147,6 +146,9 @@ public final class RtTerrain {
     private static final RtTerrain INSTANCE = new RtTerrain();
 
     private final Long2ObjectOpenHashMap<SectionGeom> resident = new Long2ObjectOpenHashMap<>();
+    // Persistent palette snapshots for tessellation regions (render-thread only); invalidated on dirty
+    // sections, column unload/window-leave, and full clears.
+    private final RtSectionSnapshots snapshots = new RtSectionSnapshots();
     private LongOpenHashSet published = new LongOpenHashSet();
     private final LongOpenHashSet empty = new LongOpenHashSet(); // loaded, in-window sections with no geometry
     private final Object dirtyLock = new Object();
@@ -506,6 +508,7 @@ public final class RtTerrain {
 
     private void rebuildDesiredWindow(ClientChunkCache chunkSource, int pcx, int pcz,
                                       int radius, int loY, int hiY, List<SectionGeom> removed) {
+        snapshots.clear(); // teleport / shape change — no per-column eviction diff, drop everything
         desired.clear();
         desiredColumns.clear();
         loadedColumns.clear();
@@ -611,6 +614,9 @@ public final class RtTerrain {
     private void removeDesiredColumnSections(int scx, int scz, int loY, int hiY, List<SectionGeom> removed) {
         for (int scy = loY; scy <= hiY; scy++) {
             long key = sectionKey(scx, scy, scz);
+            // Unloaded or out of the window — the chunk may reload with different data, so the cached
+            // snapshot can't be trusted past this point.
+            snapshots.invalidate(key);
             desired.remove(key);
             clearQueuedWork(key, true);
             invalidateInFlight(key);
@@ -665,6 +671,7 @@ public final class RtTerrain {
     }
 
     private boolean handleDirtySection(long key, int pcx, int psy, int pcz, long dirtyGroup) {
+        snapshots.invalidate(key); // block data changed — the cached palette snapshot is stale
         boolean wasEmpty = empty.remove(key);
         if (wasEmpty && dirtyGroup != NO_DIRTY_GROUP) {
             DirtyGroup group = dirtyGroups.get(dirtyGroup);
@@ -886,7 +893,7 @@ public final class RtTerrain {
      * upload, where the render thread resolves them through the material atlas.
      * Returns the mesh (possibly empty — caller checks {@code idx}).
      */
-    private static CpuSection buildCpuSection(RenderSectionRegion region, BlockStateModelSet modelSet,
+    private static CpuSection buildCpuSection(BlockAndTintGetter region, BlockStateModelSet modelSet,
                                               ModelBlockRenderer renderer, QuadCapture capture,
                                               FluidRenderer fluidRenderer, FluidCapture fluidCapture,
                                               SectionMesh mesh, BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
@@ -951,7 +958,7 @@ public final class RtTerrain {
         return new PackedSection(positions, indices, uvs, material, materialSprites, bucketTris, triBase);
     }
 
-    private static void tessellate(RenderSectionRegion region, BlockStateModelSet modelSet,
+    private static void tessellate(BlockAndTintGetter region, BlockStateModelSet modelSet,
                                    ModelBlockRenderer renderer, QuadCapture capture,
                                    FluidRenderer fluidRenderer, FluidCapture fluidCapture,
                                    SectionMesh mesh, BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
@@ -1116,7 +1123,7 @@ public final class RtTerrain {
      */
     private static DispatchContext dispatchContext(ClientLevel level) {
         Minecraft mc = Minecraft.getInstance();
-        return new DispatchContext(level, new RenderRegionCache(),
+        return new DispatchContext(level,
                 mc.getModelManager().getBlockStateModelSet(), mc.getModelManager().getFluidStateModelSet(),
                 mc.getBlockColors());
     }
@@ -1279,7 +1286,7 @@ public final class RtTerrain {
     /** Snapshot one section on the render thread and submit its tessellation to the worker pool. */
     private void dispatchSection(DispatchContext dispatch, long key, int sx, int sy, int sz, int priority) {
         RtFrameStats.FRAME.count("sectionsSnapshotted", 1);
-        RenderSectionRegion region = dispatch.regionCache().createRegion(dispatch.level(), SectionPos.asLong(sx, sy, sz));
+        RtSectionSnapshots.Region region = snapshots.createRegion(dispatch.level(), sx, sy, sz);
         long token = ++tessToken;
         long dirtyGroup = queuedDirtyGroup.remove(key);
         if (dirtyGroup != NO_DIRTY_GROUP && !dirtyGroups.containsKey(dirtyGroup)) {
@@ -1489,7 +1496,7 @@ public final class RtTerrain {
     }
 
     /** Per-tick render-thread snapshot dependencies shared by reextract + missing dispatch. */
-    private record DispatchContext(ClientLevel level, RenderRegionCache regionCache, BlockStateModelSet modelSet,
+    private record DispatchContext(ClientLevel level, BlockStateModelSet modelSet,
                                    FluidStateModelSet fluidModelSet, BlockColors blockColors) {
     }
 
@@ -1848,6 +1855,7 @@ public final class RtTerrain {
     private void clear(RtContext ctx, boolean shutdown) {
         cancelJobs();
         cancelAllDirtyGroups();
+        snapshots.clear();
         synchronized (dirtyLock) {
             dirty.clear(); // any pending re-extract keys refer to the old world/coords — drop them
             dirtyEvents.clear();
@@ -1950,7 +1958,7 @@ public final class RtTerrain {
     }
 
     /** Pack section coords into a stable map key; ranges fit comfortably in the masks. */
-    private static long sectionKey(int scx, int scy, int scz) {
+    static long sectionKey(int scx, int scy, int scz) {
         return (scx & 0x3FFFFFFL) | ((scz & 0x3FFFFFFL) << 26) | ((scy & 0xFFFL) << 52);
     }
 
