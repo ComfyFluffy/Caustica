@@ -33,10 +33,9 @@ public final class RtFrameStats {
             new String[] {
                     "terrain.windowSync",
                     "terrain.dirtyDrain",
-                    "terrain.finalize",
-                    "terrain.drainUpload",
+                    "terrain.drainCompletion",
                     "terrain.snapshotDispatch",
-                    "terrain.startBuild",
+                    "terrain.publish",
                     "entity.capture",
                     "entity.blockEntities",
                     "entity.particles",

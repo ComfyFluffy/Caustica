@@ -167,6 +167,8 @@ public final class RtContext {
     }
 
     private RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label, boolean asyncShared) {
+        long handle = 0L;
+        long allocation = 0L;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCreateInfo bci = VkBufferCreateInfo.calloc(stack).sType$Default()
                     .size(size).usage(usage | VK12.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
@@ -183,11 +185,17 @@ public final class RtContext {
             PointerBuffer pAlloc = stack.mallocPointer(1);
             VmaAllocationInfo info = VmaAllocationInfo.calloc(stack);
             check(Vma.vmaCreateBuffer(vma, bci, aci, pBuf, pAlloc, info), "vmaCreateBuffer");
-            long handle = pBuf.get(0);
+            handle = pBuf.get(0);
+            allocation = pAlloc.get(0);
             RtDebugLabels.nameBuffer(this, handle, label);
             VkBufferDeviceAddressInfo bdai = VkBufferDeviceAddressInfo.calloc(stack).sType$Default().buffer(handle);
             long address = VK12.vkGetBufferDeviceAddress(vk, bdai);
-            return new RtBuffer(vma, handle, pAlloc.get(0), address, hostVisible ? info.pMappedData() : 0L, size, usage, hostVisible);
+            return new RtBuffer(vma, handle, allocation, address, hostVisible ? info.pMappedData() : 0L, size, usage, hostVisible);
+        } catch (Throwable t) {
+            if (handle != 0L) {
+                Vma.vmaDestroyBuffer(vma, handle, allocation);
+            }
+            throw t;
         }
     }
 

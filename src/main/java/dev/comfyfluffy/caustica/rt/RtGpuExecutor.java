@@ -18,6 +18,8 @@ import org.lwjgl.vulkan.VkSemaphoreWaitInfo;
 import org.lwjgl.vulkan.VkSubmitInfo2;
 
 import java.nio.LongBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -33,6 +35,7 @@ import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACI
  * and render-thread submission would violate this executor's fully asynchronous contract.
  */
 public final class RtGpuExecutor {
+    private static final int MAX_BUILD_BATCH = 32;
     private static final Job STOP = new Job(null, null);
     private static final long TERRAIN_READ_STAGES =
             VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
@@ -140,30 +143,53 @@ public final class RtGpuExecutor {
 
     private void run() {
         while (true) {
-            Job job;
+            Job first;
             try {
-                job = jobs.take();
+                first = jobs.take();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
             }
-            if (job == STOP) {
+            if (first == STOP) {
                 return;
             }
+            ArrayList<Job> batch = new ArrayList<>(MAX_BUILD_BATCH);
+            batch.add(first);
+            boolean stopAfterBatch = false;
+            while (batch.size() < MAX_BUILD_BATCH) {
+                Job next = jobs.poll();
+                if (next == null) {
+                    break;
+                }
+                if (next == STOP) {
+                    stopAfterBatch = true;
+                    break;
+                }
+                batch.add(next);
+            }
             try {
-                execute(job);
-                completedBuildValue.accumulateAndGet(job.build.value, Math::max);
-                job.build.completion.complete(null);
+                execute(batch);
+                long completed = batch.get(batch.size() - 1).build.value;
+                completedBuildValue.accumulateAndGet(completed, Math::max);
+                for (Job job : batch) {
+                    job.build.completion.complete(null);
+                }
             } catch (Throwable t) {
-                job.build.completion.completeExceptionally(t);
+                for (Job job : batch) {
+                    job.build.completion.completeExceptionally(t);
+                }
+            }
+            if (stopAfterBatch) {
+                return;
             }
         }
     }
 
-    private void execute(Job job) {
+    private void execute(List<Job> batch) {
         VkCommandBuffer cmd = null;
         boolean submitted = false;
         boolean completed = false;
+        long signalValue = batch.get(batch.size() - 1).build.value;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
                     .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
@@ -173,19 +199,21 @@ public final class RtGpuExecutor {
             VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                     .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
             RtContext.check(VK10.vkBeginCommandBuffer(cmd, bi), "vkBeginCommandBuffer(RT GPU executor)");
-            job.record.accept(cmd);
+            for (Job job : batch) {
+                job.record.accept(cmd);
+            }
             RtContext.check(VK10.vkEndCommandBuffer(cmd), "vkEndCommandBuffer(RT GPU executor)");
             VkCommandBufferSubmitInfo.Buffer command = VkCommandBufferSubmitInfo.calloc(1, stack)
                     .sType$Default().commandBuffer(cmd);
             VkSemaphoreSubmitInfo.Buffer signal = VkSemaphoreSubmitInfo.calloc(1, stack)
-                    .sType$Default().semaphore(buildTimeline).value(job.build.value)
+                    .sType$Default().semaphore(buildTimeline).value(signalValue)
                     .stageMask(VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
             VkSubmitInfo2.Buffer submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(command).pSignalSemaphoreInfos(signal);
             RtContext.check(org.lwjgl.vulkan.KHRSynchronization2.vkQueueSubmit2KHR(
                     computeQueue.vkQueue(), submit, 0L), "vkQueueSubmit2KHR(RT GPU executor)");
             submitted = true;
-            waitTimeline(buildTimeline, job.build.value);
+            waitTimeline(buildTimeline, signalValue);
             completed = true;
         } finally {
             // Never retry a failed host wait while unwinding: propagate its original error. A command

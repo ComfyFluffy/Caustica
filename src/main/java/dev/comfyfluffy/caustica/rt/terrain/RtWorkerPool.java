@@ -13,10 +13,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Shared daemon thread pool for CPU-heavy RT work that must stay off the render thread — terrain
- * tessellation, with LOD build / atlas stitching as future candidates. Jobs must be pure CPU:
- * no Vulkan calls and no shared mutable state (the graphics queue is render-thread-owned, and
- * queue submission stays single-threaded). Results are collected on the render thread via the
- * returned {@link Future}.
+ * tessellation and terrain buffer/BLAS preparation, with LOD build / atlas stitching as future
+ * candidates. Workers may create distinct Vulkan/VMA objects and enqueue command recording onto
+ * {@code RtGpuExecutor}; they never access or submit the graphics queue. Results are collected on the
+ * render thread via the returned {@link Future}.
  *
  * <p>Sized at {@code -Dcaustica.rt.workerThreads} (default {@code clamp(cores/2, 1, 4)}) to leave
  * cores for Minecraft's own chunk meshers. Core threads time out when idle; all are daemon so they
@@ -55,7 +55,7 @@ public final class RtWorkerPool {
         return exec;
     }
 
-    /** Submit a pure-CPU job; poll the returned future on the render thread. */
+    /** Submit worker-owned RT preparation; poll the returned future on the render thread. */
     public <T> Future<T> submit(Callable<T> job) {
         return executor().submit(job);
     }

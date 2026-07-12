@@ -91,7 +91,9 @@ public final class CausticaConfig {
                         + " stream-budget-max-ms (big backlog: initial fill, F3+A, teleport, fast flight) so fill\n"
                         + " throughput recovers when it matters and the cost drops back once the queue clears.\n"
                         + " stream-fallback-budget-ms is the per-tick slice used only when no world frame is\n"
-                        + " streaming (loading screens), where a long pass hitches nothing.");
+                        + " streaming (loading screens), where a long pass hitches nothing.\n"
+                        + " max-inflight-native-mb bounds worker-owned terrain allocations using a conservative\n"
+                        + " 16 MiB reservation per section until its build is published or discarded.");
         FILE.setComment("frame-generation",
                 " DLSS Frame Generation. Default off; gated additionally by hardware/driver availability.\n"
                         + " multi-frame-count: frames generated per rendered frame (1 = 2x, 2 = 3x, ...), clamped\n"
@@ -560,6 +562,8 @@ public final class CausticaConfig {
                     clampedFloat("caustica.rt.streamFallbackBudgetMs", "terrain.stream-fallback-budget-ms", 8f, 0.05f, 100f);
             public static final IntSetting MAX_INFLIGHT_SECTIONS =
                     intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 192, 0);
+            public static final IntSetting MAX_INFLIGHT_NATIVE_MB =
+                    intAtLeast("caustica.rt.maxInflightNativeMb", "terrain.max-inflight-native-mb", 1024, 16);
             public static final IntSetting SECTION_TABLE_INITIAL_CAPACITY =
                     intAtLeast("caustica.rt.sectionTableInitialCapacity", "terrain.section-table-initial-capacity", 512, 1);
             public static final IntSetting REBASE_DISTANCE_BLOCKS =

@@ -348,16 +348,29 @@ public final class RtAccel {
                                                   String label) {
         VkDevice vk = ctx.vk();
         String debugLabel = labelOr(label, "terrain BLAS");
+        OpacityMicromap opacityMicromap = null;
+        RtBuffer backing = null;
+        RtBuffer scratch = null;
+        RtAccel accel = null;
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            OpacityMicromap opacityMicromap = prepareOpacityMicromap(ctx, opacityMicromapInput, debugLabel);
+            opacityMicromap = prepareOpacityMicromap(ctx, opacityMicromapInput, debugLabel);
             VkAccelerationStructureBuildSizesInfoKHR sizes = queryTerrainBlasSizes(vk, stack, positions, indices,
                     vertexCount, bucketTris, opacityMicromap);
-            RtBuffer backing = ctx.createAsyncBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
+            backing = ctx.createAsyncBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
                     debugLabel + " backing");
-            RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
-            RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), true, debugLabel, opacityMicromap);
+            scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
+            accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), true, debugLabel, opacityMicromap);
             return PreparedBlas.terrain(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
                     bucketTris, opacityMicromap, debugLabel);
+        } catch (Throwable t) {
+            if (accel != null) {
+                accel.destroy();
+            } else {
+                if (scratch != null) scratch.destroy();
+                if (backing != null) backing.destroy();
+                if (opacityMicromap != null) opacityMicromap.destroy();
+            }
+            throw t;
         }
     }
 
@@ -369,39 +382,51 @@ public final class RtAccel {
         VkDevice vk = ctx.vk();
         String label = blasLabel + " opacity micromap";
         int inputUsage = VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT;
-        RtBuffer data = ctx.createAsyncBuffer(input.data().length + MICROMAP_INPUT_ADDRESS_ALIGNMENT - 1,
-                inputUsage, true, label + " data");
-        long dataOffset = alignUp(data.deviceAddress, MICROMAP_INPUT_ADDRESS_ALIGNMENT) - data.deviceAddress;
-        long dataAddress = data.deviceAddress + dataOffset;
-        MemoryUtil.memByteBuffer(data.mapped + dataOffset, input.data().length).put(input.data());
-        long triangleBytes = input.triangles().length;
-        RtBuffer triangles = ctx.createAsyncBuffer(triangleBytes + MICROMAP_INPUT_ADDRESS_ALIGNMENT - 1, inputUsage, true,
-                label + " triangles");
-        long triangleOffset = alignUp(triangles.deviceAddress, MICROMAP_INPUT_ADDRESS_ALIGNMENT) - triangles.deviceAddress;
-        long triangleArrayAddress = triangles.deviceAddress + triangleOffset;
-        MemoryUtil.memByteBuffer(triangles.mapped + triangleOffset, input.triangles().length).put(input.triangles());
-        data.flush();
-        triangles.flush();
-
+        RtBuffer data = null;
+        RtBuffer triangles = null;
+        RtBuffer backing = null;
+        RtBuffer scratch = null;
+        long handle = 0L;
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            data = ctx.createAsyncBuffer(input.data().length + MICROMAP_INPUT_ADDRESS_ALIGNMENT - 1,
+                    inputUsage, true, label + " data");
+            long dataOffset = alignUp(data.deviceAddress, MICROMAP_INPUT_ADDRESS_ALIGNMENT) - data.deviceAddress;
+            long dataAddress = data.deviceAddress + dataOffset;
+            MemoryUtil.memByteBuffer(data.mapped + dataOffset, input.data().length).put(input.data());
+            long triangleBytes = input.triangles().length;
+            triangles = ctx.createAsyncBuffer(triangleBytes + MICROMAP_INPUT_ADDRESS_ALIGNMENT - 1, inputUsage, true,
+                    label + " triangles");
+            long triangleOffset = alignUp(triangles.deviceAddress, MICROMAP_INPUT_ADDRESS_ALIGNMENT) - triangles.deviceAddress;
+            long triangleArrayAddress = triangles.deviceAddress + triangleOffset;
+            MemoryUtil.memByteBuffer(triangles.mapped + triangleOffset, input.triangles().length).put(input.triangles());
+            data.flush();
+            triangles.flush();
+
             VkMicromapUsageEXT.Buffer usage = micromapUsage(stack, input.triangleCount(), input.subdivisionLevel());
             VkMicromapBuildInfoEXT build = micromapBuildInfo(stack, dataAddress, 0L, triangleArrayAddress, 0L, usage);
             VkMicromapBuildSizesInfoEXT sizes = VkMicromapBuildSizesInfoEXT.calloc(stack).sType$Default();
             vkGetMicromapBuildSizesEXT(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, build, sizes);
 
-            RtBuffer backing = ctx.createAsyncBuffer(sizes.micromapSize(), VK_BUFFER_USAGE_MICROMAP_STORAGE_BIT_EXT, false,
+            backing = ctx.createAsyncBuffer(sizes.micromapSize(), VK_BUFFER_USAGE_MICROMAP_STORAGE_BIT_EXT, false,
                     label + " backing");
             VkMicromapCreateInfoEXT ci = VkMicromapCreateInfoEXT.calloc(stack).sType$Default()
                     .buffer(backing.handle).offset(0).size(sizes.micromapSize()).type(VK_MICROMAP_TYPE_OPACITY_MICROMAP_EXT);
             java.nio.LongBuffer pMicromap = stack.mallocLong(1);
             RtContext.check(vkCreateMicromapEXT(vk, ci, null, pMicromap), "vkCreateMicromapEXT");
-            long handle = pMicromap.get(0);
+            handle = pMicromap.get(0);
             RtDebugLabels.nameMicromap(ctx, handle, label);
 
-            RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), label + " build scratch");
+            scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), label + " build scratch");
             long scratchAddress = scratchAddress(ctx, scratch);
             return new OpacityMicromap(vk, handle, backing, data, triangles, scratch, scratchAddress,
                     dataAddress, triangleArrayAddress, input.triangleCount(), input.subdivisionLevel(), input.bytesPerTriangle());
+        } catch (Throwable t) {
+            if (handle != 0L) vkDestroyMicromapEXT(vk, handle, null);
+            if (scratch != null) scratch.destroy();
+            if (backing != null) backing.destroy();
+            if (triangles != null) triangles.destroy();
+            if (data != null) data.destroy();
+            throw t;
         }
     }
 
@@ -513,11 +538,16 @@ public final class RtAccel {
         java.nio.LongBuffer pAs = stack.mallocLong(1);
         RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
         long handle = pAs.get(0);
-        RtDebugLabels.nameAccelerationStructure(ctx, handle, label);
-        VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
-                .sType$Default().accelerationStructure(handle);
-        long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
-        return new RtAccel(vk, handle, deviceAddress, backing, ownsBacking, opacityMicromap);
+        try {
+            RtDebugLabels.nameAccelerationStructure(ctx, handle, label);
+            VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
+                    .sType$Default().accelerationStructure(handle);
+            long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
+            return new RtAccel(vk, handle, deviceAddress, backing, ownsBacking, opacityMicromap);
+        } catch (Throwable t) {
+            vkDestroyAccelerationStructureKHR(vk, handle, null);
+            throw t;
+        }
     }
 
     private static VkAccelerationStructureGeometryKHR.Buffer triangleGeometry(MemoryStack stack, long vertexAddr, long indexAddr, int vertexCount, boolean opaque) {
