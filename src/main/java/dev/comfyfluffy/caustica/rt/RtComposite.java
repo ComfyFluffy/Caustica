@@ -359,7 +359,7 @@ public final class RtComposite {
     }
 
     public boolean composite(GpuTexture nativeColor, int width, int height) {
-        frameCounter++; // advances once per frame; RtTerrain retires resources relative to it
+        frameCounter++; // global frame serial used by remaining per-frame/entity rings and diagnostics
         hdrWrittenThisFrame = false; // set true again below once this frame's HDR display image is written
         if (failed) {
             return false;
@@ -767,7 +767,8 @@ public final class RtComposite {
             // Rebuild the TLAS this frame from static section instances merged with dynamic entity
             // instances, bind it into the pipeline's descriptor ring, record the build, then barrier so
             // the trace sees the finished TLAS. Section BLASes are already built (async, by RtTerrain);
-            // only the cheap instance-level TLAS is rebuilt per frame. Retired KEEP_FRAMES later.
+            // only the cheap instance-level TLAS is rebuilt per frame. Retired terrain geometry/table
+            // generations are reclaimed by graphics-timeline completion.
             // Entity BLASes are built inline below and merged into the per-frame TLAS. geomTableAddr
             // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
             RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),

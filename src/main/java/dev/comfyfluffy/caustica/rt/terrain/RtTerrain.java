@@ -54,7 +54,6 @@ import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -68,6 +67,7 @@ import dev.comfyfluffy.caustica.rt.terrain.RtTerrainMesher.CpuSection;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrainMesher.PackedSection;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrainMesher.WorkerTessState;
 import dev.comfyfluffy.caustica.rt.terrain.RtSectionBuilder.PreparedSection;
+import dev.comfyfluffy.caustica.rt.terrain.RtSectionTable.Generation;
 import dev.comfyfluffy.caustica.rt.terrain.RtSectionTable.SectionGeom;
 /**
  * Per-section terrain residency synced to vanilla's loaded chunks. A singleton manager
@@ -91,7 +91,7 @@ import dev.comfyfluffy.caustica.rt.terrain.RtSectionTable.SectionGeom;
  * {@link RtSectionSnapshots}). CPU meshing runs on
  * {@link RtWorkerPool}; snapshotting and publication stay on the render thread, while workers own GPU
  * buffer allocation/fill, OMM/BLAS preparation, and enqueue onto the single-owner GPU executor. Frees
- * are deferred frames-in-flight-safe (no {@code waitIdle} on the hot path).
+ * are retired against graphics timeline completion (no {@code waitIdle} on the hot path).
  */
 public final class RtTerrain {
     // The render thread snapshots and publishes; workers mesh, allocate/fill, prepare BLAS/OMM objects,
@@ -139,9 +139,6 @@ public final class RtTerrain {
     private static final long NATIVE_RESERVATION_BYTES = 16L << 20;
 
     private static final int SECTION_ENTRY_BYTES = 32; // {u64 primAddr, u64 uvAddr, u32 triBase[4]}
-    // Frames a retired resource must outlive before it's freed (> frames-in-flight). The frame counter
-    // advances per composite; old TLAS/table/sections are freed this many frames after the swap.
-    private static final int KEEP_FRAMES = 4;
     private static final long NO_TESS_TOKEN = Long.MIN_VALUE;
     private static final int PRIORITY_PLAYER = 0;
     private static final int PRIORITY_DIRTY = 1;
@@ -189,7 +186,6 @@ public final class RtTerrain {
     // frames, so evicted geometry waits here until the next publish pass retires it.
     private final List<SectionGeom> removed = new ArrayList<>();
     private final List<PreparedSection> prepared = new ArrayList<>();
-    private final List<Deferred> deferred = new ArrayList<>(); // frames-in-flight-safe frees
     // Worker tessellation bookkeeping (render-thread only). `inFlight` maps a dispatched section key to a
     // monotonic token; a completed job whose token no longer matches (section re-dirtied / unloaded /
     // left the window since dispatch) is dropped. `jobs` holds the outstanding worker futures.
@@ -344,7 +340,6 @@ public final class RtTerrain {
     }
 
     private void tick(RtContext ctx) {
-        processDeferredFrees();
 
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
@@ -419,7 +414,6 @@ public final class RtTerrain {
             return;
         }
         lastFrameStreamNanos = System.nanoTime();
-        processDeferredFrees();
         stream(ctx, dynamicStreamBudgetNanos());
     }
 
@@ -1057,8 +1051,9 @@ public final class RtTerrain {
                                 cpu.opacityMicromap(), job.key, job.sox, job.soy, job.soz);
                         RtGpuExecutor.Build build;
                         try {
-                            build = dispatch.ctx().gpuExecutor().submit(cmd -> RtAccel.recordBlasBuilds(
-                                    dispatch.ctx(), cmd, List.of(prepared.blas())));
+                            build = dispatch.ctx().gpuExecutor().submit(
+                                    cmd -> RtAccel.recordBlasBuilds(dispatch.ctx(), cmd, List.of(prepared.blas())),
+                                    () -> RtAccel.freeBlasScratch(List.of(prepared.blas())));
                         } catch (Throwable t) {
                             RtSectionBuilder.destroy(prepared);
                             throw t;
@@ -1174,7 +1169,6 @@ public final class RtTerrain {
             if (built != null) {
                 try {
                     ctx.gpuExecutor().free(result.build());
-                    RtAccel.freeBlasScratch(List.of(built.blas()));
                     RtSectionBuilder.resolveMaterials(built);
                     ctx.gpuExecutor().markPublished(result.build());
                     RtFrameStats.FRAME.count("sectionsUploaded", 1);
@@ -1227,7 +1221,7 @@ public final class RtTerrain {
             return;
         }
         ctx.gpuExecutor().free(result.build());
-        RtSectionBuilder.destroy(result.prepared());
+        ctx.gpuExecutor().enqueueDestroyUnpublished(() -> RtSectionBuilder.destroy(result.prepared()));
     }
 
     private void releaseJobReservation(TessJob job) {
@@ -1293,7 +1287,12 @@ public final class RtTerrain {
     }
 
     private void destroyPreparedSection(PreparedSection ps) {
-        RtSectionBuilder.destroy(ps);
+        RtContext ctx = RtContext.get();
+        if (ctx == null) {
+            RtSectionBuilder.destroy(ps);
+        } else {
+            ctx.gpuExecutor().enqueueDestroyUnpublished(() -> RtSectionBuilder.destroy(ps));
+        }
     }
 
     /** Per-tick render-thread snapshot dependencies shared by reextract + missing dispatch. */
@@ -1318,10 +1317,6 @@ public final class RtTerrain {
             this.remaining = remaining;
             this.keys = new LongArrayList(keys);
         }
-    }
-
-    /** A deferred free: run {@code free} once the frame counter reaches {@code freeFrame}. */
-    private record Deferred(long freeFrame, Runnable free) {
     }
 
     /** An outstanding async tessellation; completed results are delivered through the priority queues. */
@@ -1360,7 +1355,7 @@ public final class RtTerrain {
 
     private void applyBuildChanges(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed,
                                    boolean rebase, int rbx, int rby, int rbz) {
-        long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
+        long lastGraphicsUse = ctx.gpuExecutor().latestGraphicsUseValue();
         int baseX = rebase ? rbx : blockX;
         int baseY = rebase ? rby : blockY;
         int baseZ = rebase ? rbz : blockZ;
@@ -1368,13 +1363,13 @@ public final class RtTerrain {
         for (SectionGeom g : removed) {
             table.removePublished(resident, published, g);
         }
-        retire(freeAt, null, removed);
+        retire(ctx, lastGraphicsUse, removed);
 
 
         if (!prepared.isEmpty()) {
-            RtBuffer oldTable = table.ensureCapacity(ctx, table.liveSlotCapacity(prepared, resident));
-            if (oldTable != null) {
-                retire(freeAt, oldTable, List.of());
+            Generation oldGeneration = table.beginWriteGeneration(ctx, table.liveSlotCapacity(prepared, resident));
+            if (oldGeneration != null) {
+                retireGeneration(ctx, lastGraphicsUse, oldGeneration);
 
             }
         }
@@ -1385,7 +1380,7 @@ public final class RtTerrain {
             if (!desired.contains(ps.key())) {
                 // Left the window while its batched BLAS build was in flight (window sync keeps running
                 // during builds). Never published — retire the fresh, unreferenced geometry.
-                retire(freeAt, null, List.of(g));
+                ctx.gpuExecutor().enqueueDestroyUnpublished(g::destroy);
                 continue;
             }
             SectionGeom prev = resident.get(ps.key());
@@ -1396,7 +1391,7 @@ public final class RtTerrain {
                 resident.put(ps.key(), g);
                 table.write(g);
                 table.instanceList.set(g.instanceIndex, table.instanceFor(g, baseX, baseY, baseZ));
-                retire(freeAt, null, List.of(prev));
+                retire(ctx, lastGraphicsUse, List.of(prev));
             } else {
                 g.slot = table.allocateSlot();
                 g.instanceIndex = table.instanceList.size();
@@ -1407,11 +1402,13 @@ public final class RtTerrain {
             }
             published.add(ps.key());
         }
+        table.flushWrites();
 
         if (resident.isEmpty()) {
-            retire(freeAt, table.buffer, List.of());
-            table.buffer = null;
-            table.capacity = 0;
+            Generation emptyGeneration = table.detachGeneration();
+            if (emptyGeneration != null) {
+                retireGeneration(ctx, lastGraphicsUse, emptyGeneration);
+            }
             table.nextSlot = 0;
             table.freeSlots.clear();
             table.slots.clear();
@@ -1460,29 +1457,16 @@ public final class RtTerrain {
         ready = true;
     }
 
-    /** Queue old GPU resources for a frames-in-flight-safe free at {@code freeFrame}. */
-    private void retire(long freeFrame, RtBuffer oldTable, List<SectionGeom> removed) {
-        if (oldTable != null) {
-            deferred.add(new Deferred(freeFrame, oldTable::destroy));
-        }
+    /** Queue old GPU resources until the last graphics submission that could reference them completes. */
+    private void retire(RtContext ctx, long lastGraphicsUse, List<SectionGeom> removed) {
         for (SectionGeom g : removed) {
-            deferred.add(new Deferred(freeFrame, g::destroy));
+            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, g::destroy);
         }
     }
 
-    private void processDeferredFrees() {
-        if (deferred.isEmpty()) {
-            return;
-        }
-        long now = RtComposite.frameCounter();
-        Iterator<Deferred> it = deferred.iterator();
-        while (it.hasNext()) {
-            Deferred d = it.next();
-            if (d.freeFrame() <= now) {
-                d.free().run();
-                it.remove();
-            }
-        }
+    private void retireGeneration(RtContext ctx, long lastGraphicsUse, Generation generation) {
+        ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse,
+                () -> table.recycleGeneration(generation));
     }
 
     /** Join outstanding worker/build jobs and destroy every unpublished native result. */
@@ -1512,6 +1496,7 @@ public final class RtTerrain {
         while ((result = pollCompleted()) != null) {
             releaseJobReservation(result.job());
             if (result.prepared() != null) {
+                PreparedSection unpublished = result.prepared();
                 try {
                     ctx.gpuExecutor().free(result.build());
                 } catch (Throwable t) {
@@ -1519,7 +1504,7 @@ public final class RtTerrain {
                         failure = t;
                     }
                 }
-                RtSectionBuilder.destroy(result.prepared());
+                ctx.gpuExecutor().enqueueDestroyUnpublished(() -> RtSectionBuilder.destroy(unpublished));
             }
             if (result.failure() != null && failure == null) {
                 failure = result.failure();
@@ -1540,6 +1525,9 @@ public final class RtTerrain {
     private void clear(RtContext ctx, boolean shutdown) {
         cancelJobs(ctx);
         cancelAllDirtyGroups();
+        ctx.waitIdle();
+        ctx.gpuExecutor().flushDestroysAfterDeviceIdle();
+        table.destroyRecycledGenerations();
         snapshots.clear();
         synchronized (dirtyLock) {
             dirty.clear(); // any pending re-extract keys refer to the old world/coords — drop them
@@ -1560,8 +1548,7 @@ public final class RtTerrain {
         reextract.clear();
         queuedReextract.clear();
         windowValid = false;
-        if (resident.isEmpty() && table.buffer == null && deferred.isEmpty()
-                && removed.isEmpty() && prepared.isEmpty()) {
+        if (resident.isEmpty() && table.buffer == null && removed.isEmpty() && prepared.isEmpty()) {
             empty.clear();
             table.instances = null;
             published.clear();
@@ -1579,14 +1566,9 @@ public final class RtTerrain {
             }
             return;
         }
-        ctx.waitIdle();
-        for (Deferred d : deferred) {
-            d.free().run();
-        }
-        deferred.clear();
-        if (table.buffer != null) {
-            table.buffer.destroy();
-            table.buffer = null;
+        Generation currentGeneration = table.detachGeneration();
+        if (currentGeneration != null) {
+            currentGeneration.buffer().destroy();
         }
         table.capacity = 0;
         table.nextSlot = 0;

@@ -12,6 +12,7 @@ import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Mutable GPU section-table state owned by the render thread. M0 centralizes the table buffer, slot
@@ -25,7 +26,10 @@ final class RtSectionTable {
     final LongArrayList freeSlots = new LongArrayList();
     final ArrayList<SectionGeom> slots = new ArrayList<>();
     final ArrayList<RtAccel.Instance> instanceList = new ArrayList<>();
+    private final ConcurrentLinkedQueue<Generation> recycledGenerations = new ConcurrentLinkedQueue<>();
     List<RtAccel.Instance> instances;
+    private long dirtyStart = Long.MAX_VALUE;
+    private long dirtyEnd;
 
     long address() {
         return buffer.deviceAddress;
@@ -48,39 +52,77 @@ final class RtSectionTable {
         return needed;
     }
 
-    /** Allocate a copy-on-write table and return the previous generation for deferred retirement. */
-    RtBuffer ensureCapacity(RtContext ctx, int minCapacity) {
+    /** Acquire a writable copy-on-write generation and return the previous graphics-owned generation. */
+    Generation beginWriteGeneration(RtContext ctx, int minCapacity) {
         int newCapacity = CausticaConfig.Rt.Terrain.SECTION_TABLE_INITIAL_CAPACITY.value();
         newCapacity = Math.max(newCapacity, capacity);
         while (newCapacity < minCapacity) {
             newCapacity <<= 1;
         }
-        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        RtBuffer newTable = ctx.createBuffer((long) newCapacity * SECTION_ENTRY_BYTES, storage, true,
-                "terrain section table " + newCapacity + " slots");
-        RtBuffer oldTable = buffer;
+        Generation writable = acquireGeneration(ctx, newCapacity);
+        RtBuffer newTable = writable.buffer;
+        newCapacity = writable.capacity;
+        Generation oldGeneration = buffer == null ? null : new Generation(buffer, capacity);
         int oldCapacity = capacity;
         buffer = newTable;
         capacity = newCapacity;
-        if (oldTable != null && oldCapacity > 0) {
-            MemoryUtil.memCopy(oldTable.mapped, newTable.mapped,
+        if (oldGeneration != null && oldCapacity > 0) {
+            MemoryUtil.memCopy(oldGeneration.buffer.mapped, newTable.mapped,
                     (long) oldCapacity * SECTION_ENTRY_BYTES);
-            newTable.flush(0L, (long) oldCapacity * SECTION_ENTRY_BYTES);
+            markDirty(0L, (long) oldCapacity * SECTION_ENTRY_BYTES);
         }
-        return oldTable;
+        return oldGeneration;
     }
 
     void ensureEmpty(RtContext ctx) {
         if (buffer == null) {
             int initialCapacity = CausticaConfig.Rt.Terrain.SECTION_TABLE_INITIAL_CAPACITY.value();
-            buffer = ctx.createBuffer((long) initialCapacity * SECTION_ENTRY_BYTES,
-                    org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true,
-                    "terrain section table " + initialCapacity + " slots (empty)");
-            capacity = initialCapacity;
+            Generation generation = acquireGeneration(ctx, initialCapacity);
+            buffer = generation.buffer;
+            capacity = generation.capacity;
         }
         if (instances == null) {
             instances = instanceList;
         }
+    }
+
+    Generation detachGeneration() {
+        if (buffer == null) {
+            return null;
+        }
+        Generation generation = new Generation(buffer, capacity);
+        buffer = null;
+        capacity = 0;
+        return generation;
+    }
+
+    /** Called after this generation's graphics timeline value completes. */
+    void recycleGeneration(Generation generation) {
+        recycledGenerations.add(generation);
+    }
+
+    void destroyRecycledGenerations() {
+        Generation generation;
+        while ((generation = recycledGenerations.poll()) != null) {
+            generation.buffer.destroy();
+        }
+    }
+
+    private Generation acquireGeneration(RtContext ctx, int minCapacity) {
+        Generation generation;
+        while ((generation = recycledGenerations.poll()) != null) {
+            if (generation.capacity >= minCapacity) {
+                return generation;
+            }
+            ctx.gpuExecutor().enqueueDestroyUnpublished(generation.buffer::destroy);
+        }
+        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        RtBuffer buffer = ctx.createBuffer((long) minCapacity * SECTION_ENTRY_BYTES, storage, true,
+                "terrain section table " + minCapacity + " slots");
+        return new Generation(buffer, minCapacity);
+    }
+
+    record Generation(RtBuffer buffer, int capacity) {
     }
 
     int allocateSlot() {
@@ -119,14 +161,30 @@ final class RtSectionTable {
     }
 
     void write(SectionGeom geom) {
-        long base = buffer.mapped + (long) geom.slot * SECTION_ENTRY_BYTES;
+        long offset = (long) geom.slot * SECTION_ENTRY_BYTES;
+        long base = buffer.mapped + offset;
         MemoryUtil.memPutLong(base, geom.material.deviceAddress);
         MemoryUtil.memPutLong(base + 8, geom.uvs.deviceAddress);
         MemoryUtil.memPutInt(base + 16, geom.triBase[0]);
         MemoryUtil.memPutInt(base + 20, geom.triBase[1]);
         MemoryUtil.memPutInt(base + 24, geom.triBase[2]);
         MemoryUtil.memPutInt(base + 28, geom.triBase[3]);
-        buffer.flush((long) geom.slot * SECTION_ENTRY_BYTES, SECTION_ENTRY_BYTES);
+        markDirty(offset, SECTION_ENTRY_BYTES);
+    }
+
+    /** Publish every copy/patch made to the writable generation with one VMA flush. */
+    void flushWrites() {
+        if (dirtyStart == Long.MAX_VALUE) {
+            return;
+        }
+        buffer.flush(dirtyStart, dirtyEnd - dirtyStart);
+        dirtyStart = Long.MAX_VALUE;
+        dirtyEnd = 0L;
+    }
+
+    private void markDirty(long offset, long length) {
+        dirtyStart = Math.min(dirtyStart, offset);
+        dirtyEnd = Math.max(dirtyEnd, offset + length);
     }
 
     RtAccel.Instance instanceFor(SectionGeom geom, int rbx, int rby, int rbz) {

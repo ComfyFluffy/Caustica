@@ -1,9 +1,12 @@
 # Full-Async Terrain Pipeline — Plan of Record
 
-Status: **M2 implemented; runtime validation pending** (2026-07-12). M0 is compile-tested and M1 is
-Vulkan-validation clean. M2 moves buffer fill plus OMM/BLAS creation/enqueue into worker-owned jobs,
-batches up to 32 recordings per executor submission, removes the single `Pending` build restriction,
-and adds a configurable native-resource admission cap using conservative 16 MiB section reservations.
+Status: **M3 implemented; runtime validation pending** (2026-07-12). M0 is compile-tested; M1 and M2
+are Vulkan-validation clean. M3 routes terrain geometry destruction through graphics-timeline
+completion, makes section-table copy-on-write generations explicit and recyclable, and removes terrain's
+`KEEP_FRAMES`/deferred-free heuristic entirely. M2 moved buffer fill plus OMM/BLAS creation/enqueue into
+worker-owned jobs, batches up to 32 recordings per executor submission, removed the single `Pending`
+build restriction, and added a configurable native-resource admission cap using conservative 16 MiB
+section reservations.
 Supersedes the
 incremental worker-direct-to-mapped-buffer change
 (already in the working tree) as the target architecture; that change survives as the M2 worker job's
@@ -142,11 +145,13 @@ queue M1 needs; it becomes mandatory if that ownership assumption changes.
 - **Host-side timeline poll = scheduling only.** The render thread publishes a section only once
   `completedBuildValue() >= V` — this keeps the device wait always-already-signaled (zero stall), but it is
   a scheduling gate, not the correctness mechanism.
-- **Graphics completion is a separate timeline.** Every successful graphics frame submission signals
-  monotonically increasing value `G` at the end of its work. A resource replaced before submission
-  `G+1` is retired against the latest successfully submitted `G`, and is destroyed only after
-  `completedGraphicsValue() >= G`. The build timeline proves construction completed; it never proves
-  that an older graphics frame stopped tracing a published BLAS.
+- **Graphics completion is a separate timeline.** Every recorded RT graphics frame signals a
+  monotonically increasing value `G` at the end of its work. A replaced resource is retired against
+  the latest recorded value that could reference it and is destroyed only after
+  `completedGraphicsValue() >= G`. If that frame is skipped, a later submitted frame signals a higher
+  timeline value and therefore satisfies the older target; if no later RT frame occurs, teardown's
+  device-idle flush reclaims it. The build timeline proves construction completed; it never proves that
+  an older graphics frame stopped tracing a published BLAS.
 - **Wait acknowledgment:** `pendingPublishWaitValue()` is not cleared when queried or when the render
   thread merely records a frame. It remains attached to subsequent graphics submissions until one is
   successfully queued with that wait. Repeating a wait on an already-signaled timeline value is safe;
@@ -194,7 +199,7 @@ were queued successfully.
 4. **Publish (render thread, per frame):** drain completion queue under the existing token check.
    Stale → `enqueueDestroyUnpublished` (BLAS was built but never referenced by any TLAS — safe).
    Valid → existing `applyBuildChanges` swap logic (slot reuse, table patch, instance swap), old geom
-   retired against `latestSuccessfullySubmittedGraphicsValue`. Dirty groups keep group-atomic publish:
+   retired against the latest recorded graphics-use value. Dirty groups keep group-atomic publish:
    a group completes when all members' completions have arrived.
 5. **Frame submit:** a device-side `waitSemaphore(timeline, pendingPublishWaitValue(), ...)` gates the
    graphics queue whenever terrain published since the last acknowledged submit, and that frame
@@ -224,9 +229,10 @@ and reclaim it only after its build value completes.
 - Retired geometry (`retire`) → `enqueueDestroyAfterGraphics(lastUseG, geom::destroy)`.
 - Stale/cancelled results whose compute build completed but which were never published →
   `enqueueDestroyUnpublished` immediately.
-- Old section-table generations on grow/replacement → retire against their last graphics-use value.
-- Executor polls both timeline counters each loop iteration; a wake-up after each graphics submission
-  guarantees destroy progress even when no builds are queued.
+- Old section-table generations on every patched publication → retire against their last graphics-use
+  value, then recycle the completed buffer for a later writable generation when capacity permits.
+- Executor polls both timeline counters on build completion and on a wake queued with each recorded
+  graphics use, guaranteeing destroy progress even when no builds are queued.
 - `clear()/shutdown`: stop dispatch → `cancelJobs()` (joins workers — already implemented) →
   `executor.flushAndJoin()` → `waitIdle` → destroy remainder synchronously. Executor holds no world
   state, so teardown ordering stays simple.
