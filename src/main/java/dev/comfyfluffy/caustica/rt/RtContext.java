@@ -3,6 +3,7 @@ package dev.comfyfluffy.caustica.rt;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import com.mojang.blaze3d.vulkan.VulkanQueue;
+import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
@@ -46,6 +47,7 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_STRUCTURE_TYPE_PHYSICAL_
  */
 public final class RtContext {
     private static RtContext instance;
+    private static boolean unavailable;
 
     private final VulkanDevice device;
     private final VkDevice vk;
@@ -82,9 +84,15 @@ public final class RtContext {
     }
 
     public static synchronized RtContext get(VulkanDevice device) {
-        if (instance == null) {
-            instance = create(device);
+        if (instance != null || unavailable) {
+            return instance;
         }
+        if (device.computeQueue().vkQueue().address() == device.graphicsQueue().vkQueue().address()) {
+            unavailable = true;
+            CausticaMod.LOGGER.warn("Caustica RT disabled: Vulkan compute queue aliases graphics queue");
+            return null;
+        }
+        instance = create(device);
         return instance;
     }
 
@@ -372,6 +380,7 @@ public final class RtContext {
             Vma.vmaDestroyAllocator(vma);
         }
         instance = null;
+        unavailable = false;
     }
 
     private void ensurePool() {

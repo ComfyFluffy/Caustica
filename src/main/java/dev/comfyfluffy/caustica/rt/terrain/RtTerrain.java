@@ -107,14 +107,6 @@ public final class RtTerrain {
         return CausticaConfig.Rt.Terrain.MAX_INFLIGHT_SECTIONS.value();
     }
 
-    private static long maxInflightNativeBytes() {
-        return (long) CausticaConfig.Rt.Terrain.MAX_INFLIGHT_NATIVE_MB.value() << 20;
-    }
-
-    // Conservative admission reservation covering mesh buffers, AS/OMM backing, build inputs, and scratch.
-    // Together with the executor's 32-build cap this bounds one GPU batch to at most 512 MiB reserved.
-    private static final long NATIVE_RESERVATION_BYTES = 16L << 20;
-
     private static final int SECTION_ENTRY_BYTES = 32; // {u64 primAddr, u64 uvAddr, u32 triBase[4]}
     private static final long NO_TESS_TOKEN = Long.MIN_VALUE;
     private static final int NO_MISSING_INDEX = -1;
@@ -152,8 +144,6 @@ public final class RtTerrain {
     private final LongArrayList missing = new LongArrayList();
     private final Long2IntOpenHashMap missingIndex = new Long2IntOpenHashMap();
     private final Long2LongOpenHashMap queuedDirtyGroup = new Long2LongOpenHashMap();
-    private final LongArrayList playerReextract = new LongArrayList();
-    private final LongOpenHashSet queuedPlayerReextract = new LongOpenHashSet();
     private final LongArrayList reextract = new LongArrayList();
     private final LongOpenHashSet queuedReextract = new LongOpenHashSet();
     // Publish accumulators: window sync (tick) and completion drain (streaming pass) may run on different
@@ -170,7 +160,6 @@ public final class RtTerrain {
     private int activeTasks;
     private long buildToken;
     private long dirtyGroupSeq;
-    private long inFlightNativeBytes;
     private final RtSectionTable table = new RtSectionTable();
     private boolean ready;
     // Full-residency invalidation requested off the render thread. Wired to Fabric's
@@ -360,12 +349,12 @@ public final class RtTerrain {
             if (!dirtyDrain.isEmpty()) {
                 for (LongIterator it = dirtyDrain.iterator(); it.hasNext(); ) {
                     long key = it.nextLong();
-                    handleDirtySection(key, pcx, psy, pcz, NO_DIRTY_GROUP);
+                    handleDirtySection(key, NO_DIRTY_GROUP);
                 }
             }
             if (!dirtyEventDrain.isEmpty()) {
                 for (DirtyEvent event : dirtyEventDrain) {
-                    handleDirtyEvent(event, pcx, psy, pcz);
+                    handleDirtyEvent(event);
                 }
             }
         }
@@ -398,7 +387,7 @@ public final class RtTerrain {
         if (level == null || mc.player == null) {
             return;
         }
-        if (playerReextract.isEmpty() && reextract.isEmpty() && missing.isEmpty()
+        if (reextract.isEmpty() && missing.isEmpty()
                 && completedBuilds.isEmpty()
                 && removed.isEmpty() && prepared.isEmpty()) {
             return;
@@ -426,21 +415,12 @@ public final class RtTerrain {
         // Snapshot and dispatch a bounded number of new worker-owned section builds.
         try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.snapshotDispatch")) {
             DispatchContext dispatch = null;
-            int countSlots = Math.max(0, maxInflight() - inFlight.size());
-            int nativeSlots = (int) Math.max(0L,
-                    (maxInflightNativeBytes() - inFlightNativeBytes) / NATIVE_RESERVATION_BYTES);
-            int dispatchSlots = Math.min(asyncDispatchPerPass(), Math.min(countSlots, nativeSlots));
-            if (dispatchSlots > 0 && !playerReextract.isEmpty()) {
-                dispatch = dispatchContext(ctx, level);
-                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots,
-                        playerReextract, queuedPlayerReextract);
-            }
+            int dispatchSlots = Math.min(asyncDispatchPerPass(), Math.max(0, maxInflight() - inFlight.size()));
             if (dispatchSlots > 0 && !reextract.isEmpty()) {
                 if (dispatch == null) {
                     dispatch = dispatchContext(ctx, level);
                 }
-                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots,
-                        reextract, queuedReextract);
+                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots, pcx, psy, pcz);
             }
             if (dispatchSlots > 0 && !missing.isEmpty()) {
                 if (dispatch == null) {
@@ -488,7 +468,6 @@ public final class RtTerrain {
 
         pruneUndesired(removed);
         removeKeysNotIn(queuedReextract, desired);
-        removeKeysNotIn(queuedPlayerReextract, desired);
         windowValid = true;
         windowPcx = pcx;
         windowPcz = pcz;
@@ -599,7 +578,7 @@ public final class RtTerrain {
         removeQueuedGroupsNotIn(desired);
     }
 
-    private void handleDirtyEvent(DirtyEvent event, int pcx, int psy, int pcz) {
+    private void handleDirtyEvent(DirtyEvent event) {
         int groupMembers = 0;
         for (LongIterator it = event.keys().iterator(); it.hasNext(); ) {
             if (canGroupDirtySection(it.nextLong())) {
@@ -618,7 +597,7 @@ public final class RtTerrain {
             long memberGroup = groupId != NO_DIRTY_GROUP
                     && dirtyGroups.containsKey(groupId)
                     && canGroupDirtySection(key) ? groupId : NO_DIRTY_GROUP;
-            if (!handleDirtySection(key, pcx, psy, pcz, memberGroup) && memberGroup != NO_DIRTY_GROUP) {
+            if (!handleDirtySection(key, memberGroup) && memberGroup != NO_DIRTY_GROUP) {
                 cancelDirtyGroup(memberGroup);
             }
         }
@@ -628,7 +607,7 @@ public final class RtTerrain {
         return desired.contains(key) && (resident.containsKey(key) || empty.contains(key));
     }
 
-    private boolean handleDirtySection(long key, int pcx, int psy, int pcz, long dirtyGroup) {
+    private boolean handleDirtySection(long key, long dirtyGroup) {
         snapshots.invalidate(key); // block data changed — the cached palette snapshot is stale
         boolean wasEmpty = empty.remove(key);
         if (wasEmpty && dirtyGroup != NO_DIRTY_GROUP) {
@@ -646,12 +625,7 @@ public final class RtTerrain {
         // (no eviction gap -> no flicker). Non-resident dirty keys re-enter the normal missing queue.
         SectionGeom g = resident.get(key);
         if (g != null) {
-            if (isPlayerUpdatePriority(key, pcx, psy, pcz)) {
-                queuedReextract.remove(key); // promote; stale normal entry will be skipped
-                if (queuedPlayerReextract.add(key)) {
-                    playerReextract.add(key);
-                }
-            } else if (!queuedPlayerReextract.contains(key) && queuedReextract.add(key)) {
+            if (queuedReextract.add(key)) {
                 reextract.add(key);
             }
             setQueuedGroup(key, dirtyGroup);
@@ -659,12 +633,6 @@ public final class RtTerrain {
         } else {
             return enqueueMissing(key, dirtyGroup);
         }
-    }
-
-    private static boolean isPlayerUpdatePriority(long key, int pcx, int psy, int pcz) {
-        return Math.abs(sectionX(key) - pcx) <= 1
-                && Math.abs(sectionY(key) - psy) <= 1
-                && Math.abs(sectionZ(key) - pcz) <= 1;
     }
 
     private boolean enqueueMissingIfNeeded(long key) {
@@ -696,7 +664,6 @@ public final class RtTerrain {
 
     private void clearQueuedWork(long key, boolean cancelGroup) {
         removeMissing(key);
-        queuedPlayerReextract.remove(key);
         queuedReextract.remove(key);
         clearQueuedGroup(key, cancelGroup);
     }
@@ -717,7 +684,7 @@ public final class RtTerrain {
 
     private boolean isQueuedAnywhere(long key) {
         return missingIndex.get(key) != NO_MISSING_INDEX
-                || queuedPlayerReextract.contains(key) || queuedReextract.contains(key);
+                || queuedReextract.contains(key);
     }
 
     /** Remove an unsorted missing entry in O(1) by moving the last entry into its slot. */
@@ -869,11 +836,7 @@ public final class RtTerrain {
         for (int read = 0, n = missing.size(); read < n; read++) {
             long key = missing.getLong(read);
             // rank = columnDist²(16+) | |Δy|(0..15): column-major nearest-first.
-            int dx = sectionX(key) - pcx;
-            int dz = sectionZ(key) - pcz;
-            long colDist2 = (long) dx * dx + (long) dz * dz;
-            long dy = Math.min(0xFFFF, Math.abs(sectionY(key) - psy));
-            long rank = (colDist2 << 16) | dy;
+            long rank = distanceRank(key, pcx, psy, pcz);
             if (heapSize < k) {
                 heapRank[heapSize] = rank;
                 heapKey[heapSize] = key;
@@ -948,27 +911,29 @@ public final class RtTerrain {
      * is what prevents the visible flicker on block updates that plain eviction would cause.
      */
     private int dispatchReextract(DispatchContext dispatch, ClientChunkCache chunkSource, int remaining,
-                                  LongArrayList queue, LongOpenHashSet queued) {
-        if (queue.isEmpty()) {
+                                  int pcx, int psy, int pcz) {
+        if (reextract.isEmpty()) {
             return 0;
         }
-        int dispatched = 0;
-        int attempts = Math.min(queue.size(), Math.max(64, remaining * 4));
-        for (int i = 0; i < queue.size() && remaining > 0 && attempts-- > 0; ) {
-            long key = queue.getLong(i);
-            if (!queued.contains(key)) {
+        int k = Math.min(reextract.size(), Math.max(8, remaining * 2));
+        long[] heapRank = new long[k];
+        long[] heapKey = new long[k];
+        int heapSize = 0;
+        for (int i = 0; i < reextract.size(); ) {
+            long key = reextract.getLong(i);
+            if (!queuedReextract.contains(key)) {
                 if (!isQueuedAnywhere(key)) {
                     clearQueuedGroup(key, true);
                 }
-                queue.removeLong(i);
+                removeUnsorted(reextract, i);
                 continue;
             }
             // Skip ones the window pass freed this tick (out of view) — they're being retired, not rebuilt.
             SectionGeom g = resident.get(key);
             if (g == null || !desired.contains(key) || inFlight.containsKey(key)) {
-                queued.remove(key);
+                queuedReextract.remove(key);
                 clearQueuedGroup(key, true);
-                queue.removeLong(i);
+                removeUnsorted(reextract, i);
                 continue;
             }
             int sx = g.sx >> 4;
@@ -977,13 +942,50 @@ public final class RtTerrain {
                 i++;
                 continue;
             }
-            queued.remove(key);
-            queue.removeLong(i);
+            long rank = distanceRank(key, pcx, psy, pcz);
+            if (heapSize < k) {
+                heapRank[heapSize] = rank;
+                heapKey[heapSize] = key;
+                siftUp(heapRank, heapKey, heapSize++);
+            } else if (rank < heapRank[0]) {
+                heapRank[0] = rank;
+                heapKey[0] = key;
+                siftDown(heapRank, heapKey, heapSize, 0);
+            }
+            i++;
+        }
+        for (int end = heapSize - 1; end > 0; end--) {
+            long r = heapRank[0]; heapRank[0] = heapRank[end]; heapRank[end] = r;
+            long q = heapKey[0]; heapKey[0] = heapKey[end]; heapKey[end] = q;
+            siftDown(heapRank, heapKey, end, 0);
+        }
+        int dispatched = 0;
+        for (int i = 0; i < heapSize && remaining > 0; i++) {
+            long key = heapKey[i];
+            SectionGeom g = resident.get(key);
+            queuedReextract.remove(key);
+            removeUnsorted(reextract, reextract.indexOf(key));
             dispatchSectionBuild(dispatch, key, g.sx >> 4, g.sy >> 4, g.sz >> 4);
             remaining--;
             dispatched++;
         }
         return dispatched;
+    }
+
+    private static long distanceRank(long key, int pcx, int psy, int pcz) {
+        int dx = sectionX(key) - pcx;
+        int dz = sectionZ(key) - pcz;
+        long colDist2 = (long) dx * dx + (long) dz * dz;
+        long dy = Math.min(0xFFFF, Math.abs(sectionY(key) - psy));
+        return (colDist2 << 16) | dy;
+    }
+
+    private static void removeUnsorted(LongArrayList queue, int index) {
+        int last = queue.size() - 1;
+        if (index != last) {
+            queue.set(index, queue.getLong(last));
+        }
+        queue.removeLong(last);
     }
 
     /** Snapshot one section and dispatch its complete worker → GPU build lifecycle. */
@@ -996,7 +998,6 @@ public final class RtTerrain {
             dirtyGroup = NO_DIRTY_GROUP;
         }
         SectionTask task = new SectionTask(key, token, sx << 4, sy << 4, sz << 4, dirtyGroup);
-        inFlightNativeBytes += task.nativeReservationBytes;
         beginActiveTask();
         try {
             RtWorkerPool.INSTANCE.submit(() -> {
@@ -1029,7 +1030,6 @@ public final class RtTerrain {
                 }
             });
         } catch (Throwable t) {
-            releaseTaskReservation(task);
             finishActiveTask();
             throw t;
         }
@@ -1097,7 +1097,6 @@ public final class RtTerrain {
                 break;
             }
             SectionTask task = result.task();
-            releaseTaskReservation(task);
             long expected = inFlight.get(task.key);
             boolean valid = expected == task.token;
             if (!valid) {
@@ -1108,8 +1107,7 @@ public final class RtTerrain {
             long dirtyGroup = inFlightDirtyGroup.remove(task.key);
             if (result.failure() != null) {
                 if (result.prepared() != null) {
-                    PreparedSection failed = result.prepared();
-                    ctx.gpuExecutor().enqueueDestroyUnpublished(() -> RtSectionBuilder.destroy(failed));
+                    destroyPreparedSection(result.prepared());
                 }
                 if (dirtyGroup != NO_DIRTY_GROUP) {
                     cancelDirtyGroup(dirtyGroup);
@@ -1172,18 +1170,7 @@ public final class RtTerrain {
         if (result.prepared() == null) {
             return;
         }
-        ctx.gpuExecutor().enqueueDestroyUnpublished(() -> RtSectionBuilder.destroy(result.prepared()));
-    }
-
-    private void releaseTaskReservation(SectionTask task) {
-        if (task.nativeReservationBytes == 0L) {
-            return;
-        }
-        inFlightNativeBytes -= task.nativeReservationBytes;
-        if (inFlightNativeBytes < 0L) {
-            throw new IllegalStateException("RT terrain native reservation underflow");
-        }
-        task.nativeReservationBytes = 0L;
+        destroyPreparedSection(result.prepared());
     }
 
     private void completeDirtyGroupMember(DirtyGroup group, List<PreparedSection> prepared, List<SectionGeom> removed) {
@@ -1238,7 +1225,7 @@ public final class RtTerrain {
     }
 
     private void destroyPreparedSection(PreparedSection ps) {
-        RtContext ctx = RtContext.get();
+        RtContext ctx = RtContext.currentOrNull();
         if (ctx == null) {
             RtSectionBuilder.destroy(ps);
         } else {
@@ -1278,8 +1265,6 @@ public final class RtTerrain {
         final int soy;
         final int soz;
         final long dirtyGroup;
-        long nativeReservationBytes = NATIVE_RESERVATION_BYTES;
-
         SectionTask(long key, long token, int sox, int soy, int soz, long dirtyGroup) {
             this.key = key;
             this.token = token;
@@ -1419,14 +1404,15 @@ public final class RtTerrain {
 
     /** Join outstanding worker/GPU tasks and destroy every unpublished terminal result. */
     private void drainTasksForClear(RtContext ctx) {
+        // A dead executor cannot make further task progress. Throw on the render thread before waiting;
+        // its failure path has already terminally failed every accepted queued build.
+        ctx.gpuExecutor().throwIfFailed();
         awaitActiveTasks();
         Throwable failure = null;
         SectionResult result;
         while ((result = completedBuilds.poll()) != null) {
-            releaseTaskReservation(result.task());
             if (result.prepared() != null) {
-                PreparedSection unpublished = result.prepared();
-                ctx.gpuExecutor().enqueueDestroyUnpublished(() -> RtSectionBuilder.destroy(unpublished));
+                destroyPreparedSection(result.prepared());
             }
             if (result.failure() != null && failure == null) {
                 failure = result.failure();
@@ -1434,10 +1420,6 @@ public final class RtTerrain {
         }
         inFlight.clear();
         inFlightDirtyGroup.clear();
-        if (inFlightNativeBytes != 0L) {
-            throw new IllegalStateException("RT terrain native reservations remain after worker join: "
-                    + inFlightNativeBytes);
-        }
         if (failure != null) {
             throw new RuntimeException("RT terrain worker/build failed during teardown", failure);
         }
@@ -1468,8 +1450,6 @@ public final class RtTerrain {
         missing.clear();
         missingIndex.clear();
         queuedDirtyGroup.clear();
-        playerReextract.clear();
-        queuedPlayerReextract.clear();
         reextract.clear();
         queuedReextract.clear();
         windowValid = false;

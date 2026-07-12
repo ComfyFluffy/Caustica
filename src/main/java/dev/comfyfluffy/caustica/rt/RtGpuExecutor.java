@@ -51,6 +51,7 @@ public final class RtGpuExecutor {
     private final AtomicLong nextBuildValue = new AtomicLong();
     private final AtomicLong pendingPublishWaitValue = new AtomicLong();
     private final AtomicLong nextGraphicsValue = new AtomicLong();
+    private final AtomicLong latestGraphicsUseValue = new AtomicLong();
     private final ArrayList<DestroyJob> destroyJobs = new ArrayList<>();
     private final Thread thread;
     private long commandPool;
@@ -102,10 +103,13 @@ public final class RtGpuExecutor {
         return nextGraphicsValue.incrementAndGet();
     }
 
-    /** Signal completion after the RT command buffer; later M3 retirement consumes this timeline. */
+    /** Signal completion after the final terrain/TLAS consumer and commit the value for retirement. */
     public void endGraphicsTerrainUse(VulkanCommandEncoder encoder, long graphicsValue) {
         encoder.signalSemaphore(graphicsTimeline, graphicsValue, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR);
-        jobs.offer(WAKE);
+        latestGraphicsUseValue.accumulateAndGet(graphicsValue, Math::max);
+        if (hasPendingDestroys()) {
+            jobs.offer(WAKE);
+        }
     }
 
     public long completedGraphicsValue() {
@@ -114,7 +118,12 @@ public final class RtGpuExecutor {
 
     /** Latest recorded graphics submission that can reference the currently published terrain state. */
     public long latestGraphicsUseValue() {
-        return nextGraphicsValue.get();
+        return latestGraphicsUseValue.get();
+    }
+
+    /** Rethrow a latched executor failure on the calling thread. */
+    public void throwIfFailed() {
+        checkExecutorFailure();
     }
 
     public void enqueueDestroyAfterGraphics(long lastUseValue, Runnable destroy) {
@@ -207,6 +216,7 @@ public final class RtGpuExecutor {
                 first = jobs.take();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                failQueuedJobs(e);
                 return;
             }
             if (first == STOP) {
@@ -214,6 +224,7 @@ public final class RtGpuExecutor {
             }
             if (first == WAKE) {
                 if (!processDestroyJobsSafely()) {
+                    failQueuedJobs(executorFailure);
                     return;
                 }
                 continue;
@@ -246,6 +257,11 @@ public final class RtGpuExecutor {
                 }
             }
             if (!processDestroyJobsSafely()) {
+                failQueuedJobs(executorFailure);
+                return;
+            }
+            if (executorFailure != null) {
+                failQueuedJobs(executorFailure);
                 return;
             }
             if (stopAfterBatch) {
@@ -268,7 +284,27 @@ public final class RtGpuExecutor {
             if (failure != null) {
                 failure.addSuppressed(t);
             }
-            executorFailure = t;
+            latchFailure(t);
+        }
+    }
+
+    /** Fail every accepted build before the executor thread exits so task ownership always unwinds. */
+    private synchronized void failQueuedJobs(Throwable failure) {
+        Throwable terminal = failure != null ? failure : new IllegalStateException("RT GPU executor stopped");
+        latchFailure(terminal);
+        Job job;
+        while ((job = jobs.poll()) != null) {
+            if (job != STOP && job != WAKE) {
+                finishJob(job, terminal);
+            }
+        }
+    }
+
+    private synchronized void latchFailure(Throwable failure) {
+        if (executorFailure == null) {
+            executorFailure = failure;
+        } else if (executorFailure != failure) {
+            executorFailure.addSuppressed(failure);
         }
     }
 
@@ -277,7 +313,7 @@ public final class RtGpuExecutor {
             processDestroyJobs();
             return true;
         } catch (Throwable t) {
-            executorFailure = t;
+            latchFailure(t);
             return false;
         }
     }

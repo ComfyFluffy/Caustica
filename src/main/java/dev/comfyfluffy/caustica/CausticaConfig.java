@@ -87,9 +87,8 @@ public final class CausticaConfig {
                         + " A matching -Dcaustica.* system property overrides the value below.");
         FILE.setComment("terrain",
                 " Render-thread terrain work is bounded by dispatch/result counts per streaming pass.\n"
-                        + " Buffer fill and BLAS/OMM preparation run on workers. max-inflight-native-mb bounds\n"
-                        + " worker-owned terrain allocations using a conservative\n"
-                        + " 16 MiB reservation per section until its build is published or discarded.");
+                        + " Buffer fill and BLAS/OMM preparation run on workers. max-inflight-sections bounds\n"
+                        + " the complete snapshot -> worker -> GPU build -> publication lifecycle.");
         FILE.setComment("frame-generation",
                 " DLSS Frame Generation. Default off; gated additionally by hardware/driver availability.\n"
                         + " multi-frame-count: frames generated per rendered frame (1 = 2x, 2 = 3x, ...), clamped\n"
@@ -553,9 +552,7 @@ public final class CausticaConfig {
             public static final IntSetting COMPLETION_RESULTS_PER_PASS =
                     intAtLeast("caustica.rt.sectionResultsPerTick", "terrain.section-results-per-tick", 64, 0);
             public static final IntSetting MAX_INFLIGHT_SECTIONS =
-                    intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 192, 0);
-            public static final IntSetting MAX_INFLIGHT_NATIVE_MB =
-                    intAtLeast("caustica.rt.maxInflightNativeMb", "terrain.max-inflight-native-mb", 1024, 16);
+                    intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 128, 0);
             public static final IntSetting SECTION_TABLE_INITIAL_CAPACITY =
                     intAtLeast("caustica.rt.sectionTableInitialCapacity", "terrain.section-table-initial-capacity", 512, 1);
             public static final IntSetting REBASE_DISTANCE_BLOCKS =

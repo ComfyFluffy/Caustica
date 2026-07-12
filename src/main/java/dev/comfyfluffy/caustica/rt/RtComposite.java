@@ -287,6 +287,7 @@ public final class RtComposite {
     // makes the TLAS build's writes visible without an extra semaphore, matching every other overlay
     // feature's reliance on in-order queue execution for this frame's world content.
     private volatile long currentTlasHandle;
+    private long pendingTerrainGraphicsUse;
 
     private RtComposite() {
     }
@@ -350,8 +351,27 @@ public final class RtComposite {
      * runs instead.
      */
     public void beginFrame() {
+        if (pendingTerrainGraphicsUse != 0L) {
+            throw new IllegalStateException("Previous RT terrain graphics use was never completed");
+        }
         RtFrameStats.FRAME.beginIfInactive();
         hdrWrittenThisFrame = false;
+    }
+
+    /** Record terrain retirement completion after the frame's final TLAS consumer (world overlay). */
+    public void finishTerrainGraphicsUse() {
+        long graphicsUse = pendingTerrainGraphicsUse;
+        if (graphicsUse == 0L) {
+            return;
+        }
+        RtContext ctx = RtContext.currentOrNull();
+        if (ctx == null) {
+            throw new IllegalStateException("RT context disappeared before terrain graphics use completed");
+        }
+        var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice()
+                .createCommandEncoder()).caustica$getBackend();
+        ctx.gpuExecutor().endGraphicsTerrainUse(encoder, graphicsUse);
+        pendingTerrainGraphicsUse = 0L;
     }
 
     public void endFrame() {
@@ -368,11 +388,13 @@ public final class RtComposite {
         if (ctx == null) {
             return false;
         }
+        ctx.gpuExecutor().throwIfFailed();
         // Count-bounded terrain streaming (dispatch/drain/build kick) runs here once per render frame — before
         // the ready gate below, because it is what MAKES terrain ready during the initial fill.
         try {
             RtTerrain.frame(ctx);
         } catch (Throwable t) {
+            ctx.gpuExecutor().throwIfFailed();
             failed = true;
             CausticaMod.LOGGER.error("RT terrain streaming failed; reverting to vanilla path", t);
             return false;
@@ -415,6 +437,7 @@ public final class RtComposite {
             }
             return true;
         } catch (Throwable t) {
+            ctx.gpuExecutor().throwIfFailed();
             failed = true;
             CausticaMod.LOGGER.error("RT composite failed; reverting to vanilla path", t);
             return false;
@@ -900,7 +923,7 @@ public final class RtComposite {
         RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
         long graphicsUse = gpuExecutor.beginGraphicsTerrainUse(encoder);
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
-        gpuExecutor.endGraphicsTerrainUse(encoder, graphicsUse);
+        pendingTerrainGraphicsUse = graphicsUse;
     }
 
     /**
