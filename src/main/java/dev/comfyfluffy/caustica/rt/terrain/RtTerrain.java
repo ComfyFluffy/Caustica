@@ -140,6 +140,7 @@ public final class RtTerrain {
 
     private static final int SECTION_ENTRY_BYTES = 32; // {u64 primAddr, u64 uvAddr, u32 triBase[4]}
     private static final long NO_TESS_TOKEN = Long.MIN_VALUE;
+    private static final int NO_MISSING_INDEX = -1;
     private static final int PRIORITY_PLAYER = 0;
     private static final int PRIORITY_DIRTY = 1;
     private static final int PRIORITY_MISSING = 2;
@@ -175,8 +176,8 @@ public final class RtTerrain {
     private final LongOpenHashSet desiredColumns = new LongOpenHashSet();
     private final LongOpenHashSet loadedColumns = new LongOpenHashSet();
     private final LongArrayList missing = new LongArrayList();
-    private final LongOpenHashSet queuedMissing = new LongOpenHashSet();
-    private final Long2IntOpenHashMap missingPriority = new Long2IntOpenHashMap();
+    private final IntArrayList missingPriorities = new IntArrayList();
+    private final Long2IntOpenHashMap missingIndex = new Long2IntOpenHashMap();
     private final Long2LongOpenHashMap queuedDirtyGroup = new Long2LongOpenHashMap();
     private final LongArrayList playerReextract = new LongArrayList();
     private final LongOpenHashSet queuedPlayerReextract = new LongOpenHashSet();
@@ -224,7 +225,7 @@ public final class RtTerrain {
     private long lastFrameStreamNanos;
 
     private RtTerrain() {
-        missingPriority.defaultReturnValue(PRIORITY_MISSING);
+        missingIndex.defaultReturnValue(NO_MISSING_INDEX);
         queuedDirtyGroup.defaultReturnValue(NO_DIRTY_GROUP);
         inFlight.defaultReturnValue(NO_TESS_TOKEN);
         inFlightDirtyGroup.defaultReturnValue(NO_DIRTY_GROUP);
@@ -503,8 +504,8 @@ public final class RtTerrain {
         desiredColumns.clear();
         loadedColumns.clear();
         missing.clear();
-        queuedMissing.clear();
-        missingPriority.clear();
+        missingPriorities.clear();
+        missingIndex.clear();
 
         for (int scx = pcx - radius; scx <= pcx + radius; scx++) {
             for (int scz = pcz - radius; scz <= pcz + radius; scz++) {
@@ -704,12 +705,13 @@ public final class RtTerrain {
         if (resident.containsKey(key) || empty.contains(key) || inFlight.containsKey(key)) {
             return false;
         }
-        if (!queuedMissing.add(key)) {
+        if (missingIndex.get(key) != NO_MISSING_INDEX) {
             return false;
         }
         setQueuedGroup(key, NO_DIRTY_GROUP);
-        missingPriority.put(key, PRIORITY_MISSING);
+        missingIndex.put(key, missing.size());
         missing.add(key);
+        missingPriorities.add(PRIORITY_MISSING);
         return true;
     }
 
@@ -723,17 +725,20 @@ public final class RtTerrain {
         }
         // `missing` is unsorted — urgency is just the priority lane, read when dispatch selects the best
         // candidates. Already-queued keys only get their priority/group upgraded.
-        if (queuedMissing.add(key)) {
+        int index = missingIndex.get(key);
+        if (index == NO_MISSING_INDEX) {
+            missingIndex.put(key, missing.size());
             missing.add(key);
+            missingPriorities.add(priority);
+        } else {
+            missingPriorities.set(index, priority);
         }
         setQueuedGroup(key, dirtyGroup);
-        missingPriority.put(key, priority);
         return true;
     }
 
     private void clearQueuedWork(long key, boolean cancelGroup) {
-        queuedMissing.remove(key);
-        missingPriority.remove(key);
+        removeMissing(key);
         queuedPlayerReextract.remove(key);
         queuedReextract.remove(key);
         clearQueuedGroup(key, cancelGroup);
@@ -754,7 +759,27 @@ public final class RtTerrain {
     }
 
     private boolean isQueuedAnywhere(long key) {
-        return queuedMissing.contains(key) || queuedPlayerReextract.contains(key) || queuedReextract.contains(key);
+        return missingIndex.get(key) != NO_MISSING_INDEX
+                || queuedPlayerReextract.contains(key) || queuedReextract.contains(key);
+    }
+
+    /** Remove an unsorted missing entry in O(1) by moving the last entry into its slot. */
+    private int removeMissing(long key) {
+        int index = missingIndex.remove(key);
+        if (index == NO_MISSING_INDEX) {
+            return NO_MISSING_INDEX;
+        }
+        int lastIndex = missing.size() - 1;
+        int priority = missingPriorities.getInt(index);
+        if (index != lastIndex) {
+            long movedKey = missing.getLong(lastIndex);
+            missing.set(index, movedKey);
+            missingPriorities.set(index, missingPriorities.getInt(lastIndex));
+            missingIndex.put(movedKey, index);
+        }
+        missing.removeLong(lastIndex);
+        missingPriorities.removeInt(lastIndex);
+        return priority;
     }
 
     private void invalidateInFlight(long key) {
@@ -866,9 +891,9 @@ public final class RtTerrain {
     }
 
     /**
-     * Dispatch the best missing sections. {@code missing} is <b>unsorted</b>; every call makes one
-     * compacting pass over it (dropping entries whose {@code queuedMissing} membership was cleared
-     * elsewhere) while collecting the top candidates by (priority, column-distance², |Δy|) into a bounded
+     * Dispatch the best missing sections. {@code missing} is an indexed unsorted queue; every call scans
+     * its contiguous key/priority arrays while collecting the top candidates by
+     * (priority, column-distance², |Δy|) into a bounded
      * max-heap — nearest-first order continuously tracks the player with no sort anywhere (the old
      * sorted-queue approach re-sorted the whole list on every window rebuild, a multi-ms spike at high
      * render distance). Ranking by <b>column</b> first makes the dispatch order column-coherent: all
@@ -888,25 +913,14 @@ public final class RtTerrain {
         long[] heapRank = new long[k];
         long[] heapKey = new long[k];
         int heapSize = 0;
-        int write = 0;
         for (int read = 0, n = missing.size(); read < n; read++) {
             long key = missing.getLong(read);
-
-            if (!queuedMissing.contains(key)) {
-                // Dequeued (dispatched / built / left the window) since it was added — compact out.
-                missingPriority.remove(key);
-                if (!isQueuedAnywhere(key)) {
-                    clearQueuedGroup(key, true);
-                }
-                continue;
-            }
-            missing.set(write++, key);
             // rank = priority(48+) | columnDist²(16..47) | |Δy|(0..15): column-major nearest-first.
             int dx = sectionX(key) - pcx;
             int dz = sectionZ(key) - pcz;
             long colDist2 = (long) dx * dx + (long) dz * dz;
             long dy = Math.min(0xFFFF, Math.abs(sectionY(key) - psy));
-            long rank = ((long) missingPriority.get(key) << 48) | (colDist2 << 16) | dy;
+            long rank = ((long) missingPriorities.getInt(read) << 48) | (colDist2 << 16) | dy;
             if (heapSize < k) {
                 heapRank[heapSize] = rank;
                 heapKey[heapSize] = key;
@@ -917,7 +931,6 @@ public final class RtTerrain {
                 siftDown(heapRank, heapKey, heapSize, 0);
             }
         }
-        missing.size(write);
         // Heapsort the candidates ascending (best first), then dispatch until the budget/deadline runs out.
         for (int end = heapSize - 1; end > 0; end--) {
             long r = heapRank[0]; heapRank[0] = heapRank[end]; heapRank[end] = r;
@@ -927,18 +940,16 @@ public final class RtTerrain {
         for (int i = 0; i < heapSize && budget > 0 && System.nanoTime() < deadline; i++) {
             long key = heapKey[i];
             if (!desired.contains(key) || resident.containsKey(key) || empty.contains(key) || inFlight.containsKey(key)) {
-                queuedMissing.remove(key);
-                missingPriority.remove(key);
+                removeMissing(key);
                 clearQueuedGroup(key, true);
-                continue; // stale list entry — compacted out on a later pass
+                continue;
             }
             int sx = sectionX(key);
             int sz = sectionZ(key);
             if (!neighborChunksReady(chunkSource, sx, sz)) {
                 continue; // stays queued; dispatched once the neighbours load
             }
-            int priority = missingPriority.remove(key);
-            queuedMissing.remove(key);
+            int priority = removeMissing(key);
             budget--;
             dispatchSection(dispatch, key, sx, sectionY(key), sz, priority);
         }
@@ -1544,8 +1555,8 @@ public final class RtTerrain {
         desiredColumns.clear();
         loadedColumns.clear();
         missing.clear();
-        queuedMissing.clear();
-        missingPriority.clear();
+        missingPriorities.clear();
+        missingIndex.clear();
         queuedDirtyGroup.clear();
         playerReextract.clear();
         queuedPlayerReextract.clear();
