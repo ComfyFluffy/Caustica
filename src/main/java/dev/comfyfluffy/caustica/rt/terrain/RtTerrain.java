@@ -5,7 +5,6 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import com.mojang.blaze3d.vertex.QuadInstance;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.comfyfluffy.caustica.CausticaConfig;
-import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.SpriteContentsAccessor;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
@@ -195,7 +194,6 @@ public final class RtTerrain {
     private final ConcurrentLinkedQueue<TessResult> completedMissingJobs = new ConcurrentLinkedQueue<>();
     private long tessToken;
     private long dirtyGroupSeq;
-    private boolean loggedTessFailure; // log the first worker tessellation failure (should never happen)
     private Pending pending; // in-flight async geometry build, or null
     private final RtSectionTable table = new RtSectionTable();
     private boolean ready;
@@ -1137,12 +1135,9 @@ public final class RtTerrain {
                 if (dirtyGroup != NO_DIRTY_GROUP) {
                     cancelDirtyGroup(dirtyGroup);
                 }
-                if (!loggedTessFailure) {
-                    loggedTessFailure = true;
-                    CausticaMod.LOGGER.warn("async terrain: tessellation task failed for section {},{},{}",
-                            job.sox >> 4, job.soy >> 4, job.soz >> 4, result.failure());
-                }
-                continue;
+                throw new RuntimeException("RT terrain tessellation failed for section "
+                        + (job.sox >> 4) + "," + (job.soy >> 4) + "," + (job.soz >> 4),
+                        result.failure());
             }
             PackedSection packed = result.cpu().packed();
             if (dirtyGroup != NO_DIRTY_GROUP && dirtyGroups.containsKey(dirtyGroup)) {

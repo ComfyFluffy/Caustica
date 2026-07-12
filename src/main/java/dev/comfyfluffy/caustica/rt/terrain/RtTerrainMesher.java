@@ -3,7 +3,6 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import com.mojang.blaze3d.vertex.QuadInstance;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.comfyfluffy.caustica.CausticaConfig;
-import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.SpriteContentsAccessor;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
@@ -60,8 +59,6 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Future;
 
 final class RtTerrainMesher {
-    private static volatile boolean loggedMeshFailure;
-
     /**
      * Reusable per-worker-thread meshing state. The mesh + captures are reset between jobs so their
      * backing arrays amortize across sections instead of re-growing per job (the per-job allocate-and-grow
@@ -185,11 +182,7 @@ final class RtTerrainMesher {
                         // Water is the dielectric fluid; lava stays an opaque emitter. Tagged per-prim
                         // so the path tracer can branch (see emitQuad).
                         fluidCapture.water = fluid.is(FluidTags.WATER);
-                        try {
-                            RtFluidMesher.tesselate(region, m, fluidCapture, fluidRenderer.fluidModels, state, fluid);
-                        } catch (Throwable t) {
-                            warnMeshOnce("fluid", t); // skip a fluid whose meshing throws, don't fail the section
-                        }
+                        RtFluidMesher.tesselate(region, m, fluidCapture, fluidRenderer.fluidModels, state, fluid);
                     }
                     if (state.getRenderShape() != RenderShape.MODEL) {
                         continue;
@@ -198,26 +191,12 @@ final class RtTerrainMesher {
                     if (model == null) {
                         continue;
                     }
-                    try {
-                        capture.state = state;
-                        capture.pos = m;
-                        renderer.tesselateBlock(capture, lx, ly, lz, region, m, state, model, state.getSeed(m));
-                        capture.flushBlock(); // resolve coplanar ties (grass overlay / cross faces), then emit
-                    } catch (Throwable t) {
-                        capture.discardBlock(); // drop any partially-buffered quads from the throw
-                        warnMeshOnce("block model", t); // skip a block whose meshing throws, don't fail the section
-                    }
+                    capture.state = state;
+                    capture.pos = m;
+                    renderer.tesselateBlock(capture, lx, ly, lz, region, m, state, model, state.getSeed(m));
+                    capture.flushBlock(); // resolve coplanar ties (grass overlay / cross faces), then emit
                 }
             }
-        }
-    }
-
-    /** Surface the first per-block/fluid meshing throw (swallowed above to keep one bad block from voiding
-     *  the whole section), then stay quiet. May run on a worker thread; the flag is volatile + one-shot. */
-    private static void warnMeshOnce(String what, Throwable t) {
-        if (!loggedMeshFailure) {
-            loggedMeshFailure = true;
-            CausticaMod.LOGGER.warn("RT terrain: {} meshing threw (skipped); first occurrence:", what, t);
         }
     }
 
