@@ -51,20 +51,16 @@ import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Future;
 
 final class RtTerrainMesher {
     /**
-     * Reusable per-worker-thread meshing state. The mesh + captures are reset between jobs so their
-     * backing arrays amortize across sections instead of re-growing per job (the per-job allocate-and-grow
-     * ladder was a profiler hotspot during fill). Everything the job result carries out —
+     * Reusable per-worker-thread meshing state. The mesh + captures are reset between tasks so their
+     * backing arrays amortize across sections instead of re-growing per task. Everything the result carries out —
      * {@link PackedSection}, OMM data — is copied out of this state before the job returns, so reuse on
-     * the next job cannot corrupt a queued result. The renderers stay per-job: they're cheap and capture
+     * the next task cannot corrupt a queued result. The renderers stay per-task: they're cheap and capture
      * the dispatch context's model sets/colors.
      */
     static final class WorkerTessState {

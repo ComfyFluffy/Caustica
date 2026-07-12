@@ -3,8 +3,6 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 
-import java.util.concurrent.Callable;
-import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -15,8 +13,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Shared daemon thread pool for CPU-heavy RT work that must stay off the render thread — terrain
  * tessellation and terrain buffer/BLAS preparation, with LOD build / atlas stitching as future
  * candidates. Workers may create distinct Vulkan/VMA objects and enqueue command recording onto
- * {@code RtGpuExecutor}; they never access or submit the graphics queue. Results are collected on the
- * render thread via the returned {@link Future}.
+ * {@code RtGpuExecutor}; they never access or submit the graphics queue. Each task delivers exactly one
+ * terminal result through the terrain lifecycle barrier.
  *
  * <p>Sized at {@code -Dcaustica.rt.workerThreads} (default {@code clamp(cores/2, 1, 4)}) to leave
  * cores for Minecraft's own chunk meshers. Core threads time out when idle; all are daemon so they
@@ -55,9 +53,9 @@ public final class RtWorkerPool {
         return exec;
     }
 
-    /** Submit worker-owned RT preparation; poll the returned future on the render thread. */
-    public <T> Future<T> submit(Callable<T> job) {
-        return executor().submit(job);
+    /** Submit worker-owned RT preparation; completion is delivered by the task itself. */
+    public void submit(Runnable job) {
+        executor().execute(job);
     }
 
     /** Stop all workers and drop queued jobs. Safe to call when never started. */

@@ -86,14 +86,9 @@ public final class CausticaConfig {
                 " Caustica RT renderer configuration.\n"
                         + " A matching -Dcaustica.* system property overrides the value below.");
         FILE.setComment("terrain",
-                " Wall-clock budget for render-thread terrain work (snapshot dispatch + completion publish).\n"
-                        + " Buffer fill and BLAS/OMM preparation run on workers and are not charged here. The per-frame\n"
-                        + " slice scales with queue pressure from stream-budget-ms (near-idle) up to\n"
-                        + " stream-budget-max-ms (big backlog: initial fill, F3+A, teleport, fast flight) so fill\n"
-                        + " throughput recovers when it matters and the cost drops back once the queue clears.\n"
-                        + " stream-fallback-budget-ms is the per-tick slice used only when no world frame is\n"
-                        + " streaming (loading screens), where a long pass hitches nothing.\n"
-                        + " max-inflight-native-mb bounds worker-owned terrain allocations using a conservative\n"
+                " Render-thread terrain work is bounded by dispatch/result counts per streaming pass.\n"
+                        + " Buffer fill and BLAS/OMM preparation run on workers. max-inflight-native-mb bounds\n"
+                        + " worker-owned terrain allocations using a conservative\n"
                         + " 16 MiB reservation per section until its build is published or discarded.");
         FILE.setComment("frame-generation",
                 " DLSS Frame Generation. Default off; gated additionally by hardware/driver availability.\n"
@@ -557,12 +552,6 @@ public final class CausticaConfig {
                     intAtLeast("caustica.rt.asyncDispatchPerTick", "terrain.async-dispatch-per-tick", 64, 0);
             public static final IntSetting COMPLETION_RESULTS_PER_PASS =
                     intAtLeast("caustica.rt.sectionResultsPerTick", "terrain.section-results-per-tick", 64, 0);
-            public static final FloatSetting STREAM_BUDGET_MS =
-                    clampedFloat("caustica.rt.streamBudgetMs", "terrain.stream-budget-ms", 0.5f, 0.05f, 100f);
-            public static final FloatSetting STREAM_BUDGET_MAX_MS =
-                    clampedFloat("caustica.rt.streamBudgetMaxMs", "terrain.stream-budget-max-ms", 2f, 0.05f, 100f);
-            public static final FloatSetting STREAM_FALLBACK_BUDGET_MS =
-                    clampedFloat("caustica.rt.streamFallbackBudgetMs", "terrain.stream-fallback-budget-ms", 4f, 0.05f, 100f);
             public static final IntSetting MAX_INFLIGHT_SECTIONS =
                     intAtLeast("caustica.rt.maxInflightSections", "terrain.max-inflight-sections", 192, 0);
             public static final IntSetting MAX_INFLIGHT_NATIVE_MB =

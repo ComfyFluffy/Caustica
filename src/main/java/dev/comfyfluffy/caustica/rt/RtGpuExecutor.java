@@ -21,9 +21,9 @@ import java.nio.LongBuffer;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
@@ -37,8 +37,8 @@ import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACI
  */
 public final class RtGpuExecutor {
     private static final int MAX_BUILD_BATCH = 32;
-    private static final Job STOP = new Job(null, null, null);
-    private static final Job WAKE = new Job(null, null, null);
+    private static final Job STOP = new Job(null, null, null, null);
+    private static final Job WAKE = new Job(null, null, null, null);
     private static final long TERRAIN_READ_STAGES =
             VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
                     | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
@@ -49,14 +49,13 @@ public final class RtGpuExecutor {
     private final long graphicsTimeline;
     private final LinkedBlockingQueue<Job> jobs = new LinkedBlockingQueue<>();
     private final AtomicLong nextBuildValue = new AtomicLong();
-    private final AtomicLong completedBuildValue = new AtomicLong();
     private final AtomicLong pendingPublishWaitValue = new AtomicLong();
     private final AtomicLong nextGraphicsValue = new AtomicLong();
     private final ArrayList<DestroyJob> destroyJobs = new ArrayList<>();
     private final Thread thread;
     private long commandPool;
     private volatile boolean closed;
-    private volatile Throwable destroyFailure;
+    private volatile Throwable executorFailure;
 
     RtGpuExecutor(RtContext ctx) {
         this.ctx = ctx;
@@ -72,29 +71,20 @@ public final class RtGpuExecutor {
         this.thread.start();
     }
 
-    public synchronized Build submit(Consumer<VkCommandBuffer> record) {
-        return submit(record, () -> {});
-    }
-
-    /** Enqueue GPU recording plus native cleanup that runs on this thread after timeline completion. */
-    public synchronized Build submit(Consumer<VkCommandBuffer> record, Runnable onComplete) {
-        checkDestroyFailure();
+    /**
+     * Enqueue GPU recording. On success, {@code afterSuccess} runs after timeline completion; then
+     * {@code finished} receives exactly one terminal success/failure notification on this thread.
+     */
+    public synchronized Build submit(Consumer<VkCommandBuffer> record, Runnable afterSuccess,
+                                     BiConsumer<Build, Throwable> finished) {
+        checkExecutorFailure();
         if (closed) {
             throw new IllegalStateException("RT GPU executor is closed");
         }
         long value = nextBuildValue.incrementAndGet();
         Build build = new Build(value);
-        jobs.add(new Job(record, onComplete, build));
+        jobs.add(new Job(record, afterSuccess, finished, build));
         return build;
-    }
-
-    public boolean isDone(Build build) {
-        return build.completion.isDone();
-    }
-
-    /** Release submission bookkeeping after {@link #isDone}; propagates executor recording/submission failures. */
-    public void free(Build build) {
-        build.completion.join();
     }
 
     /** Mark a completed build visible to terrain publication; the next graphics terrain use waits on it. */
@@ -104,7 +94,7 @@ public final class RtGpuExecutor {
 
     /** Attach the required compute-build wait immediately before the RT command buffer is enqueued. */
     public long beginGraphicsTerrainUse(VulkanCommandEncoder encoder) {
-        checkDestroyFailure();
+        checkExecutorFailure();
         long waitValue = pendingPublishWaitValue.get();
         if (waitValue != 0L) {
             encoder.waitSemaphore(buildTimeline, waitValue, TERRAIN_READ_STAGES);
@@ -118,17 +108,8 @@ public final class RtGpuExecutor {
         jobs.offer(WAKE);
     }
 
-    public long completedBuildValue() {
-        queryTimeline(buildTimeline, completedBuildValue);
-        return completedBuildValue.get();
-    }
-
     public long completedGraphicsValue() {
-        return queryTimeline(graphicsTimeline, null);
-    }
-
-    public long pendingPublishWaitValue() {
-        return pendingPublishWaitValue.get();
+        return queryTimeline(graphicsTimeline);
     }
 
     /** Latest recorded graphics submission that can reference the currently published terrain state. */
@@ -137,7 +118,7 @@ public final class RtGpuExecutor {
     }
 
     public void enqueueDestroyAfterGraphics(long lastUseValue, Runnable destroy) {
-        checkDestroyFailure();
+        checkExecutorFailure();
         synchronized (destroyJobs) {
             destroyJobs.add(new DestroyJob(lastUseValue, destroy));
         }
@@ -157,18 +138,18 @@ public final class RtGpuExecutor {
 
     /** Wait only for terrain's latest graphics use, then execute every now-safe retirement. */
     public void waitForLatestGraphicsAndFlush() {
-        checkDestroyFailure();
+        checkExecutorFailure();
         long target = latestGraphicsUseValue();
         if (target != 0L) {
             waitTimeline(graphicsTimeline, target);
         }
         processDestroyJobs();
-        checkDestroyFailure();
+        checkExecutorFailure();
     }
 
     /** Caller has made the device idle; all queued destruction is now unconditionally safe. */
     public void flushDestroysAfterDeviceIdle() {
-        Throwable failure = destroyFailure;
+        Throwable failure = executorFailure;
         synchronized (destroyJobs) {
             for (DestroyJob job : destroyJobs) {
                 try {
@@ -184,7 +165,7 @@ public final class RtGpuExecutor {
             destroyJobs.clear();
         }
         if (failure != null) {
-            throw new IllegalStateException("RT GPU executor destruction failed", failure);
+            throw new IllegalStateException("RT GPU executor failed", failure);
         }
     }
 
@@ -256,19 +237,12 @@ public final class RtGpuExecutor {
             }
             try {
                 execute(batch);
-                long completed = batch.get(batch.size() - 1).build.value;
-                completedBuildValue.accumulateAndGet(completed, Math::max);
                 for (Job job : batch) {
-                    try {
-                        job.onComplete.run();
-                        job.build.completion.complete(null);
-                    } catch (Throwable t) {
-                        job.build.completion.completeExceptionally(t);
-                    }
+                    finishJob(job, null);
                 }
             } catch (Throwable t) {
                 for (Job job : batch) {
-                    job.build.completion.completeExceptionally(t);
+                    finishJob(job, t);
                 }
             }
             if (!processDestroyJobsSafely()) {
@@ -280,20 +254,38 @@ public final class RtGpuExecutor {
         }
     }
 
+    private void finishJob(Job job, Throwable failure) {
+        if (failure == null) {
+            try {
+                job.afterSuccess.run();
+            } catch (Throwable t) {
+                failure = t;
+            }
+        }
+        try {
+            job.finished.accept(job.build, failure);
+        } catch (Throwable t) {
+            if (failure != null) {
+                failure.addSuppressed(t);
+            }
+            executorFailure = t;
+        }
+    }
+
     private boolean processDestroyJobsSafely() {
         try {
             processDestroyJobs();
             return true;
         } catch (Throwable t) {
-            destroyFailure = t;
+            executorFailure = t;
             return false;
         }
     }
 
-    private void checkDestroyFailure() {
-        Throwable failure = destroyFailure;
+    private void checkExecutorFailure() {
+        Throwable failure = executorFailure;
         if (failure != null) {
-            throw new IllegalStateException("RT GPU executor destruction failed", failure);
+            throw new IllegalStateException("RT GPU executor failed", failure);
         }
     }
 
@@ -381,16 +373,11 @@ public final class RtGpuExecutor {
         }
     }
 
-    private long queryTimeline(long semaphore, AtomicLong cache) {
+    private long queryTimeline(long semaphore) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             LongBuffer out = stack.mallocLong(1);
             RtContext.check(VK12.vkGetSemaphoreCounterValue(ctx.vk(), semaphore, out), "vkGetSemaphoreCounterValue");
-            long value = out.get(0);
-            if (cache != null) {
-                cache.accumulateAndGet(value, Math::max);
-                return cache.get();
-            }
-            return value;
+            return out.get(0);
         }
     }
 
@@ -406,7 +393,6 @@ public final class RtGpuExecutor {
 
     public static final class Build {
         private final long value;
-        private final CompletableFuture<Void> completion = new CompletableFuture<>();
 
         private Build(long value) {
             this.value = value;
@@ -417,7 +403,8 @@ public final class RtGpuExecutor {
         }
     }
 
-    private record Job(Consumer<VkCommandBuffer> record, Runnable onComplete, Build build) {
+    private record Job(Consumer<VkCommandBuffer> record, Runnable afterSuccess,
+                       BiConsumer<Build, Throwable> finished, Build build) {
     }
 
     private record DestroyJob(long lastUseValue, Runnable destroy) {

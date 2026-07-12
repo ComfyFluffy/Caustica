@@ -17,7 +17,6 @@ import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.material.RtMaterials;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
-import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
@@ -58,8 +57,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 
 import static dev.comfyfluffy.caustica.rt.terrain.RtTerrainMesher.WORKER_TESS;
 import static dev.comfyfluffy.caustica.rt.terrain.RtTerrainMesher.buildCpuSection;
@@ -74,8 +71,8 @@ import dev.comfyfluffy.caustica.rt.terrain.RtSectionTable.SectionGeom;
  * keeps a map of resident 16³ sections. The 20 TPS tick maintains the desired window around the player
  * (slid incrementally on section-boundary crossings) and drains dirty events; the actual streaming —
  * snapshot dispatch, completion drain, and publish — runs once per render frame from
- * {@link RtComposite} under a small wall-clock budget, so fill cost is a flat slice of every frame
- * rather than a per-tick burst. Residency follows vanilla because a section is only "desired" when its
+ * {@link RtComposite} with count-bounded completion and dispatch passes rather than a per-tick burst.
+ * Residency follows vanilla because a section is only "desired" when its
  * chunk is loaded ({@code hasChunk}), so chunk load/unload drives build/free without any mixin.
  *
  * <p>Geometry comes from vanilla's {@link ModelBlockRenderer} (correct shapes, neighbour cull, biome
@@ -104,26 +101,6 @@ public final class RtTerrain {
         return CausticaConfig.Rt.Terrain.COMPLETION_RESULTS_PER_PASS.value();
     }
 
-    // Backlog (missing + queued re-extracts + in-flight jobs) at which the dynamic budget reaches max.
-    private static final int STREAM_PRESSURE_FULL_BACKLOG = 256;
-
-    /**
-     * Per-frame budget scaled by queue pressure: near-empty queues get the base slice, a big backlog
-     * (initial fill, F3+A, teleport, fast flight) ramps linearly to the max so fill throughput recovers —
-     * a few extra budgeted ms per frame only while the queue lasts.
-     */
-    private long dynamicStreamBudgetNanos() {
-        float base = CausticaConfig.Rt.Terrain.STREAM_BUDGET_MS.value();
-        float max = Math.max(base, CausticaConfig.Rt.Terrain.STREAM_BUDGET_MAX_MS.value());
-        int backlog = missing.size() + playerReextract.size() + reextract.size() + inFlight.size();
-        float t = Math.min(1f, backlog / (float) STREAM_PRESSURE_FULL_BACKLOG);
-        return (long) ((base + (max - base) * t) * 1_000_000f);
-    }
-
-    private static long streamFallbackBudgetNanos() {
-        return (long) (CausticaConfig.Rt.Terrain.STREAM_FALLBACK_BUDGET_MS.value() * 1_000_000f);
-    }
-
     // Backpressure cap: stop dispatching once this many sections are in flight. Bounds queue depth and
     // snapshot memory (each in-flight region pins 27 cached section snapshots) when flying through the world.
     private static int maxInflight() {
@@ -141,12 +118,9 @@ public final class RtTerrain {
     private static final int SECTION_ENTRY_BYTES = 32; // {u64 primAddr, u64 uvAddr, u32 triBase[4]}
     private static final long NO_TESS_TOKEN = Long.MIN_VALUE;
     private static final int NO_MISSING_INDEX = -1;
-    private static final int PRIORITY_PLAYER = 0;
-    private static final int PRIORITY_DIRTY = 1;
-    private static final int PRIORITY_MISSING = 2;
     private static final long NO_DIRTY_GROUP = 0L;
     // If no render frame has driven a streaming pass for this long, the 20 TPS tick takes over (loading
-    // screens / hidden window — states where a bigger budget can't hitch a visible frame).
+    // screens / hidden window — states where render-driven streaming has stopped).
     private static final long STREAM_FALLBACK_AFTER_NANOS = 200_000_000L;
 
     private static int sectionTableInitialCapacity() {
@@ -176,7 +150,6 @@ public final class RtTerrain {
     private final LongOpenHashSet desiredColumns = new LongOpenHashSet();
     private final LongOpenHashSet loadedColumns = new LongOpenHashSet();
     private final LongArrayList missing = new LongArrayList();
-    private final IntArrayList missingPriorities = new IntArrayList();
     private final Long2IntOpenHashMap missingIndex = new Long2IntOpenHashMap();
     private final Long2LongOpenHashMap queuedDirtyGroup = new Long2LongOpenHashMap();
     private final LongArrayList playerReextract = new LongArrayList();
@@ -187,17 +160,15 @@ public final class RtTerrain {
     // frames, so evicted geometry waits here until the next publish pass retires it.
     private final List<SectionGeom> removed = new ArrayList<>();
     private final List<PreparedSection> prepared = new ArrayList<>();
-    // Worker tessellation bookkeeping (render-thread only). `inFlight` maps a dispatched section key to a
-    // monotonic token; a completed job whose token no longer matches (section re-dirtied / unloaded /
-    // left the window since dispatch) is dropped. `jobs` holds the outstanding worker futures.
+    // Worker/build bookkeeping. `inFlight` maps a dispatched section key to a monotonic token; a completed
+    // task whose token no longer matches is discarded. The active-task barrier spans worker + GPU lifetime.
     private final Long2LongOpenHashMap inFlight = new Long2LongOpenHashMap();
     private final Long2LongOpenHashMap inFlightDirtyGroup = new Long2LongOpenHashMap();
     private final Long2ObjectOpenHashMap<DirtyGroup> dirtyGroups = new Long2ObjectOpenHashMap<>();
-    private final List<TessJob> jobs = new ArrayList<>();
-    private final ConcurrentLinkedQueue<TessResult> completedPlayerJobs = new ConcurrentLinkedQueue<>();
-    private final ConcurrentLinkedQueue<TessResult> completedDirtyJobs = new ConcurrentLinkedQueue<>();
-    private final ConcurrentLinkedQueue<TessResult> completedMissingJobs = new ConcurrentLinkedQueue<>();
-    private long tessToken;
+    private final ConcurrentLinkedQueue<SectionResult> completedBuilds = new ConcurrentLinkedQueue<>();
+    private final Object activeTaskLock = new Object();
+    private int activeTasks;
+    private long buildToken;
     private long dirtyGroupSeq;
     private long inFlightNativeBytes;
     private final RtSectionTable table = new RtSectionTable();
@@ -271,9 +242,7 @@ public final class RtTerrain {
 
     /**
      * Per-render-frame streaming pass, driven by {@link RtComposite#composite}: publish completed builds
-     * and dispatch immutable snapshots to workers — all bounded by
-     * {@code caustica.rt.streamBudgetMs} of wall clock so the cost is a flat slice of every frame instead
-     * of a 20 TPS burst.
+     * and dispatch immutable snapshots to workers, bounded by configured per-pass counts.
      */
     public static void frame(RtContext ctx) {
         INSTANCE.frameStream(ctx);
@@ -402,40 +371,38 @@ public final class RtTerrain {
         }
         // Dispatch/drain/build normally runs per render frame (RtComposite → frame()). If no frame has
         // streamed recently — loading screen, no world rendering — drive it from here with the bigger
-        // fallback budget so the world still fills.
+        // bounded fallback pass so the world still fills.
         if (System.nanoTime() - lastFrameStreamNanos > STREAM_FALLBACK_AFTER_NANOS) {
-            stream(ctx, streamFallbackBudgetNanos());
+            stream(ctx);
         }
     }
 
-    /** The per-render-frame entry point: run one budgeted streaming pass. */
+    /** The per-render-frame entry point: run one count-bounded streaming pass. */
     private void frameStream(RtContext ctx) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null) {
             return;
         }
         lastFrameStreamNanos = System.nanoTime();
-        stream(ctx, dynamicStreamBudgetNanos());
+        stream(ctx);
     }
 
     /**
      * One streaming pass: drain completed worker/executor builds, publish ready sections, and dispatch
-     * new section snapshots to the worker pool — stopping
-     * dispatch/drain once {@code budgetNanos} of wall clock is spent. Skips silently when there is
-     * nothing to do (no stats row).
+     * new section snapshots to the worker pool. Per-pass result and dispatch caps bound render-thread
+     * work. Skips silently when there is nothing to do (no stats row).
      */
-    private void stream(RtContext ctx, long budgetNanos) {
+    private void stream(RtContext ctx) {
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
         if (level == null || mc.player == null) {
             return;
         }
         if (playerReextract.isEmpty() && reextract.isEmpty() && missing.isEmpty()
-                && completedPlayerJobs.isEmpty() && completedDirtyJobs.isEmpty() && completedMissingJobs.isEmpty()
+                && completedBuilds.isEmpty()
                 && removed.isEmpty() && prepared.isEmpty()) {
             return;
         }
-        long deadline = System.nanoTime() + budgetNanos;
         int pbx = mc.player.getBlockX();
         int pby = mc.player.getBlockY();
         int pbz = mc.player.getBlockZ();
@@ -445,34 +412,7 @@ public final class RtTerrain {
 
         // Drain completed GPU builds first — publication is visible fill progress, so it gets priority.
         try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.drainCompletion")) {
-            drainTessellation(ctx, prepared, removed, completionResultsPerPass(), deadline);
-        }
-
-        // Snapshot and dispatch new worker-owned section builds with the remaining budget.
-        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.snapshotDispatch")) {
-            DispatchContext dispatch = null;
-            int countSlots = Math.max(0, maxInflight() - inFlight.size());
-            int nativeSlots = (int) Math.max(0L,
-                    (maxInflightNativeBytes() - inFlightNativeBytes) / NATIVE_RESERVATION_BYTES);
-            int dispatchSlots = Math.min(asyncDispatchPerPass(), Math.min(countSlots, nativeSlots));
-            if (dispatchSlots > 0 && !playerReextract.isEmpty() && System.nanoTime() < deadline) {
-                dispatch = dispatchContext(ctx, level);
-                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots, deadline,
-                        playerReextract, queuedPlayerReextract, PRIORITY_PLAYER);
-            }
-            if (dispatchSlots > 0 && !reextract.isEmpty() && System.nanoTime() < deadline) {
-                if (dispatch == null) {
-                    dispatch = dispatchContext(ctx, level);
-                }
-                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots, deadline,
-                        reextract, queuedReextract, PRIORITY_DIRTY);
-            }
-            if (dispatchSlots > 0 && !missing.isEmpty() && System.nanoTime() < deadline) {
-                if (dispatch == null) {
-                    dispatch = dispatchContext(ctx, level);
-                }
-                dispatchTessellation(dispatch, chunkSource, dispatchSlots, deadline, pcx, psy, pcz);
-            }
+            drainCompletedBuilds(ctx, prepared, removed, completionResultsPerPass());
         }
 
         if (!removed.isEmpty() || !prepared.isEmpty()) {
@@ -482,6 +422,34 @@ public final class RtTerrain {
                 prepared.clear();
             }
         }
+
+        // Snapshot and dispatch a bounded number of new worker-owned section builds.
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.snapshotDispatch")) {
+            DispatchContext dispatch = null;
+            int countSlots = Math.max(0, maxInflight() - inFlight.size());
+            int nativeSlots = (int) Math.max(0L,
+                    (maxInflightNativeBytes() - inFlightNativeBytes) / NATIVE_RESERVATION_BYTES);
+            int dispatchSlots = Math.min(asyncDispatchPerPass(), Math.min(countSlots, nativeSlots));
+            if (dispatchSlots > 0 && !playerReextract.isEmpty()) {
+                dispatch = dispatchContext(ctx, level);
+                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots,
+                        playerReextract, queuedPlayerReextract);
+            }
+            if (dispatchSlots > 0 && !reextract.isEmpty()) {
+                if (dispatch == null) {
+                    dispatch = dispatchContext(ctx, level);
+                }
+                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots,
+                        reextract, queuedReextract);
+            }
+            if (dispatchSlots > 0 && !missing.isEmpty()) {
+                if (dispatch == null) {
+                    dispatch = dispatchContext(ctx, level);
+                }
+                dispatchMissingBuilds(dispatch, chunkSource, dispatchSlots, pcx, psy, pcz);
+            }
+        }
+
     }
 
     private void syncDesiredWindow(ClientChunkCache chunkSource, int pcx, int psy, int pcz,
@@ -504,7 +472,6 @@ public final class RtTerrain {
         desiredColumns.clear();
         loadedColumns.clear();
         missing.clear();
-        missingPriorities.clear();
         missingIndex.clear();
 
         for (int scx = pcx - radius; scx <= pcx + radius; scx++) {
@@ -670,7 +637,7 @@ public final class RtTerrain {
                 group.restoreEmptyKeys.add(key);
             }
         }
-        invalidateInFlight(key); // invalidate any in-flight tessellation of the now-stale section
+        invalidateInFlight(key); // invalidate any in-flight build of the now-stale section
         if (!desired.contains(key)) {
             clearQueuedWork(key, true);
             return false;
@@ -678,9 +645,8 @@ public final class RtTerrain {
         // Keep the old geometry resident + traced; re-dispatch and swap when the new mesh is ready
         // (no eviction gap -> no flicker). Non-resident dirty keys re-enter the normal missing queue.
         SectionGeom g = resident.get(key);
-        int priority = isPlayerUpdatePriority(key, pcx, psy, pcz) ? PRIORITY_PLAYER : PRIORITY_DIRTY;
         if (g != null) {
-            if (priority == PRIORITY_PLAYER) {
+            if (isPlayerUpdatePriority(key, pcx, psy, pcz)) {
                 queuedReextract.remove(key); // promote; stale normal entry will be skipped
                 if (queuedPlayerReextract.add(key)) {
                     playerReextract.add(key);
@@ -691,7 +657,7 @@ public final class RtTerrain {
             setQueuedGroup(key, dirtyGroup);
             return true;
         } else {
-            return enqueueMissingUrgent(key, priority, dirtyGroup);
+            return enqueueMissing(key, dirtyGroup);
         }
     }
 
@@ -711,27 +677,18 @@ public final class RtTerrain {
         setQueuedGroup(key, NO_DIRTY_GROUP);
         missingIndex.put(key, missing.size());
         missing.add(key);
-        missingPriorities.add(PRIORITY_MISSING);
         return true;
     }
 
-    private boolean enqueueMissingUrgent(long key, int priority) {
-        return enqueueMissingUrgent(key, priority, NO_DIRTY_GROUP);
-    }
-
-    private boolean enqueueMissingUrgent(long key, int priority, long dirtyGroup) {
+    private boolean enqueueMissing(long key, long dirtyGroup) {
         if (resident.containsKey(key) || empty.contains(key) || inFlight.containsKey(key)) {
             return false;
         }
-        // `missing` is unsorted — urgency is just the priority lane, read when dispatch selects the best
-        // candidates. Already-queued keys only get their priority/group upgraded.
+        // `missing` is unsorted; dispatch ranks it directly by distance from the player.
         int index = missingIndex.get(key);
         if (index == NO_MISSING_INDEX) {
             missingIndex.put(key, missing.size());
             missing.add(key);
-            missingPriorities.add(priority);
-        } else {
-            missingPriorities.set(index, priority);
         }
         setQueuedGroup(key, dirtyGroup);
         return true;
@@ -764,22 +721,18 @@ public final class RtTerrain {
     }
 
     /** Remove an unsorted missing entry in O(1) by moving the last entry into its slot. */
-    private int removeMissing(long key) {
+    private void removeMissing(long key) {
         int index = missingIndex.remove(key);
         if (index == NO_MISSING_INDEX) {
-            return NO_MISSING_INDEX;
+            return;
         }
         int lastIndex = missing.size() - 1;
-        int priority = missingPriorities.getInt(index);
         if (index != lastIndex) {
             long movedKey = missing.getLong(lastIndex);
             missing.set(index, movedKey);
-            missingPriorities.set(index, missingPriorities.getInt(lastIndex));
             missingIndex.put(movedKey, index);
         }
         missing.removeLong(lastIndex);
-        missingPriorities.removeInt(lastIndex);
-        return priority;
     }
 
     private void invalidateInFlight(long key) {
@@ -878,10 +831,10 @@ public final class RtTerrain {
     }
 
     /**
-     * Snapshot each missing section on the render thread and submit its tessellation to the worker
-     * pool. The per-task meshing objects (renderer / captures / MutableBlockPos) are allocated inside the
-     * job so nothing mutable is shared across threads; the captured {@code region}, model sets and block
-     * colors are read-only. Capped by the configured dispatch budget.
+     * Snapshot each missing section on the render thread and submit its build to the worker pool. The
+     * per-task meshing objects (renderer / captures / MutableBlockPos) are allocated inside the task so
+     * nothing mutable is shared across threads; the captured {@code region}, model sets and block
+     * colors are read-only. Capped by the configured dispatch count.
      */
     private static DispatchContext dispatchContext(RtContext ctx, ClientLevel level) {
         Minecraft mc = Minecraft.getInstance();
@@ -892,8 +845,8 @@ public final class RtTerrain {
 
     /**
      * Dispatch the best missing sections. {@code missing} is an indexed unsorted queue; every call scans
-     * its contiguous key/priority arrays while collecting the top candidates by
-     * (priority, column-distance², |Δy|) into a bounded
+     * its contiguous key array while collecting the top candidates by
+     * (column-distance², |Δy|) into a bounded
      * max-heap — nearest-first order continuously tracks the player with no sort anywhere (the old
      * sorted-queue approach re-sorted the whole list on every window rebuild, a multi-ms spike at high
      * render distance). Ranking by <b>column</b> first makes the dispatch order column-coherent: all
@@ -901,26 +854,26 @@ public final class RtTerrain {
      * {@link RenderRegionCache} dedupes {@code SectionCopy}s, so after a column's first snapshot the rest
      * are nearly free.
      */
-    private void dispatchTessellation(DispatchContext dispatch, ClientChunkCache chunkSource, int budget, long deadline,
-                                      int pcx, int psy, int pcz) {
-        if (missing.isEmpty() || budget <= 0) {
+    private void dispatchMissingBuilds(DispatchContext dispatch, ClientChunkCache chunkSource, int remaining,
+                                       int pcx, int psy, int pcz) {
+        if (missing.isEmpty() || remaining <= 0) {
             return;
         }
-        // Over-collect 2x the budget so candidates skipped for unready neighbour chunks (they cluster at
+        // Over-collect 2x the remaining slots so candidates skipped for unready neighbour chunks (they cluster at
         // the window edge) don't leave dispatch slots idle.
-        int k = Math.min(missing.size(), Math.max(8, budget * 2));
+        int k = Math.min(missing.size(), Math.max(8, remaining * 2));
 
         long[] heapRank = new long[k];
         long[] heapKey = new long[k];
         int heapSize = 0;
         for (int read = 0, n = missing.size(); read < n; read++) {
             long key = missing.getLong(read);
-            // rank = priority(48+) | columnDist²(16..47) | |Δy|(0..15): column-major nearest-first.
+            // rank = columnDist²(16+) | |Δy|(0..15): column-major nearest-first.
             int dx = sectionX(key) - pcx;
             int dz = sectionZ(key) - pcz;
             long colDist2 = (long) dx * dx + (long) dz * dz;
             long dy = Math.min(0xFFFF, Math.abs(sectionY(key) - psy));
-            long rank = ((long) missingPriorities.getInt(read) << 48) | (colDist2 << 16) | dy;
+            long rank = (colDist2 << 16) | dy;
             if (heapSize < k) {
                 heapRank[heapSize] = rank;
                 heapKey[heapSize] = key;
@@ -931,13 +884,13 @@ public final class RtTerrain {
                 siftDown(heapRank, heapKey, heapSize, 0);
             }
         }
-        // Heapsort the candidates ascending (best first), then dispatch until the budget/deadline runs out.
+        // Heapsort the candidates ascending (best first), then dispatch up to the per-pass cap.
         for (int end = heapSize - 1; end > 0; end--) {
             long r = heapRank[0]; heapRank[0] = heapRank[end]; heapRank[end] = r;
             long q = heapKey[0]; heapKey[0] = heapKey[end]; heapKey[end] = q;
             siftDown(heapRank, heapKey, end, 0);
         }
-        for (int i = 0; i < heapSize && budget > 0 && System.nanoTime() < deadline; i++) {
+        for (int i = 0; i < heapSize && remaining > 0; i++) {
             long key = heapKey[i];
             if (!desired.contains(key) || resident.containsKey(key) || empty.contains(key) || inFlight.containsKey(key)) {
                 removeMissing(key);
@@ -949,9 +902,9 @@ public final class RtTerrain {
             if (!neighborChunksReady(chunkSource, sx, sz)) {
                 continue; // stays queued; dispatched once the neighbours load
             }
-            int priority = removeMissing(key);
-            budget--;
-            dispatchSection(dispatch, key, sx, sectionY(key), sz, priority);
+            removeMissing(key);
+            remaining--;
+            dispatchSectionBuild(dispatch, key, sx, sectionY(key), sz);
         }
     }
 
@@ -990,18 +943,18 @@ public final class RtTerrain {
 
     /**
      * Re-extraction of edited (dirty) sections that are still resident: dispatch a fresh
-     * tessellation while leaving the old geometry resident and traced, so it's swapped — never evicted
+     * rebuild while leaving the old geometry resident and traced, so it's swapped — never evicted
      * with a gap — when the new mesh is published and the replaced geometry is retired. This
      * is what prevents the visible flicker on block updates that plain eviction would cause.
      */
-    private int dispatchReextract(DispatchContext dispatch, ClientChunkCache chunkSource, int budget, long deadline,
-                                  LongArrayList queue, LongOpenHashSet queued, int priority) {
+    private int dispatchReextract(DispatchContext dispatch, ClientChunkCache chunkSource, int remaining,
+                                  LongArrayList queue, LongOpenHashSet queued) {
         if (queue.isEmpty()) {
             return 0;
         }
         int dispatched = 0;
-        int attempts = Math.min(queue.size(), Math.max(64, budget * 4));
-        for (int i = 0; i < queue.size() && budget > 0 && attempts-- > 0 && System.nanoTime() < deadline; ) {
+        int attempts = Math.min(queue.size(), Math.max(64, remaining * 4));
+        for (int i = 0; i < queue.size() && remaining > 0 && attempts-- > 0; ) {
             long key = queue.getLong(i);
             if (!queued.contains(key)) {
                 if (!isQueuedAnywhere(key)) {
@@ -1026,29 +979,29 @@ public final class RtTerrain {
             }
             queued.remove(key);
             queue.removeLong(i);
-            dispatchSection(dispatch, key, g.sx >> 4, g.sy >> 4, g.sz >> 4, priority);
-            budget--;
+            dispatchSectionBuild(dispatch, key, g.sx >> 4, g.sy >> 4, g.sz >> 4);
+            remaining--;
             dispatched++;
         }
         return dispatched;
     }
 
-    /** Snapshot one section on the render thread and submit its tessellation to the worker pool. */
-    private void dispatchSection(DispatchContext dispatch, long key, int sx, int sy, int sz, int priority) {
+    /** Snapshot one section and dispatch its complete worker → GPU build lifecycle. */
+    private void dispatchSectionBuild(DispatchContext dispatch, long key, int sx, int sy, int sz) {
         RtFrameStats.FRAME.count("sectionsSnapshotted", 1);
         RtSectionSnapshots.Region region = snapshots.createRegion(dispatch.level(), sx, sy, sz);
-        long token = ++tessToken;
+        long token = ++buildToken;
         long dirtyGroup = queuedDirtyGroup.remove(key);
         if (dirtyGroup != NO_DIRTY_GROUP && !dirtyGroups.containsKey(dirtyGroup)) {
             dirtyGroup = NO_DIRTY_GROUP;
         }
-        TessJob job = new TessJob(key, token, sx << 4, sy << 4, sz << 4, priority, dirtyGroup);
-        inFlightNativeBytes += job.nativeReservationBytes;
-        Future<?> future;
+        SectionTask task = new SectionTask(key, token, sx << 4, sy << 4, sz << 4, dirtyGroup);
+        inFlightNativeBytes += task.nativeReservationBytes;
+        beginActiveTask();
         try {
-            future = RtWorkerPool.INSTANCE.submit(() -> {
+            RtWorkerPool.INSTANCE.submit(() -> {
                 try {
-                    WorkerTessState ws = WORKER_TESS.get(); // thread-confined; reset per job, arrays amortized
+                    WorkerTessState ws = WORKER_TESS.get(); // thread-confined; reset per task, arrays amortized
                     ws.reset(dispatch.blockColors());
                     ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, dispatch.blockColors());
                     FluidRenderer fluidRenderer = new FluidRenderer(dispatch.fluidModelSet());
@@ -1056,130 +1009,118 @@ public final class RtTerrain {
                             fluidRenderer, ws.fluidCapture, ws.mesh, ws.pos, sx, sy, sz);
                     PackedSection packed = cpu.packed();
                     if (packed == null) {
-                        enqueueCompleted(job, null, null, null);
+                        completeTask(task, null, null, null);
                     } else {
                         PreparedSection prepared = RtSectionBuilder.prepare(dispatch.ctx(), packed,
-                                cpu.opacityMicromap(), job.key, job.sox, job.soy, job.soz);
-                        RtGpuExecutor.Build build;
+                                cpu.opacityMicromap(), task.key, task.sox, task.soy, task.soz);
                         try {
-                            build = dispatch.ctx().gpuExecutor().submit(
+                            dispatch.ctx().gpuExecutor().submit(
                                     cmd -> RtAccel.recordBlasBuilds(dispatch.ctx(), cmd, List.of(prepared.blas())),
-                                    () -> RtAccel.freeBlasScratch(List.of(prepared.blas())));
+                                    () -> RtAccel.freeBlasScratch(List.of(prepared.blas())),
+                                    (build, failure) -> completeTask(task, prepared, build, failure));
                         } catch (Throwable t) {
                             RtSectionBuilder.destroy(prepared);
                             throw t;
                         }
-                        enqueueCompleted(job, prepared, build, null);
                     }
                 } catch (Throwable t) {
-                    enqueueCompleted(job, null, null, t);
+                    completeTask(task, null, null, t);
                     throw t;
                 }
-                return null;
             });
         } catch (Throwable t) {
-            releaseJobReservation(job);
+            releaseTaskReservation(task);
+            finishActiveTask();
             throw t;
         }
-        job.future = future;
         inFlight.put(key, token);
         if (dirtyGroup != NO_DIRTY_GROUP) {
             inFlightDirtyGroup.put(key, dirtyGroup);
         } else {
             inFlightDirtyGroup.remove(key);
         }
-        addJob(job);
     }
 
-    private void addJob(TessJob job) {
-        job.jobIndex = jobs.size();
-        jobs.add(job);
+    private void completeTask(SectionTask task, PreparedSection prepared, RtGpuExecutor.Build build, Throwable failure) {
+        completeTask(new SectionResult(task, prepared, build, failure));
     }
 
-    private void enqueueCompleted(TessJob job, PreparedSection prepared, RtGpuExecutor.Build build, Throwable failure) {
-        enqueueCompleted(new TessResult(job, prepared, build, failure));
-    }
-
-    private void enqueueCompleted(TessResult result) {
-        TessJob job = result.job();
-        switch (job.priority) {
-            case PRIORITY_PLAYER -> completedPlayerJobs.add(result);
-            case PRIORITY_DIRTY -> completedDirtyJobs.add(result);
-            default -> completedMissingJobs.add(result);
+    private void completeTask(SectionResult result) {
+        try {
+            completedBuilds.add(result);
+        } finally {
+            finishActiveTask();
         }
     }
 
-    private TessResult pollCompleted() {
-        TessResult result = completedPlayerJobs.poll();
-        if (result != null) {
-            return result;
+    private void beginActiveTask() {
+        synchronized (activeTaskLock) {
+            activeTasks++;
         }
-        result = completedDirtyJobs.poll();
-        return result != null ? result : completedMissingJobs.poll();
     }
 
-    private void removeJob(TessJob job) {
-        int index = job.jobIndex;
-        if (index < 0 || index >= jobs.size() || jobs.get(index) != job) {
-            return; // already canceled/removed; stale completed result
+    private void finishActiveTask() {
+        synchronized (activeTaskLock) {
+            if (--activeTasks < 0) {
+                throw new IllegalStateException("RT terrain active-task underflow");
+            }
+            if (activeTasks == 0) {
+                activeTaskLock.notifyAll();
+            }
         }
-        int lastIndex = jobs.size() - 1;
-        TessJob last = jobs.remove(lastIndex);
-        if (index != lastIndex) {
-            jobs.set(index, last);
-            last.jobIndex = index;
+    }
+
+    private void awaitActiveTasks() {
+        synchronized (activeTaskLock) {
+            while (activeTasks != 0) {
+                try {
+                    activeTaskLock.wait();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted while joining RT terrain tasks", e);
+                }
+            }
         }
-        job.jobIndex = -1;
     }
 
     /**
-     * Publish finished worker/executor results (up to the configured result budget per tick). A job
+     * Publish terminal worker/executor results (up to the configured result count per pass). A task
      * whose token no longer matches {@link #inFlight} is stale and its unpublished native result is
      * destroyed instead of entering the table.
      */
-    private void drainTessellation(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed,
-                                   int resultCap, long deadline) {
-        int budget = resultCap;
-        int attempts = resultCap * 4;
-        boolean first = true;
-        while (budget > 0 && attempts-- > 0) {
-            // Always take at least one result so publication progresses even when dispatch ate the whole
-            // budget (inFlight backpressure then shifts the budget to draining on the next frames).
-            if (!first && System.nanoTime() >= deadline) {
-                break;
-            }
-            first = false;
-            TessResult result = pollCompleted();
+    private void drainCompletedBuilds(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed,
+                                      int resultCap) {
+        int remaining = resultCap;
+        while (remaining > 0) {
+            SectionResult result = completedBuilds.poll();
             if (result == null) {
                 break;
             }
-            if (result.build() != null && !ctx.gpuExecutor().isDone(result.build())) {
-                enqueueCompleted(result);
-                continue;
-            }
-            TessJob job = result.job();
-            removeJob(job);
-            releaseJobReservation(job);
-            long expected = inFlight.get(job.key);
-            boolean valid = expected == job.token;
+            SectionTask task = result.task();
+            releaseTaskReservation(task);
+            long expected = inFlight.get(task.key);
+            boolean valid = expected == task.token;
             if (!valid) {
                 destroyCompletedResult(ctx, result);
                 continue; // stale result; a newer dispatch (or none) supersedes it
             }
-            inFlight.remove(job.key);
-            long dirtyGroup = inFlightDirtyGroup.remove(job.key);
+            inFlight.remove(task.key);
+            long dirtyGroup = inFlightDirtyGroup.remove(task.key);
             if (result.failure() != null) {
+                if (result.prepared() != null) {
+                    PreparedSection failed = result.prepared();
+                    ctx.gpuExecutor().enqueueDestroyUnpublished(() -> RtSectionBuilder.destroy(failed));
+                }
                 if (dirtyGroup != NO_DIRTY_GROUP) {
                     cancelDirtyGroup(dirtyGroup);
                 }
-                throw new RuntimeException("RT terrain tessellation failed for section "
-                        + (job.sox >> 4) + "," + (job.soy >> 4) + "," + (job.soz >> 4),
+                throw new RuntimeException("RT terrain section build failed for section "
+                        + (task.sox >> 4) + "," + (task.soy >> 4) + "," + (task.soz >> 4),
                         result.failure());
             }
             PreparedSection built = result.prepared();
             if (built != null) {
                 try {
-                    ctx.gpuExecutor().free(result.build());
                     RtSectionBuilder.resolveMaterials(built);
                     ctx.gpuExecutor().markPublished(result.build());
                     RtFrameStats.FRAME.count("terrainBuildsCompleted", 1);
@@ -1189,61 +1130,60 @@ public final class RtTerrain {
                         cancelDirtyGroup(dirtyGroup);
                     }
                     throw new RuntimeException("RT terrain GPU build failed for section "
-                            + (job.sox >> 4) + "," + (job.soy >> 4) + "," + (job.soz >> 4), t);
+                            + (task.sox >> 4) + "," + (task.soy >> 4) + "," + (task.soz >> 4), t);
                 }
             }
             if (dirtyGroup != NO_DIRTY_GROUP && dirtyGroups.containsKey(dirtyGroup)) {
                 DirtyGroup group = dirtyGroups.get(dirtyGroup);
                 if (built == null) {
-                    SectionGeom prev = resident.get(job.key);
+                    SectionGeom prev = resident.get(task.key);
                     if (prev != null) {
                         group.removed.add(prev);
                     } else {
-                        group.restoreEmptyKeys.add(job.key);
+                        group.restoreEmptyKeys.add(task.key);
                     }
-                    group.emptyKeys.add(job.key);
+                    group.emptyKeys.add(task.key);
                 } else {
-                    empty.remove(job.key);
+                    empty.remove(task.key);
                     group.prepared.add(built);
                 }
                 completeDirtyGroupMember(group, prepared, removed);
-                budget--;
+                remaining--;
             } else {
                 if (built == null) {
                     // Legitimately empty (air or fully-enclosed). If this was an in-place re-extract whose new
                     // state is empty, evict the old geom and retire it in this publish pass.
-                    SectionGeom prev = resident.remove(job.key);
+                    SectionGeom prev = resident.remove(task.key);
                     if (prev != null) {
                         removed.add(prev);
                     }
-                    empty.add(job.key);
-                    budget--;
+                    empty.add(task.key);
+                    remaining--;
                 } else {
-                    empty.remove(job.key);
+                    empty.remove(task.key);
                     prepared.add(built);
-                    budget--;
+                    remaining--;
                 }
             }
         }
     }
 
-    private void destroyCompletedResult(RtContext ctx, TessResult result) {
+    private void destroyCompletedResult(RtContext ctx, SectionResult result) {
         if (result.prepared() == null) {
             return;
         }
-        ctx.gpuExecutor().free(result.build());
         ctx.gpuExecutor().enqueueDestroyUnpublished(() -> RtSectionBuilder.destroy(result.prepared()));
     }
 
-    private void releaseJobReservation(TessJob job) {
-        if (job.nativeReservationBytes == 0L) {
+    private void releaseTaskReservation(SectionTask task) {
+        if (task.nativeReservationBytes == 0L) {
             return;
         }
-        inFlightNativeBytes -= job.nativeReservationBytes;
+        inFlightNativeBytes -= task.nativeReservationBytes;
         if (inFlightNativeBytes < 0L) {
             throw new IllegalStateException("RT terrain native reservation underflow");
         }
-        job.nativeReservationBytes = 0L;
+        task.nativeReservationBytes = 0L;
     }
 
     private void completeDirtyGroupMember(DirtyGroup group, List<PreparedSection> prepared, List<SectionGeom> removed) {
@@ -1330,31 +1270,28 @@ public final class RtTerrain {
         }
     }
 
-    /** An outstanding async tessellation; completed results are delivered through the priority queues. */
-    private static final class TessJob {
+    /** An outstanding worker/GPU section build; terminal results enter one completion queue. */
+    private static final class SectionTask {
         final long key;
         final long token;
         final int sox;
         final int soy;
         final int soz;
-        final int priority;
         final long dirtyGroup;
-        Future<?> future;
-        int jobIndex = -1;
         long nativeReservationBytes = NATIVE_RESERVATION_BYTES;
 
-        TessJob(long key, long token, int sox, int soy, int soz, int priority, long dirtyGroup) {
+        SectionTask(long key, long token, int sox, int soy, int soz, long dirtyGroup) {
             this.key = key;
             this.token = token;
             this.sox = sox;
             this.soy = soy;
             this.soz = soz;
-            this.priority = priority;
             this.dirtyGroup = dirtyGroup;
         }
     }
 
-    private record TessResult(TessJob job, PreparedSection prepared, RtGpuExecutor.Build build, Throwable failure) {
+    private record SectionResult(SectionTask task, PreparedSection prepared,
+                                 RtGpuExecutor.Build build, Throwable failure) {
     }
 
     private boolean shouldRebase(int rbx, int rby, int rbz) {
@@ -1480,41 +1417,15 @@ public final class RtTerrain {
                 () -> table.recycleGeneration(generation));
     }
 
-    /** Join outstanding worker/build jobs and destroy every unpublished native result. */
-    private void cancelJobs(RtContext ctx) {
-        if (jobs.isEmpty() && inFlight.isEmpty()) {
-            inFlightDirtyGroup.clear();
-            return;
-        }
+    /** Join outstanding worker/GPU tasks and destroy every unpublished terminal result. */
+    private void drainTasksForClear(RtContext ctx) {
+        awaitActiveTasks();
         Throwable failure = null;
-        for (TessJob job : jobs) {
-            if (job.future != null) {
-                try {
-                    job.future.get();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IllegalStateException("Interrupted while joining RT terrain workers", e);
-                } catch (ExecutionException e) {
-                    if (failure == null) {
-                        failure = e.getCause();
-                    }
-                }
-            }
-            job.jobIndex = -1;
-        }
-        jobs.clear();
-        TessResult result;
-        while ((result = pollCompleted()) != null) {
-            releaseJobReservation(result.job());
+        SectionResult result;
+        while ((result = completedBuilds.poll()) != null) {
+            releaseTaskReservation(result.task());
             if (result.prepared() != null) {
                 PreparedSection unpublished = result.prepared();
-                try {
-                    ctx.gpuExecutor().free(result.build());
-                } catch (Throwable t) {
-                    if (failure == null) {
-                        failure = t;
-                    }
-                }
                 ctx.gpuExecutor().enqueueDestroyUnpublished(() -> RtSectionBuilder.destroy(unpublished));
             }
             if (result.failure() != null && failure == null) {
@@ -1534,7 +1445,7 @@ public final class RtTerrain {
 
     /** Full teardown (world exit / shutdown): drain the GPU, then free everything incl. an in-flight build. */
     private void clear(RtContext ctx, boolean shutdown) {
-        cancelJobs(ctx);
+        drainTasksForClear(ctx);
         cancelAllDirtyGroups();
         if (shutdown) {
             ctx.waitIdle();
@@ -1555,7 +1466,6 @@ public final class RtTerrain {
         desiredColumns.clear();
         loadedColumns.clear();
         missing.clear();
-        missingPriorities.clear();
         missingIndex.clear();
         queuedDirtyGroup.clear();
         playerReextract.clear();

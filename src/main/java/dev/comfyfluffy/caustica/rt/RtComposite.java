@@ -368,7 +368,7 @@ public final class RtComposite {
         if (ctx == null) {
             return false;
         }
-        // Budgeted terrain streaming (dispatch/drain/build kick) runs here, once per render frame — before
+        // Count-bounded terrain streaming (dispatch/drain/build kick) runs here once per render frame — before
         // the ready gate below, because it is what MAKES terrain ready during the initial fill.
         try {
             RtTerrain.frame(ctx);
