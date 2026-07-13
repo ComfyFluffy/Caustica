@@ -15,6 +15,7 @@
 		"LevelExtractorMixin",
 		"MinecraftMixin",
 		"MinecraftReloadMixin",
+		"ModelPartAccessor",
 		"OptionsMixin",
 		"OptionsSubScreenAccessor",
 		"ParticleEngineAccessor",

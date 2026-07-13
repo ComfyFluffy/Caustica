@@ -11,7 +11,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import net.fabricmc.loader.api.FabricLoader;
 
 /**
@@ -37,6 +39,19 @@ public final class RtFrameStats {
                     "terrain.snapshotDispatch",
                     "terrain.publish",
                     "entity.capture",
+                    "entity.capture.extract",
+                    "entity.capture.submit",
+                    "entity.capture.submit.material",
+                    "entity.capture.submit.setupAnim",
+                    "entity.capture.submit.modelDraw",
+                    "entity.capture.submit.bakedQuads",
+                    "entity.capture.submit.metrics",
+                    "entity.capture.submit.parity",
+                    "entity.capture.motion",
+                    "entity.capture.rigidReuse",
+                    "entity.capture.append.alloc",
+                    "entity.capture.append.copy",
+                    "entity.capture.append.blas",
                     "entity.blockEntities",
                     "entity.particles",
                     "entity.blasRecord",
@@ -50,7 +65,9 @@ public final class RtFrameStats {
                     "frame.copyOutput"
             },
             new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted", "entitiesCaptured", "refits",
-                    "entityReuse", "vmaBufferCreates"},
+                    "entityReuse", "vmaBufferCreates", "entityModelSubmissions", "entityCuboids",
+                    "entityModelQuads", "entityModelVertices", "entityBakedQuads", "entityBakedVertices",
+                    "entityParityChecks", "entityVmaBufferCreates", "entityUploadBytes", "entityMotionUploadBytes"},
             true);
 
     private static final List<GarbageCollectorMXBean> GC_BEANS = ManagementFactory.getGarbageCollectorMXBeans();
@@ -96,6 +113,8 @@ public final class RtFrameStats {
         private final String name;
         private final String[] stageNames;
         private final String[] counterNames;
+        private final Map<String, Integer> stageIndices;
+        private final Map<String, Integer> counterIndices;
         private final boolean trackGc;
         private final long[] stageNanos;
         private final long[] counters;
@@ -121,6 +140,8 @@ public final class RtFrameStats {
             this.trackGc = trackGc;
             this.stageNanos = new long[stageNames.length];
             this.counters = new long[counterNames.length];
+            this.stageIndices = index(stageNames);
+            this.counterIndices = index(counterNames);
         }
 
         /** Start timing a new frame; clears this frame's stage/counter accumulators. */
@@ -151,17 +172,33 @@ public final class RtFrameStats {
             if (!enabled() || !active) {
                 return Scope.NOOP;
             }
-            int idx = indexOf(stageNames, stageName);
+            int idx = indexOf(stageIndices, stageName);
             long start = System.nanoTime();
             return () -> stageNanos[idx] += System.nanoTime() - start;
         }
 
+        /**
+         * Start a hot-path stage without allocating a {@link Scope}. Returns zero while profiling is inactive;
+         * pass the value unchanged to {@link #endStage(String, long)}.
+         */
+        public long startStage() {
+            return enabled() && active ? System.nanoTime() : 0L;
+        }
+
+        /** Finish a stage started by {@link #startStage()}. */
+        public void endStage(String stageName, long startNanos) {
+            if (startNanos == 0L) {
+                return;
+            }
+            stageNanos[indexOf(stageIndices, stageName)] += System.nanoTime() - startNanos;
+        }
+
         /** Add to a named counter for the current frame. */
-        public void count(String counterName, int delta) {
+        public void count(String counterName, long delta) {
             if (!enabled() || !active || delta == 0) {
                 return;
             }
-            counters[indexOf(counterNames, counterName)] += delta;
+            counters[indexOf(counterIndices, counterName)] += delta;
         }
 
         /** Finish the current frame: record it into the rolling median and log a hitch line if it's slow. */
@@ -252,7 +289,11 @@ public final class RtFrameStats {
                     .append(ms(total)).append("ms (median ").append(ms(median)).append("ms):");
             long staged = 0;
             for (int i = 0; i < stageNames.length; i++) {
-                staged += stageNanos[i];
+                // entity.capture.* is a detailed subdivision nested inside the top-level entity.capture
+                // envelope. Report it, but do not double-count it when deriving unaccounted frame time.
+                if (!stageNames[i].startsWith("entity.capture.")) {
+                    staged += stageNanos[i];
+                }
                 sb.append(' ').append(stageNames[i]).append('=').append(ms(stageNanos[i])).append("ms");
             }
             // Time inside this frame not covered by any stage timer — a big value here with gcPause>0 means
@@ -271,13 +312,22 @@ public final class RtFrameStats {
             return Math.round(nanos / 1000.0) / 1000.0;
         }
 
-        private static int indexOf(String[] arr, String name) {
-            for (int i = 0; i < arr.length; i++) {
-                if (arr[i].equals(name)) {
-                    return i;
+        private static Map<String, Integer> index(String[] names) {
+            Map<String, Integer> result = new HashMap<>(names.length * 2);
+            for (int i = 0; i < names.length; i++) {
+                if (result.put(names[i], i) != null) {
+                    throw new IllegalArgumentException("Duplicate RtFrameStats name: " + names[i]);
                 }
             }
-            throw new IllegalArgumentException("Unknown RtFrameStats name: " + name);
+            return result;
+        }
+
+        private static int indexOf(Map<String, Integer> indices, String name) {
+            Integer index = indices.get(name);
+            if (index == null) {
+                throw new IllegalArgumentException("Unknown RtFrameStats name: " + name);
+            }
+            return index;
         }
     }
 }

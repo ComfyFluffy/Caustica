@@ -504,7 +504,13 @@ public final class RtEntities {
             EntityPrev prev = prevVerts.get(id);
             capture.reset(prev != null ? prev.size / 3 : 0);
             try {
-                EntityRenderState state = dispatcher.extractEntity(entity, partial);
+                EntityRenderState state;
+                long extractStart = RtFrameStats.FRAME.startStage();
+                try {
+                    state = dispatcher.extractEntity(entity, partial);
+                } finally {
+                    RtFrameStats.FRAME.endStage("entity.capture.extract", extractStart);
+                }
                 // extractEntity already ran EntityRenderer.extractNameTags (shouldShowName, crosshair-look,
                 // distance cutoff, the attachment point) as a normal part of building the render state — no
                 // need to reimplement any of that here, just read the result. Name tags billboard to face
@@ -516,16 +522,21 @@ public final class RtEntities {
                 if (nameTags && !firstPersonSelf && state.nameTag != null) {
                     captureNameTag(level, state, ix, iy, iz, rbx, rby, rbz);
                 }
-                collector.begin(capture);
+                collector.begin(capture, true);
                 // Capture directly in rebased space so the TLAS instance transform is identity.
-                dispatcher.submit(state, cameraState, ix - rbx, iy - rby, iz - rbz, new PoseStack(), collector);
+                long submitStart = RtFrameStats.FRAME.startStage();
+                try {
+                    dispatcher.submit(state, cameraState, ix - rbx, iy - rby, iz - rbz, new PoseStack(), collector);
+                } finally {
+                    RtFrameStats.FRAME.endStage("entity.capture.submit", submitStart);
+                }
             } catch (Throwable t) {
                 // Fail loud instead of skip-and-limp: a capture throw here is almost always our bug, and
                 // swallowing it leaves the entity invisible every frame plus a per-frame MC CrashReport.
                 // Propagate to composite(), which logs the full trace, disables RT, and reverts to vanilla.
                 throw new RuntimeException("RT entity capture failed", t);
             } finally {
-                collector.begin(null);
+                collector.begin(null, false);
             }
             if (capture.isEmpty()) {
                 continue; // non-model entity (arrow/etc.) — no body geometry captured
@@ -542,11 +553,24 @@ public final class RtEntities {
             }
             // Motion vs last frame's posed mesh. New/topology-changed entities get one frame of camera-only
             // MV; rigid translation is packed into the table, deformation gets a disp buffer.
-            Motion motion = uploadVertexMotion(ctx, build, capture.verts, prev, rbx, rby, rbz, "entity " + id);
+            Motion motion;
+            long motionStart = RtFrameStats.FRAME.startStage();
+            try {
+                motion = uploadVertexMotion(ctx, build, capture.verts, prev, rbx, rby, rbz, "entity " + id);
+            } finally {
+                RtFrameStats.FRAME.endStage("entity.capture.motion", motionStart);
+            }
             curVerts.put(id, storeEntityPrev(prev, capture.verts, rbx, rby, rbz));
             // Rigid reuse first: a pose that is a rigid transform of the entity's last-built mesh
             // re-references that AS through the instance transform — no upload, no refit.
-            if (!appendRigidReuse(ctx, build, motion, id, mask)) {
+            boolean reused;
+            long reuseStart = RtFrameStats.FRAME.startStage();
+            try {
+                reused = appendRigidReuse(ctx, build, motion, id, mask);
+            } finally {
+                RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
+            }
+            if (!reused) {
                 appendCapture(ctx, build, motion, id, ENTITY_BIT, mask);
             }
             RtFrameStats.FRAME.count("entitiesCaptured", 1);
@@ -631,6 +655,7 @@ public final class RtEntities {
         beginBuildIfNeeded(ctx, build);
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         RtBuffer dispBuf = allocBuffer(ctx, (long) vc * 4L * Float.BYTES, storage, true, label + " disp");
+        RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
         long out = dispBuf.mapped;
         for (int i = 0; i < vc; i++) {
             MemoryUtil.memPutFloat(out, (curVerts[i * 3] - prevVerts[i * 3]) + sx);
@@ -639,6 +664,7 @@ public final class RtEntities {
             MemoryUtil.memPutFloat(out + 12, 0f);
             out += 16;
         }
+        RtFrameStats.FRAME.count("entityMotionUploadBytes", (long) vc * 4L * Float.BYTES);
         build.buffers.add(dispBuf);
         return new Motion(dispBuf.deviceAddress, 0f, 0f, 0f);
     }
@@ -854,13 +880,13 @@ public final class RtEntities {
             if (state == null) {
                 return; // off-screen-only (beacon/end-gateway), distance-culled, or no renderer
             }
-            collector.begin(capture);
+            collector.begin(capture, false);
             // Identity pose ⇒ block-local mesh; world placement is the per-frame instance transform in emitBe.
             beDispatcher.submit(state, new PoseStack(), collector, cameraState);
         } catch (Throwable t) {
             throw new RuntimeException("RT block-entity capture failed", t); // propagate to composite() (see entity path)
         } finally {
-            collector.begin(null);
+            collector.begin(null, false);
         }
         if (capture.isEmpty()) {
             return;
@@ -1185,29 +1211,57 @@ public final class RtEntities {
         int vertCount = capture.verts.size() / 3;
         int idxCount = capture.idx.size();
         String label = entityId >= 0 ? "entity " + entityId : "entity mesh " + build.count;
-        RtBuffer positions = allocBuffer(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true,
-                label + " positions");
-        RtBuffer indices = allocBuffer(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true,
-                label + " indices");
-        RtBuffer uvs = allocBuffer(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true,
-                label + " uvs");
-        RtBuffer prim = allocBuffer(ctx, (long) capture.prim.size() * Float.BYTES, storage, true,
-                label + " prim");
-        MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
-        MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
-        MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
-        MemoryUtil.memFloatBuffer(prim.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
+        boolean profileEntity = entityId >= 0;
+        RtBuffer positions;
+        RtBuffer indices;
+        RtBuffer uvs;
+        RtBuffer prim;
+        long allocStart = profileEntity ? RtFrameStats.FRAME.startStage() : 0L;
+        try {
+            positions = allocBuffer(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true,
+                    label + " positions");
+            indices = allocBuffer(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true,
+                    label + " indices");
+            uvs = allocBuffer(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true,
+                    label + " uvs");
+            prim = allocBuffer(ctx, (long) capture.prim.size() * Float.BYTES, storage, true,
+                    label + " prim");
+            if (profileEntity) {
+                RtFrameStats.FRAME.count("entityVmaBufferCreates", 4);
+            }
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.append.alloc", allocStart);
+        }
+        long copiedBytes = ((long) capture.verts.size() + capture.uvList.size() + capture.prim.size()) * Float.BYTES
+                + (long) capture.idx.size() * Integer.BYTES;
+        long copyStart = profileEntity ? RtFrameStats.FRAME.startStage() : 0L;
+        try {
+            MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
+            MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
+            MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
+            MemoryUtil.memFloatBuffer(prim.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
+            if (profileEntity) {
+                RtFrameStats.FRAME.count("entityUploadBytes", copiedBytes);
+            }
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.append.copy", copyStart);
+        }
 
         // Non-opaque so world.rahit alpha-tests the texture (cutout). Opaque texels pass to the chit.
         RtAccel accel;
-        if (entityId >= 0) {
-            accel = refitOrBuild(ctx, build, entityId, positions, indices, vertCount, idxCount, label);
-        } else {
-            RtAccel.PreparedBlas blas = RtAccel.prepareEntityBlas(ctx, positions, vertCount, indices, idxCount, false,
-                    label + " BLAS");
-            build.blas.add(blas);
-            build.pooledBlas.add(blas);
-            accel = blas.accel;
+        long blasStart = profileEntity ? RtFrameStats.FRAME.startStage() : 0L;
+        try {
+            if (entityId >= 0) {
+                accel = refitOrBuild(ctx, build, entityId, positions, indices, vertCount, idxCount, label);
+            } else {
+                RtAccel.PreparedBlas blas = RtAccel.prepareEntityBlas(ctx, positions, vertCount, indices, idxCount, false,
+                        label + " BLAS");
+                build.blas.add(blas);
+                build.pooledBlas.add(blas);
+                accel = blas.accel;
+            }
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.append.blas", blasStart);
         }
 
         writeTableEntry(build, prim.deviceAddress, indices.deviceAddress, uvs.deviceAddress, motion.dispAddr,
@@ -1314,6 +1368,7 @@ public final class RtEntities {
             RtFrameStats.FRAME.count("refits", 1);
             RtBuffer scratch = allocBuffer(ctx, RtAccel.scratchBufferSize(ctx, slot.updateScratchSize), storage, false,
                     label + " refit scratch");
+            RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
             build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positions.deviceAddress, indices.deviceAddress, vertCount, idxCount, false,
                     label + " BLAS refit"));
             build.refitScratch.add(scratch);
@@ -1330,6 +1385,7 @@ public final class RtEntities {
         }
         RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, positions, vertCount, indices, idxCount, false,
                 label + " BLAS");
+        RtFrameStats.FRAME.count("entityVmaBufferCreates", 2); // persistent AS backing + transient build scratch
         slot.accel = ub.accel();
         slot.backing = ub.backing();
         slot.vertCount = vertCount;

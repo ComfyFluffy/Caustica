@@ -580,6 +580,9 @@ public final class CausticaConfig {
                     bool("caustica.rt.glow", "entities.glow.enabled", true);
             public static final BooleanSetting NAME_TAGS_ENABLED =
                     bool("caustica.rt.nameTags", "entities.name-tags.enabled", true);
+            /** Debug-only: render each model submission twice and require bitwise-identical CPU captures. */
+            public static final BooleanSetting CAPTURE_PARITY =
+                    bool("caustica.rt.entityCaptureParity", "entities.debug.capture-parity", false);
             public static final IntSetting MAX_ENTITIES =
                     intAtLeast("caustica.rt.maxEntities", "entities.max-entities", 1024, 1);
             public static final IntSetting BE_VIEW_CHUNKS =
