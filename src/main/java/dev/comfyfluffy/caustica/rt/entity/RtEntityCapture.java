@@ -239,15 +239,29 @@ public final class RtEntityCapture implements VertexConsumer {
     }
 
     private void emitQuad() {
+        appendQuad(qx, qy, qz, qu, qv, qnx[0], qny[0], qnz[0], qcol[0], false);
+    }
+
+    /**
+     * Append one already-transformed model quad without routing its four vertices through the
+     * {@link VertexConsumer} accumulator. The direct cuboid path supplies the same polygon order,
+     * authored normal, UVs and flat submission colour as {@code ModelPart.Cube.compile}.
+     */
+    void addDirectQuad(float[] x, float[] y, float[] z, float[] u, float[] v,
+                       float nx, float ny, float nz, int color) {
+        appendQuad(x, y, z, u, v, nx, ny, nz, color, uvRemap);
+    }
+
+    private void appendQuad(float[] x, float[] y, float[] z, float[] u, float[] v,
+                            float nx, float ny, float nz, int color, boolean remapUv) {
         // Authored model normal (pose-transformed by compile); planar quad, so vertex 0's normal is the
         // face normal. Baked quads (items/blocks) pass no normal → fall back to a geometric one from the
         // quad edges. The closest-hit flips it toward the viewer, as for terrain. Computed BEFORE the
         // positions are staged so a same-order offset (below) can push along it.
-        float nx = qnx[0], ny = qny[0], nz = qnz[0];
         float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
         if (len <= 1.0e-6f) {
-            float ex1 = qx[1] - qx[0], ey1 = qy[1] - qy[0], ez1 = qz[1] - qz[0];
-            float ex2 = qx[2] - qx[0], ey2 = qy[2] - qy[0], ez2 = qz[2] - qz[0];
+            float ex1 = x[1] - x[0], ey1 = y[1] - y[0], ez1 = z[1] - z[0];
+            float ex2 = x[2] - x[0], ey2 = y[2] - y[0], ez2 = z[2] - z[0];
             nx = ey1 * ez2 - ez1 * ey2;
             ny = ez1 * ex2 - ex1 * ez2;
             nz = ex1 * ey2 - ey1 * ex2;
@@ -266,19 +280,19 @@ public final class RtEntityCapture implements VertexConsumer {
         if (currentOrder != 0 && len > 1.0e-6f) {
             float off = ORDER_OFFSET * currentOrder;
             for (int i = 0; i < 4; i++) {
-                qx[i] += nx * off;
-                qy[i] += ny * off;
-                qz[i] += nz * off;
+                x[i] += nx * off;
+                y[i] += ny * off;
+                z[i] += nz * off;
             }
         }
 
         int base = verts.size() / 3;
         for (int i = 0; i < 4; i++) {
-            verts.add(qx[i]);
-            verts.add(qy[i]);
-            verts.add(qz[i]);
-            uvList.add(qu[i]);
-            uvList.add(qv[i]);
+            verts.add(x[i]);
+            verts.add(y[i]);
+            verts.add(z[i]);
+            uvList.add(remapUv ? uvU0 + u[i] * uvDU : u[i]);
+            uvList.add(remapUv ? uvV0 + v[i] * uvDV : v[i]);
         }
         idx.add(base);
         idx.add(base + 1);
@@ -287,7 +301,7 @@ public final class RtEntityCapture implements VertexConsumer {
         idx.add(base + 2);
         idx.add(base + 3);
         // Vertex colour as a flat per-prim tint (ARGB → rgb). White (-1) for most models → grey when lit.
-        int c = qcol[0];
+        int c = color;
         float tr = ((c >> 16) & 0xFF) * (1f / 255f);
         float tg = ((c >> 8) & 0xFF) * (1f / 255f);
         float tb = (c & 0xFF) * (1f / 255f);

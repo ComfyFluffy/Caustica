@@ -70,6 +70,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private RtEntityCapture capture;
     private boolean profileDynamicEntity;
     private final RtEntityCapture parityCapture = new RtEntityCapture();
+    private final RtCuboidEmitter cuboidEmitter = new RtCuboidEmitter();
     private ModelBlockRenderer blockRenderer; // lazily-built mesher for moving (falling) blocks
     // Set by order(int) for the very next submitModel call (banner/shield pattern-layer stacking), then
     // consumed. Baked-quad paths (addQuad) don't use ordering and always reset the capture's order to 0.
@@ -172,10 +173,18 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         int idxStart = capture.idx.size();
         int uvStart = capture.uvList.size();
         int primStart = capture.prim.size();
+        RtCuboidEmitter.ModelTemplate directTemplate = cuboidEmitter.prepare(model);
         long drawStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
         try {
-            model.renderToBuffer(poseStack, capture, lightCoords, overlayCoords, color);
+            if (directTemplate != null) {
+                cuboidEmitter.emit(directTemplate, poseStack, capture, color);
+            } else {
+                model.renderToBuffer(poseStack, capture, lightCoords, overlayCoords, color);
+            }
         } finally {
+            RtFrameStats.FRAME.endStage(directTemplate != null
+                    ? "entity.capture.submit.modelDraw.direct"
+                    : "entity.capture.submit.modelDraw.fallback", drawStart);
             RtFrameStats.FRAME.endStage("entity.capture.submit.modelDraw", drawStart);
         }
         int addedVertices = (capture.verts.size() - vertStart) / 3;
@@ -183,6 +192,11 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (profileDynamicEntity) {
             RtFrameStats.FRAME.count("entityModelVertices", addedVertices);
             RtFrameStats.FRAME.count("entityModelQuads", addedQuads);
+            RtFrameStats.FRAME.count(directTemplate != null ? "entityDirectSubmissions" : "entityDirectFallbacks", 1);
+            if (directTemplate != null) {
+                RtFrameStats.FRAME.count("entityDirectVertices", addedVertices);
+                RtFrameStats.FRAME.count("entityDirectQuads", addedQuads);
+            }
         }
 
         if (CausticaConfig.Rt.Entities.CAPTURE_PARITY.value()) {

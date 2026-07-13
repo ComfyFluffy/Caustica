@@ -44,6 +44,8 @@ public final class RtFrameStats {
                     "entity.capture.submit.material",
                     "entity.capture.submit.setupAnim",
                     "entity.capture.submit.modelDraw",
+                    "entity.capture.submit.modelDraw.direct",
+                    "entity.capture.submit.modelDraw.fallback",
                     "entity.capture.submit.bakedQuads",
                     "entity.capture.submit.metrics",
                     "entity.capture.submit.parity",
@@ -70,6 +72,7 @@ public final class RtFrameStats {
             new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted", "entitiesCaptured", "refits",
                     "entityReuse", "vmaBufferCreates", "entityModelSubmissions", "entityCuboids",
                     "entityModelQuads", "entityModelVertices", "entityBakedQuads", "entityBakedVertices",
+                    "entityDirectSubmissions", "entityDirectFallbacks", "entityDirectQuads", "entityDirectVertices",
                     "entityParityChecks", "entityVmaBufferCreates", "entityUploadBytes", "entityMotionUploadBytes"},
             true);
 
