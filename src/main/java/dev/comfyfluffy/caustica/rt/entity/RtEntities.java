@@ -41,6 +41,7 @@ import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -54,8 +55,8 @@ import java.util.Queue;
  * Dynamic entities as real ray-traced {@code ModelPart} geometry. Each frame, every model entity is
  * re-posed and captured ({@link RtEntityCollector} + {@link RtEntityCapture}) into a mesh in terrain's
  * vertex layout, uploaded, and given a per-entity BLAS built inline in the composite's frame command
- * buffer. One TLAS instance per entity (identity transform — geometry is captured directly in terrain's
- * rebased space) carries the {@link #ENTITY_BIT} custom-index flag so {@code world.rchit} takes the
+ * buffer. One TLAS instance per entity places entity-local geometry at {@code anchor - rebase} and carries
+ * the {@link #ENTITY_BIT} custom-index flag so {@code world.rchit} takes the
  * entity path. A per-frame entity geometry table ({@code {primAddr, idxAddr, uvAddr, disp}}) gives the
  * hit shader each entity's per-triangle normals/tint and its per-object motion-vector displacement.
  * Non-model entities (items/arrows — geometry via submitItem/submitBlockModel, which the collector
@@ -158,14 +159,15 @@ public final class RtEntities {
     // Treat per-vertex displacements as rigid when every vertex agrees within this tolerance, avoiding a
     // transient disp buffer for plain whole-entity translation.
     private static final float RIGID_DISP_EPS = 1.0e-5f;
-    // Identity 3x4 row-major: entity geometry is captured directly in rebased space, so no per-instance
-    // transform is needed (unlike terrain sections, which carry sectionOrigin − rebase).
+    // Identity 3x4 row-major. Particles are already captured in rebased space; dynamic entities use a
+    // translate/yaw instance transform because their geometry is captured around the entity anchor.
     private static final float[] IDENTITY = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     private static final Motion NO_MOTION = new Motion(0L, 0f, 0f, 0f);
 
     // Reusable capture pipeline (single-threaded on the render thread).
     private final RtEntityCollector collector = new RtEntityCollector();
     private final RtEntityCapture capture = new RtEntityCapture();
+    private final PoseStack entityPoseStack = new PoseStack();
     private CameraRenderState cameraState;
 
     // Particle capture: a VertexConsumer adapter that funnels MC's billboard quads into `capture` (the
@@ -189,11 +191,11 @@ public final class RtEntities {
 
     private final FrameLists[] frameLists = new FrameLists[FRAME_LIST_RING];
 
-    // Previous frame's captured (rebase-space) vertex positions + that frame's rebase origin, keyed by
+    // Previous frame's captured entity-local vertex positions + its interpolated world anchor, keyed by
     // entity id. Maps are swapped/reused each frame: entries not seen this frame fall out, while visible
     // entities keep their float[] backing to avoid steady-state allocation churn.
-    private Map<Integer, EntityPrev> prevVerts = new HashMap<>(entityMapCapacity());
-    private Map<Integer, EntityPrev> curVerts = new HashMap<>(entityMapCapacity());
+    private Int2ObjectOpenHashMap<EntityPrev> prevVerts = new Int2ObjectOpenHashMap<>(entityMapCapacity());
+    private Int2ObjectOpenHashMap<EntityPrev> curVerts = new Int2ObjectOpenHashMap<>(entityMapCapacity());
 
     // This frame's glowing entities (see GlowEntity) + the camera-relative offset (camera pos - rebase
     // origin) their positions are captured against, for RtGlowOutlineFeature's raster pass. Rebuilt every frame.
@@ -234,19 +236,18 @@ public final class RtEntities {
         return cameraState.orientation;
     }
 
-    /** Last frame's posed mesh for one entity: rebase-space vertex positions + the rebase origin they were
-     *  captured against (needed to convert the inter-frame delta to world space when the rebase moved). */
+    /** Last frame's posed mesh for one entity: local vertex positions + its interpolated world anchor. */
     private static final class EntityPrev {
         float[] verts = new float[0];
         int size;
-        int rbx, rby, rbz;
+        float anchorX, anchorY, anchorZ;
     }
 
     // Per-frame entity GPU resources awaiting a frames-in-flight-safe free.
     private final List<Deferred> deferred = new ArrayList<>();
 
     // Persistent per-entity acceleration structures, keyed by entity id, for refit.
-    private final Map<Integer, EntityAccel> entityAccels = new HashMap<>();
+    private final Int2ObjectOpenHashMap<EntityAccel> entityAccels = new Int2ObjectOpenHashMap<>(entityMapCapacity());
 
     // Persistent per-block-entity geometry, keyed by BlockPos.asLong(). Built once and reused every frame.
     private final Map<Long, BeEntry> beCache = new HashMap<>();
@@ -291,7 +292,7 @@ public final class RtEntities {
 
     /** A per-entity ring of {@link EntitySlot}s, cycled one-per-frame so a refit never writes an AS still
      *  in flight, plus the last frame the entity was captured (drives eviction). Also holds the rigid-reuse
-     *  reference: the mesh contents of the most recently written AS (in its rebased capture space) and the
+     *  reference: the entity-local mesh contents of the most recently written AS and the
      *  cache-owned shading buffers the geometry table points at on reuse frames. */
     private static final class EntityAccel {
         final EntitySlot[] ring = new EntitySlot[REFIT_RING];
@@ -307,6 +308,7 @@ public final class RtEntities {
         int refIdxCount = -1;
         long refShadeHash;                      // rotation-invariant uv+prim hash (catches tint/sprite swaps)
         RtBuffer refIndices, refUvs, refPrim;   // cache-owned; released when superseded or evicted
+        long retryYawFitAfter;
     }
 
     /** This frame's entity contribution: the full instance list (terrain + entities), the entity BLAS to
@@ -429,7 +431,8 @@ public final class RtEntities {
      * Capture this frame's model entities + block entities into per-object meshes/BLAS and merge them
      * with the terrain static instances. The caller (RtComposite) records the returned BLAS builds
      * before the TLAS build and pushes the geometry-table address. Returns terrain-only (no BLAS, addr 0)
-     * when disabled or nothing captured. Coordinates are captured rebase-relative → identity instance.
+     * when disabled or nothing captured. Dynamic entity coordinates are local and placed by TLAS instances;
+     * particles remain captured rebase-relative with an identity instance.
      */
     public FrameEntities beginFrame(RtContext ctx, List<RtAccel.Instance> base, int rbx, int rby, int rbz,
                                     double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
@@ -488,6 +491,7 @@ public final class RtEntities {
         glowCamOffsetX = (float) (cameraState.pos.x - rbx);
         glowCamOffsetY = (float) (cameraState.pos.y - rby);
         glowCamOffsetZ = (float) (cameraState.pos.z - rbz);
+        resetPoseStack(entityPoseStack);
         for (Entity entity : level.entitiesForRendering()) {
             if (build.full()) {
                 break;
@@ -523,10 +527,12 @@ public final class RtEntities {
                     captureNameTag(level, state, ix, iy, iz, rbx, rby, rbz);
                 }
                 collector.begin(capture, true);
-                // Capture directly in rebased space so the TLAS instance transform is identity.
+                resetPoseStack(entityPoseStack);
+                // Capture around the entity anchor. Per-frame placement moves into the TLAS instance,
+                // so ordinary world translation no longer changes the mesh or its float precision.
                 long submitStart = RtFrameStats.FRAME.startStage();
                 try {
-                    dispatcher.submit(state, cameraState, ix - rbx, iy - rby, iz - rbz, new PoseStack(), collector);
+                    dispatcher.submit(state, cameraState, 0.0, 0.0, 0.0, entityPoseStack, collector);
                 } finally {
                     RtFrameStats.FRAME.endStage("entity.capture.submit", submitStart);
                 }
@@ -537,6 +543,7 @@ public final class RtEntities {
                 throw new RuntimeException("RT entity capture failed", t);
             } finally {
                 collector.begin(null, false);
+                resetPoseStack(entityPoseStack);
             }
             if (capture.isEmpty()) {
                 continue; // non-model entity (arrow/etc.) — no body geometry captured
@@ -548,7 +555,8 @@ public final class RtEntities {
                 // must explicitly skip it to match — otherwise it'd show an outline vanilla never would.
                 int glowColor = collector.outlineColor();
                 if (glowColor != 0) {
-                    glowBatches.add(new GlowEntity(capture.verts.toFloatArray(), capture.idx.toIntArray(), glowColor));
+                    glowBatches.add(new GlowEntity(copyTranslatedVertices(capture.verts,
+                            ix - rbx, iy - rby, iz - rbz), capture.idx.toIntArray(), glowColor));
                 }
             }
             // Motion vs last frame's posed mesh. New/topology-changed entities get one frame of camera-only
@@ -556,28 +564,47 @@ public final class RtEntities {
             Motion motion;
             long motionStart = RtFrameStats.FRAME.startStage();
             try {
-                motion = uploadVertexMotion(ctx, build, capture.verts, prev, rbx, rby, rbz, "entity " + id);
+                motion = uploadVertexMotion(ctx, build, capture.verts, prev, ix, iy, iz);
             } finally {
                 RtFrameStats.FRAME.endStage("entity.capture.motion", motionStart);
             }
-            curVerts.put(id, storeEntityPrev(prev, capture.verts, rbx, rby, rbz));
+            curVerts.put(id, storeEntityPrev(prev, capture.verts, ix, iy, iz));
             // Rigid reuse first: a pose that is a rigid transform of the entity's last-built mesh
             // re-references that AS through the instance transform — no upload, no refit.
             boolean reused;
             long reuseStart = RtFrameStats.FRAME.startStage();
             try {
-                reused = appendRigidReuse(ctx, build, motion, id, mask);
+                reused = appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
             } finally {
                 RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
             }
             if (!reused) {
-                appendCapture(ctx, build, motion, id, ENTITY_BIT, mask);
+                appendCapture(ctx, build, motion, id, ENTITY_BIT, mask,
+                        translationTransform(ix - rbx, iy - rby, iz - rbz));
             }
             RtFrameStats.FRAME.count("entitiesCaptured", 1);
         }
-        Map<Integer, EntityPrev> oldPrev = prevVerts;
+        Int2ObjectOpenHashMap<EntityPrev> oldPrev = prevVerts;
         prevVerts = curVerts;
         curVerts = oldPrev;
+    }
+
+    private static void resetPoseStack(PoseStack poseStack) {
+        while (!poseStack.isEmpty()) {
+            poseStack.popPose();
+        }
+        poseStack.setIdentity();
+    }
+
+    private static float[] copyTranslatedVertices(FloatArrayList local, float tx, float ty, float tz) {
+        float[] placed = new float[local.size()];
+        float[] src = local.elements();
+        for (int i = 0; i < local.size(); i += 3) {
+            placed[i] = src[i] + tx;
+            placed[i + 1] = src[i + 1] + ty;
+            placed[i + 2] = src[i + 2] + tz;
+        }
+        return placed;
     }
 
     /**
@@ -613,21 +640,21 @@ public final class RtEntities {
     }
 
     /**
-     * Upload this entity's motion-vector displacement. Captures are rebase-relative, so the world delta
-     * adds the rebase shift {@code rebaseCur − rebasePrev}. If every vertex has the same displacement,
+     * Upload this entity's world-space motion-vector displacement. Captures are entity-local, so the delta
+     * is {@code (anchorCur + vertexCur) - (anchorPrev + vertexPrev)}. If every vertex agrees,
      * store it as a rigid vector in the geometry-table entry; otherwise write a per-vertex {@code vec4}
      * buffer directly, avoiding the old intermediate {@code float[]}.
      */
     private Motion uploadVertexMotion(RtContext ctx, FrameBuild build, FloatArrayList cur,
-                                      EntityPrev prev, int rbx, int rby, int rbz, String label) {
+                                      EntityPrev prev, float anchorX, float anchorY, float anchorZ) {
         if (prev == null || prev.size != cur.size()) {
             return NO_MOTION;
         }
         float[] curVerts = cur.elements();
         float[] prevVerts = prev.verts;
-        float sx = rbx - prev.rbx;
-        float sy = rby - prev.rby;
-        float sz = rbz - prev.rbz;
+        float sx = anchorX - prev.anchorX;
+        float sy = anchorY - prev.anchorY;
+        float sz = anchorZ - prev.anchorZ;
         int vc = cur.size() / 3;
         if (vc == 0) {
             return NO_MOTION;
@@ -654,7 +681,7 @@ public final class RtEntities {
 
         beginBuildIfNeeded(ctx, build);
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        RtBuffer dispBuf = allocBuffer(ctx, (long) vc * 4L * Float.BYTES, storage, true, label + " disp");
+        RtBuffer dispBuf = allocBuffer(ctx, (long) vc * 4L * Float.BYTES, storage, true, "entity motion disp");
         RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
         long out = dispBuf.mapped;
         for (int i = 0; i < vc; i++) {
@@ -670,7 +697,7 @@ public final class RtEntities {
     }
 
     private static EntityPrev storeEntityPrev(EntityPrev prev, FloatArrayList cur,
-                                              int rbx, int rby, int rbz) {
+                                              float anchorX, float anchorY, float anchorZ) {
         EntityPrev out = prev != null ? prev : new EntityPrev();
         int size = cur.size();
         if (out.verts.length < size) {
@@ -678,9 +705,9 @@ public final class RtEntities {
         }
         System.arraycopy(cur.elements(), 0, out.verts, 0, size);
         out.size = size;
-        out.rbx = rbx;
-        out.rby = rby;
-        out.rbz = rbz;
+        out.anchorX = anchorX;
+        out.anchorY = anchorY;
+        out.anchorZ = anchorZ;
         return out;
     }
 
@@ -1001,7 +1028,7 @@ public final class RtEntities {
         // disp is non-null only for a BE whose mesh changed this frame (chest lid / spawner); a static BE
         // passes null ⇒ dispAddr 0 ⇒ no MV. The disp buffer is a per-frame transient, so a BE that stops
         // animating reverts to MV 0 next frame.
-        long dispAddr = uploadDisp(ctx, build, disp, "block entity");
+        long dispAddr = uploadDisp(ctx, build, disp, "block entity disp");
         writeTableEntry(build, e.prim.deviceAddress, e.indices.deviceAddress, e.uvs.deviceAddress, dispAddr, 0f, 0f, 0f);
         // Block-local mesh placed by a translate-only instance transform (blockPos − rebase), like terrain.
         float[] xform = {1, 0, 0, e.bx - rbx, 0, 1, 0, e.by - rby, 0, 0, 1, e.bz - rbz};
@@ -1069,8 +1096,8 @@ public final class RtEntities {
     }
 
     /**
-     * Rigid-reuse fast path: if the current {@link #capture} is a rigid transform (translation and/or yaw
-     * rotation) of the mesh this entity's AS was last built from, emit a geometry-table entry pointing at
+     * Rigid-reuse fast path: if the current local-space {@link #capture} is identical to, or a rigid yaw
+     * transform of, the mesh this entity's AS was last built from, emit a geometry-table entry pointing at
      * the cached shading buffers and a TLAS instance carrying the fitted transform over the cached AS —
      * skipping the 4 mesh uploads and the BLAS refit. Covers still mobs, item frames, armor stands, and
      * spinning/bobbing dropped items. The hit shader rotates prim normals / TBN by the instance transform,
@@ -1079,26 +1106,54 @@ public final class RtEntities {
      * Returns false (caller takes the full path) when there is no reusable AS, the topology changed, the
      * pose is non-rigid (animation), or the shading data changed under identical topology.
      */
-    private boolean appendRigidReuse(RtContext ctx, FrameBuild build, Motion motion, int entityId, int mask) {
+    private boolean appendRigidReuse(RtContext ctx, FrameBuild build, Motion motion, int entityId, int mask,
+                                     float placeX, float placeY, float placeZ) {
         EntityAccel ea = entityAccels.get(entityId);
         if (ea == null || ea.refAccel == null
                 || ea.refVertCount != capture.verts.size() / 3 || ea.refIdxCount != capture.idx.size()) {
             return false;
         }
-        float[] xform = fitRigidTransform(ea.refVerts, capture.verts.elements(), ea.refVertCount);
-        if (xform == null) {
-            return false;
+        long equalStart = RtFrameStats.FRAME.startStage();
+        boolean equal;
+        try {
+            equal = positionsBitwiseEqual(ea.refVerts, capture.verts.elements(), ea.refVertCount * 3);
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.rigidReuse.equal", equalStart);
+        }
+        float[] localTransform = IDENTITY;
+        if (!equal) {
+            long now = RtComposite.frameCounter();
+            if (now < ea.retryYawFitAfter) {
+                return false;
+            }
+            long yawStart = RtFrameStats.FRAME.startStage();
+            try {
+                localTransform = fitYawTransform(ea.refVerts, capture.verts.elements(), ea.refVertCount);
+            } finally {
+                RtFrameStats.FRAME.endStage("entity.capture.rigidReuse.yaw", yawStart);
+            }
+            if (localTransform == null) {
+                ea.retryYawFitAfter = now + 8L;
+                return false;
+            }
+            ea.retryYawFitAfter = 0L;
         }
         // Same topology + rigid pose, but tint/sprite/material lanes may still have changed (dyed sheep,
         // item frame content swap that kept counts). Compare the rotation-invariant shading hash.
-        if (shadeHash() != ea.refShadeHash) {
-            return false;
+        long shadeStart = RtFrameStats.FRAME.startStage();
+        try {
+            if (shadeHash() != ea.refShadeHash) {
+                return false;
+            }
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.rigidReuse.shade", shadeStart);
         }
         beginBuildIfNeeded(ctx, build);
         ea.lastSeen = RtComposite.frameCounter();
         writeTableEntry(build, ea.refPrim.deviceAddress, ea.refIndices.deviceAddress, ea.refUvs.deviceAddress,
                 motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ);
-        build.instances.add(new RtAccel.Instance(xform, ea.refAccel.deviceAddress,
+        build.instances.add(new RtAccel.Instance(placeTransform(localTransform, placeX, placeY, placeZ),
+                ea.refAccel.deviceAddress,
                 ENTITY_BIT | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
         build.count++;
         RtFrameStats.FRAME.count("entityReuse", 1);
@@ -1106,31 +1161,12 @@ public final class RtEntities {
     }
 
     /**
-     * Fit {@code cur ≈ R_yaw·ref + t}. Returns a row-major 3x4 instance transform mapping the AS's object
-     * space (= {@code ref} as stored) onto this frame's rebased space, or null if the pose is not rigid
-     * within {@link #RIGID_FIT_EPS}. A rebase shift between the two captures shows up as a constant
-     * translation and is absorbed by the fit. Translation-only is tried first (one early-exit pass — the
-     * common still case, and animating meshes reject on the first moving vertex); then a yaw fit
-     * (dropped-item spin, minecarts). Pitch/roll and deformation take the full path.
+     * Fit {@code cur ≈ R_yaw·ref + t} in entity-local space. Exact local equality is handled before this
+     * method; this slower centroid/yaw fit covers dropped-item spin and minecarts. Pitch/roll and skeletal
+     * deformation take the full path.
      */
-    private static float[] fitRigidTransform(float[] ref, float[] cur, int vc) {
-        // Pass 1: pure translation — every cur−ref delta equal.
-        float tx = cur[0] - ref[0];
-        float ty = cur[1] - ref[1];
-        float tz = cur[2] - ref[2];
-        boolean translation = true;
-        for (int i = 1; i < vc; i++) {
-            if (Math.abs((cur[i * 3]     - ref[i * 3])     - tx) > RIGID_FIT_EPS
-                    || Math.abs((cur[i * 3 + 1] - ref[i * 3 + 1]) - ty) > RIGID_FIT_EPS
-                    || Math.abs((cur[i * 3 + 2] - ref[i * 3 + 2]) - tz) > RIGID_FIT_EPS) {
-                translation = false;
-                break;
-            }
-        }
-        if (translation) {
-            return new float[] {1, 0, 0, tx, 0, 1, 0, ty, 0, 0, 1, tz};
-        }
-        // Pass 2: yaw + translation. Centroid-align, then the least-squares rotation angle about Y for
+    private static float[] fitYawTransform(float[] ref, float[] cur, int vc) {
+        // Centroid-align, then the least-squares rotation angle about Y for
         // x' = x·cos + z·sin, z' = −x·sin + z·cos is atan2(Σ(cx·rz − cz·rx), Σ(cx·rx + cz·rz)).
         float crx = 0f, cry = 0f, crz = 0f, ccx = 0f, ccy = 0f, ccz = 0f;
         for (int i = 0; i < vc; i++) {
@@ -1171,6 +1207,29 @@ public final class RtEntities {
                 -sin, 0, cos, ccz - rcz};
     }
 
+    private static boolean positionsBitwiseEqual(float[] a, float[] b, int size) {
+        for (int i = 0; i < size; i++) {
+            if (Float.floatToRawIntBits(a[i]) != Float.floatToRawIntBits(b[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static float[] translationTransform(float x, float y, float z) {
+        return new float[] {1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, z};
+    }
+
+    private static float[] placeTransform(float[] local, float x, float y, float z) {
+        if (local == IDENTITY) {
+            return translationTransform(x, y, z);
+        }
+        return new float[] {
+                local[0], local[1], local[2], local[3] + x,
+                local[4], local[5], local[6], local[7] + y,
+                local[8], local[9], local[10], local[11] + z};
+    }
+
     /**
      * FNV-1a over the capture's shading data that must match for AS reuse: UVs plus each prim record's
      * emission/tint/material lanes. Prim NORMALS are deliberately excluded — they rotate with the pose,
@@ -1200,18 +1259,23 @@ public final class RtEntities {
      */
     private void appendCapture(RtContext ctx, FrameBuild build, float[] disp, int entityId, int instanceBit, int mask) {
         beginBuildIfNeeded(ctx, build);
-        String label = entityId >= 0 ? "entity " + entityId : "entity mesh " + build.count;
-        appendCapture(ctx, build, new Motion(uploadDisp(ctx, build, disp, label), 0f, 0f, 0f), entityId, instanceBit, mask);
+        String dispLabel = entityId >= 0 ? "entity disp" : "particle disp";
+        appendCapture(ctx, build, new Motion(uploadDisp(ctx, build, disp, dispLabel), 0f, 0f, 0f),
+                entityId, instanceBit, mask, IDENTITY);
     }
 
-    private void appendCapture(RtContext ctx, FrameBuild build, Motion motion, int entityId, int instanceBit, int mask) {
+    private void appendCapture(RtContext ctx, FrameBuild build, Motion motion, int entityId, int instanceBit, int mask,
+                               float[] instanceTransform) {
         beginBuildIfNeeded(ctx, build);
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = capture.verts.size() / 3;
         int idxCount = capture.idx.size();
-        String label = entityId >= 0 ? "entity " + entityId : "entity mesh " + build.count;
         boolean profileEntity = entityId >= 0;
+        String positionsLabel = profileEntity ? "entity positions" : "particle positions";
+        String indicesLabel = profileEntity ? "entity indices" : "particle indices";
+        String uvsLabel = profileEntity ? "entity uvs" : "particle uvs";
+        String primLabel = profileEntity ? "entity prim" : "particle prim";
         RtBuffer positions;
         RtBuffer indices;
         RtBuffer uvs;
@@ -1219,13 +1283,13 @@ public final class RtEntities {
         long allocStart = profileEntity ? RtFrameStats.FRAME.startStage() : 0L;
         try {
             positions = allocBuffer(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true,
-                    label + " positions");
+                    positionsLabel);
             indices = allocBuffer(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true,
-                    label + " indices");
+                    indicesLabel);
             uvs = allocBuffer(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true,
-                    label + " uvs");
+                    uvsLabel);
             prim = allocBuffer(ctx, (long) capture.prim.size() * Float.BYTES, storage, true,
-                    label + " prim");
+                    primLabel);
             if (profileEntity) {
                 RtFrameStats.FRAME.count("entityVmaBufferCreates", 4);
             }
@@ -1252,10 +1316,10 @@ public final class RtEntities {
         long blasStart = profileEntity ? RtFrameStats.FRAME.startStage() : 0L;
         try {
             if (entityId >= 0) {
-                accel = refitOrBuild(ctx, build, entityId, positions, indices, vertCount, idxCount, label);
+                accel = refitOrBuild(ctx, build, entityId, positions, indices, vertCount, idxCount);
             } else {
                 RtAccel.PreparedBlas blas = RtAccel.prepareEntityBlas(ctx, positions, vertCount, indices, idxCount, false,
-                        label + " BLAS");
+                        "particle BLAS");
                 build.blas.add(blas);
                 build.pooledBlas.add(blas);
                 accel = blas.accel;
@@ -1267,7 +1331,7 @@ public final class RtEntities {
         writeTableEntry(build, prim.deviceAddress, indices.deviceAddress, uvs.deviceAddress, motion.dispAddr,
                 motion.rigidX, motion.rigidY, motion.rigidZ);
 
-        build.instances.add(new RtAccel.Instance(IDENTITY, accel.deviceAddress,
+        build.instances.add(new RtAccel.Instance(instanceTransform, accel.deviceAddress,
                 instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
         build.buffers.add(positions); // only this frame's BLAS build consumes positions — always per-frame
         if (entityId >= 0) {
@@ -1327,7 +1391,7 @@ public final class RtEntities {
             return 0L;
         }
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        RtBuffer dispBuf = allocBuffer(ctx, (long) disp.length * Float.BYTES, storage, true, label + " disp");
+        RtBuffer dispBuf = allocBuffer(ctx, (long) disp.length * Float.BYTES, storage, true, label);
         MemoryUtil.memFloatBuffer(dispBuf.mapped, disp.length).put(disp, 0, disp.length);
         build.buffers.add(dispBuf);
         return dispBuf.deviceAddress;
@@ -1353,10 +1417,15 @@ public final class RtEntities {
      * AS of the same topology, else a full ALLOW_UPDATE BUILD (first use of the slot, a topology change, or
      * the periodic BVH-quality rebuild). The mesh buffers + scratch are per-frame transients; the AS persists.
      */
-    private RtAccel refitOrBuild(RtContext ctx, FrameBuild build, int entityId, RtBuffer positions, RtBuffer indices, int vertCount, int idxCount, String label) {
+    private RtAccel refitOrBuild(RtContext ctx, FrameBuild build, int entityId, RtBuffer positions, RtBuffer indices,
+                                 int vertCount, int idxCount) {
         int triCount = idxCount / 3;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        EntityAccel ea = entityAccels.computeIfAbsent(entityId, k -> new EntityAccel());
+        EntityAccel ea = entityAccels.get(entityId);
+        if (ea == null) {
+            ea = new EntityAccel();
+            entityAccels.put(entityId, ea);
+        }
         ea.lastSeen = RtComposite.frameCounter();
         int s = ea.cursor;
         ea.cursor = (ea.cursor + 1) % REFIT_RING;
@@ -1367,10 +1436,10 @@ public final class RtEntities {
         if (canUpdate) {
             RtFrameStats.FRAME.count("refits", 1);
             RtBuffer scratch = allocBuffer(ctx, RtAccel.scratchBufferSize(ctx, slot.updateScratchSize), storage, false,
-                    label + " refit scratch");
+                    "entity refit scratch");
             RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
             build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positions.deviceAddress, indices.deviceAddress, vertCount, idxCount, false,
-                    label + " BLAS refit"));
+                    "entity BLAS refit"));
             build.refitScratch.add(scratch);
             slot.updatesSinceBuild++;
             return slot.accel;
@@ -1384,7 +1453,7 @@ public final class RtEntities {
             deferDestroyAccel(slot.accel, slot.backing);
         }
         RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, positions, vertCount, indices, idxCount, false,
-                label + " BLAS");
+                "entity BLAS");
         RtFrameStats.FRAME.count("entityVmaBufferCreates", 2); // persistent AS backing + transient build scratch
         slot.accel = ub.accel();
         slot.backing = ub.backing();
@@ -1409,9 +1478,9 @@ public final class RtEntities {
             return;
         }
         long now = RtComposite.frameCounter();
-        Iterator<Map.Entry<Integer, EntityAccel>> it = entityAccels.entrySet().iterator();
+        var it = entityAccels.values().iterator();
         while (it.hasNext()) {
-            EntityAccel ea = it.next().getValue();
+            EntityAccel ea = it.next();
             if (now - ea.lastSeen < KEEP_FRAMES) {
                 continue;
             }
