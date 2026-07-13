@@ -73,6 +73,7 @@ public final class RtFrameStats {
                     "entityReuse", "vmaBufferCreates", "entityModelSubmissions", "entityCuboids",
                     "entityModelQuads", "entityModelVertices", "entityBakedQuads", "entityBakedVertices",
                     "entityDirectSubmissions", "entityDirectFallbacks", "entityDirectQuads", "entityDirectVertices",
+                    "entitySpecializedCuboids", "entityGenericCuboids",
                     "entityParityChecks", "entityVmaBufferCreates", "entityUploadBytes", "entityMotionUploadBytes"},
             true);
 

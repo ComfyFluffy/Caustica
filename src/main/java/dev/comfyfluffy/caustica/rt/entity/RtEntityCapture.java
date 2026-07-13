@@ -98,6 +98,13 @@ public final class RtEntityCapture implements VertexConsumer {
         prim.ensureCapacity(primCapacity(vertexCount));
     }
 
+    /** Reserve room for an upcoming direct-model submission without changing any logical sizes. */
+    void ensureAdditionalVertexCapacity(int additionalVertices) {
+        if (additionalVertices > 0) {
+            ensureVertexCapacity(verts.size() / 3 + additionalVertices);
+        }
+    }
+
     private static int indexCapacity(int vertexCount) {
         int quadCount = (vertexCount + 3) / 4;
         return quadCount * 6;
@@ -239,7 +246,7 @@ public final class RtEntityCapture implements VertexConsumer {
     }
 
     private void emitQuad() {
-        appendQuad(qx, qy, qz, qu, qv, qnx[0], qny[0], qnz[0], qcol[0], false);
+        appendQuad(qx, qy, qz, null, qu, qv, qnx[0], qny[0], qnz[0], qcol[0], false);
     }
 
     /**
@@ -249,10 +256,16 @@ public final class RtEntityCapture implements VertexConsumer {
      */
     void addDirectQuad(float[] x, float[] y, float[] z, float[] u, float[] v,
                        float nx, float ny, float nz, int color) {
-        appendQuad(x, y, z, u, v, nx, ny, nz, color, uvRemap);
+        appendQuad(x, y, z, null, u, v, nx, ny, nz, color, uvRemap);
     }
 
-    private void appendQuad(float[] x, float[] y, float[] z, float[] u, float[] v,
+    /** Append a face whose positions reference a transformed eight-corner cube template. */
+    void addIndexedDirectQuad(float[] x, float[] y, float[] z, int[] corners, float[] u, float[] v,
+                              float nx, float ny, float nz, int color) {
+        appendQuad(x, y, z, corners, u, v, nx, ny, nz, color, uvRemap);
+    }
+
+    private void appendQuad(float[] x, float[] y, float[] z, int[] corners, float[] u, float[] v,
                             float nx, float ny, float nz, int color, boolean remapUv) {
         // Authored model normal (pose-transformed by compile); planar quad, so vertex 0's normal is the
         // face normal. Baked quads (items/blocks) pass no normal → fall back to a geometric one from the
@@ -260,8 +273,11 @@ public final class RtEntityCapture implements VertexConsumer {
         // positions are staged so a same-order offset (below) can push along it.
         float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
         if (len <= 1.0e-6f) {
-            float ex1 = x[1] - x[0], ey1 = y[1] - y[0], ez1 = z[1] - z[0];
-            float ex2 = x[2] - x[0], ey2 = y[2] - y[0], ez2 = z[2] - z[0];
+            int p0 = positionIndex(corners, 0);
+            int p1 = positionIndex(corners, 1);
+            int p2 = positionIndex(corners, 2);
+            float ex1 = x[p1] - x[p0], ey1 = y[p1] - y[p0], ez1 = z[p1] - z[p0];
+            float ex2 = x[p2] - x[p0], ey2 = y[p2] - y[p0], ez2 = z[p2] - z[p0];
             nx = ey1 * ez2 - ez1 * ey2;
             ny = ez1 * ex2 - ex1 * ez2;
             nz = ex1 * ey2 - ey1 * ex2;
@@ -277,20 +293,15 @@ public final class RtEntityCapture implements VertexConsumer {
         // push each later layer outward along the face normal by rank, same fix as terrain's coincident
         // grass-overlay resolution (RtTerrain.QuadCapture), so any-hit cutout lets the ray fall through a
         // discarded pattern texel to the layer behind instead of a random BVH pick.
-        if (currentOrder != 0 && len > 1.0e-6f) {
-            float off = ORDER_OFFSET * currentOrder;
-            for (int i = 0; i < 4; i++) {
-                x[i] += nx * off;
-                y[i] += ny * off;
-                z[i] += nz * off;
-            }
-        }
+        boolean offset = currentOrder != 0 && len > 1.0e-6f;
+        float off = offset ? ORDER_OFFSET * currentOrder : 0f;
 
         int base = verts.size() / 3;
         for (int i = 0; i < 4; i++) {
-            verts.add(x[i]);
-            verts.add(y[i]);
-            verts.add(z[i]);
+            int p = positionIndex(corners, i);
+            verts.add(offset ? x[p] + nx * off : x[p]);
+            verts.add(offset ? y[p] + ny * off : y[p]);
+            verts.add(offset ? z[p] + nz * off : z[p]);
             uvList.add(remapUv ? uvU0 + u[i] * uvDU : u[i]);
             uvList.add(remapUv ? uvV0 + v[i] * uvDV : v[i]);
         }
@@ -324,6 +335,10 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(currentHasS ? matSource : 0f); // mat.z
             prim.add(currentHasN ? matSource : 0f); // mat.w
         }
+    }
+
+    private static int positionIndex(int[] corners, int vertex) {
+        return corners == null ? vertex : corners[vertex];
     }
 
     // Unused VertexConsumer surface — ModelPart.Cube.compile only calls the bulk addVertex above.

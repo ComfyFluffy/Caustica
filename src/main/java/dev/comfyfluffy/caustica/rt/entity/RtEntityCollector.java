@@ -174,10 +174,11 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         int uvStart = capture.uvList.size();
         int primStart = capture.prim.size();
         RtCuboidEmitter.ModelTemplate directTemplate = cuboidEmitter.prepare(model);
+        long directCubeCounts = 0L;
         long drawStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
         try {
             if (directTemplate != null) {
-                cuboidEmitter.emit(directTemplate, poseStack, capture, color);
+                directCubeCounts = cuboidEmitter.emit(directTemplate, poseStack, capture, color);
             } else {
                 model.renderToBuffer(poseStack, capture, lightCoords, overlayCoords, color);
             }
@@ -196,6 +197,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             if (directTemplate != null) {
                 RtFrameStats.FRAME.count("entityDirectVertices", addedVertices);
                 RtFrameStats.FRAME.count("entityDirectQuads", addedQuads);
+                RtFrameStats.FRAME.count("entitySpecializedCuboids", directCubeCounts >>> 32);
+                RtFrameStats.FRAME.count("entityGenericCuboids", directCubeCounts & 0xffffffffL);
             }
         }
 
