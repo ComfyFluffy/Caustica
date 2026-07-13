@@ -132,7 +132,7 @@ public final class RtEntities {
     // Ring of fixed-size geometry tables: each frame fills the next slot so the GPU read of this frame's
     // trace never races a later frame's host write. > frames-in-flight (mirrors RtPipeline RING).
     private static final int TABLE_RING = 6;
-    // Frames a per-frame entity resource (mesh buffers + BLAS + scratch) must outlive before it's freed.
+    // Frames a superseded cache or per-frame entity resource must outlive before it is freed.
     private static final int KEEP_FRAMES = 4;
     private static final int FRAME_LIST_RING = KEEP_FRAMES;
     // Refit (UPDATE-mode) BLAS: persistent per-entity AS, refit in place each frame (cheap) while
@@ -245,6 +245,7 @@ public final class RtEntities {
 
     // Per-frame entity GPU resources awaiting a frames-in-flight-safe free.
     private final List<Deferred> deferred = new ArrayList<>();
+    private long retainedPositionBytes;
 
     // Persistent per-entity acceleration structures, keyed by entity id, for refit.
     private final Int2ObjectOpenHashMap<EntityAccel> entityAccels = new Int2ObjectOpenHashMap<>(entityMapCapacity());
@@ -307,7 +308,9 @@ public final class RtEntities {
         int refVertCount = -1;
         int refIdxCount = -1;
         long refShadeHash;                      // rotation-invariant uv+prim hash (catches tint/sprite swaps)
-        RtBuffer refIndices, refUvs, refPrim;   // cache-owned; released when superseded or evicted
+        RtBuffer refGeometry;                   // packed position/index/UV/prim owner
+        long refIndexAddr, refUvAddr, refPrimAddr;
+        long refPositionBytes;
         long retryYawFitAfter;
     }
 
@@ -332,6 +335,41 @@ public final class RtEntities {
     }
 
     private record Motion(long dispAddr, float rigidX, float rigidY, float rigidZ) {
+    }
+
+    private record EntityGeometryLayout(long positionOffset, long positionBytes,
+                                        long indexOffset, long uvOffset, long primOffset,
+                                        long logicalBytes, long totalBytes) {
+        private static final long REGION_ALIGNMENT = 16L;
+
+        static EntityGeometryLayout create(int positionFloats, int indexInts, int uvFloats, int primFloats) {
+            long positionBytes = Math.multiplyExact((long) positionFloats, Float.BYTES);
+            long indexBytes = Math.multiplyExact((long) indexInts, Integer.BYTES);
+            long uvBytes = Math.multiplyExact((long) uvFloats, Float.BYTES);
+            long primBytes = Math.multiplyExact((long) primFloats, Float.BYTES);
+            long indexOffset = alignUp(positionBytes);
+            long uvOffset = alignUp(Math.addExact(indexOffset, indexBytes));
+            long primOffset = alignUp(Math.addExact(uvOffset, uvBytes));
+            long totalBytes = alignUp(Math.addExact(primOffset, primBytes));
+            long logicalBytes = Math.addExact(Math.addExact(positionBytes, indexBytes),
+                    Math.addExact(uvBytes, primBytes));
+            return new EntityGeometryLayout(0L, positionBytes, indexOffset, uvOffset, primOffset,
+                    logicalBytes, totalBytes);
+        }
+
+        private static long alignUp(long value) {
+            return Math.addExact(value, REGION_ALIGNMENT - 1L) & -REGION_ALIGNMENT;
+        }
+
+        EntityGeometryLayout shifted(long baseOffset) {
+            if (baseOffset < 0L || baseOffset >= REGION_ALIGNMENT) {
+                throw new IllegalArgumentException("Invalid entity geometry base offset: " + baseOffset);
+            }
+            return new EntityGeometryLayout(
+                    Math.addExact(positionOffset, baseOffset), positionBytes,
+                    Math.addExact(indexOffset, baseOffset), Math.addExact(uvOffset, baseOffset),
+                    Math.addExact(primOffset, baseOffset), logicalBytes, Math.addExact(totalBytes, baseOffset));
+        }
     }
 
     private record BeCandidate(BlockEntity be, double dist2, long posKey) {
@@ -413,7 +451,7 @@ public final class RtEntities {
         List<RtAccel.PreparedBlas> blas;        // all BLAS ops to record this frame (BUILD + refit UPDATE)
         List<RtAccel.PreparedBlas> pooledBlas;  // transient one-shot entity BLAS ops → releaseEntityBlas
         List<RtBuffer> refitScratch;            // per-frame scratch from refit ops → destroy() (AS persists)
-        List<RtBuffer> buffers;                 // per-frame mesh buffers (both paths) → destroy()
+        List<RtBuffer> buffers;                 // transient motion/particle buffers → destroy()
         long tableBase;
         long geomTableAddr;
         int count;
@@ -460,6 +498,7 @@ public final class RtEntities {
         }
         evictStaleAccels();
         evictStaleBes();
+        RtFrameStats.FRAME.count("entityRetainedPositionBytes", retainedPositionBytes);
 
         if (build.instances == null) {
             return new FrameEntities(base, List.of(), 0L);
@@ -1150,7 +1189,7 @@ public final class RtEntities {
         }
         beginBuildIfNeeded(ctx, build);
         ea.lastSeen = RtComposite.frameCounter();
-        writeTableEntry(build, ea.refPrim.deviceAddress, ea.refIndices.deviceAddress, ea.refUvs.deviceAddress,
+        writeTableEntry(build, ea.refPrimAddr, ea.refIndexAddr, ea.refUvAddr,
                 motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ);
         build.instances.add(new RtAccel.Instance(placeTransform(localTransform, placeX, placeY, placeZ),
                 ea.refAccel.deviceAddress,
@@ -1267,122 +1306,141 @@ public final class RtEntities {
     private void appendCapture(RtContext ctx, FrameBuild build, Motion motion, int entityId, int instanceBit, int mask,
                                float[] instanceTransform) {
         beginBuildIfNeeded(ctx, build);
+        if (entityId >= 0) {
+            appendPackedEntity(ctx, build, motion, entityId, instanceBit, mask, instanceTransform);
+            return;
+        }
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = capture.verts.size() / 3;
         int idxCount = capture.idx.size();
-        boolean profileEntity = entityId >= 0;
-        String positionsLabel = profileEntity ? "entity positions" : "particle positions";
-        String indicesLabel = profileEntity ? "entity indices" : "particle indices";
-        String uvsLabel = profileEntity ? "entity uvs" : "particle uvs";
-        String primLabel = profileEntity ? "entity prim" : "particle prim";
-        RtBuffer positions;
-        RtBuffer indices;
-        RtBuffer uvs;
-        RtBuffer prim;
-        long allocStart = profileEntity ? RtFrameStats.FRAME.startStage() : 0L;
-        try {
-            positions = allocBuffer(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true,
-                    positionsLabel);
-            indices = allocBuffer(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true,
-                    indicesLabel);
-            uvs = allocBuffer(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true,
-                    uvsLabel);
-            prim = allocBuffer(ctx, (long) capture.prim.size() * Float.BYTES, storage, true,
-                    primLabel);
-            if (profileEntity) {
-                RtFrameStats.FRAME.count("entityVmaBufferCreates", 4);
-            }
-        } finally {
-            RtFrameStats.FRAME.endStage("entity.capture.append.alloc", allocStart);
-        }
-        long copiedBytes = ((long) capture.verts.size() + capture.uvList.size() + capture.prim.size()) * Float.BYTES
-                + (long) capture.idx.size() * Integer.BYTES;
-        long copyStart = profileEntity ? RtFrameStats.FRAME.startStage() : 0L;
-        try {
-            MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
-            MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
-            MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
-            MemoryUtil.memFloatBuffer(prim.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
-            if (profileEntity) {
-                RtFrameStats.FRAME.count("entityUploadBytes", copiedBytes);
-            }
-        } finally {
-            RtFrameStats.FRAME.endStage("entity.capture.append.copy", copyStart);
-        }
+        RtBuffer positions = allocBuffer(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true,
+                "particle positions");
+        RtBuffer indices = allocBuffer(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true,
+                "particle indices");
+        RtBuffer uvs = allocBuffer(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true,
+                "particle uvs");
+        RtBuffer prim = allocBuffer(ctx, (long) capture.prim.size() * Float.BYTES, storage, true,
+                "particle prim");
+        MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size())
+                .put(capture.verts.elements(), 0, capture.verts.size());
+        MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size())
+                .put(capture.idx.elements(), 0, capture.idx.size());
+        MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size())
+                .put(capture.uvList.elements(), 0, capture.uvList.size());
+        MemoryUtil.memFloatBuffer(prim.mapped, capture.prim.size())
+                .put(capture.prim.elements(), 0, capture.prim.size());
 
         // Non-opaque so world.rahit alpha-tests the texture (cutout). Opaque texels pass to the chit.
-        RtAccel accel;
-        long blasStart = profileEntity ? RtFrameStats.FRAME.startStage() : 0L;
-        try {
-            if (entityId >= 0) {
-                accel = refitOrBuild(ctx, build, entityId, positions, indices, vertCount, idxCount);
-            } else {
-                RtAccel.PreparedBlas blas = RtAccel.prepareEntityBlas(ctx, positions, vertCount, indices, idxCount, false,
-                        "particle BLAS");
-                build.blas.add(blas);
-                build.pooledBlas.add(blas);
-                accel = blas.accel;
-            }
-        } finally {
-            RtFrameStats.FRAME.endStage("entity.capture.append.blas", blasStart);
-        }
+        RtAccel.PreparedBlas blas = RtAccel.prepareEntityBlas(ctx, positions, vertCount, indices, idxCount, false,
+                "particle BLAS");
+        build.blas.add(blas);
+        build.pooledBlas.add(blas);
 
         writeTableEntry(build, prim.deviceAddress, indices.deviceAddress, uvs.deviceAddress, motion.dispAddr,
                 motion.rigidX, motion.rigidY, motion.rigidZ);
 
-        build.instances.add(new RtAccel.Instance(instanceTransform, accel.deviceAddress,
+        build.instances.add(new RtAccel.Instance(instanceTransform, blas.accel.deviceAddress,
                 instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
-        build.buffers.add(positions); // only this frame's BLAS build consumes positions — always per-frame
-        if (entityId >= 0) {
-            // Hand idx/uv/prim to the entity's rigid-reuse cache (later reuse frames keep reading them via
-            // the geometry table) and snapshot the verts this AS now contains as the fit reference.
-            EntityAccel ea = entityAccels.get(entityId); // created by refitOrBuild above
-            releaseRefBuffers(ea);
-            ea.refAccel = accel;
-            ea.refIndices = indices;
-            ea.refUvs = uvs;
-            ea.refPrim = prim;
-            int size = capture.verts.size();
-            if (ea.refVerts == null || ea.refVerts.length < size) {
-                ea.refVerts = new float[size];
-            }
-            System.arraycopy(capture.verts.elements(), 0, ea.refVerts, 0, size);
-            ea.refVertCount = vertCount;
-            ea.refIdxCount = idxCount;
-            ea.refShadeHash = shadeHash();
-        } else {
-            build.buffers.add(indices);
-            build.buffers.add(uvs);
-            build.buffers.add(prim);
-        }
+        build.buffers.add(positions);
+        build.buffers.add(indices);
+        build.buffers.add(uvs);
+        build.buffers.add(prim);
         build.count++;
     }
 
-    /** Defer-release an entity's superseded rigid-reuse cache buffers (in-flight frames may still read them). */
-    private void releaseRefBuffers(EntityAccel ea) {
-        RtBuffer idx = ea.refIndices;
-        RtBuffer uv = ea.refUvs;
-        RtBuffer pr = ea.refPrim;
+    /** Pack one changed entity's four logical geometry regions into one flushed, cache-owned backing. */
+    private void appendPackedEntity(RtContext ctx, FrameBuild build, Motion motion, int entityId,
+                                    int instanceBit, int mask, float[] instanceTransform) {
+        int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        int vertCount = capture.verts.size() / 3;
+        int idxCount = capture.idx.size();
+        EntityGeometryLayout layout = EntityGeometryLayout.create(capture.verts.size(), capture.idx.size(),
+                capture.uvList.size(), capture.prim.size());
+
+        RtBuffer geometry;
+        long allocStart = RtFrameStats.FRAME.startStage();
+        try {
+            geometry = allocBuffer(ctx, Math.addExact(layout.totalBytes,
+                            EntityGeometryLayout.REGION_ALIGNMENT - 1L),
+                    asInput | storage, true, "entity geometry");
+            layout = layout.shifted((-geometry.deviceAddress) & (EntityGeometryLayout.REGION_ALIGNMENT - 1L));
+            RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.append.alloc", allocStart);
+        }
+
+        long copyStart = RtFrameStats.FRAME.startStage();
+        try {
+            MemoryUtil.memFloatBuffer(geometry.mapped + layout.positionOffset, capture.verts.size())
+                    .put(capture.verts.elements(), 0, capture.verts.size());
+            MemoryUtil.memIntBuffer(geometry.mapped + layout.indexOffset, capture.idx.size())
+                    .put(capture.idx.elements(), 0, capture.idx.size());
+            MemoryUtil.memFloatBuffer(geometry.mapped + layout.uvOffset, capture.uvList.size())
+                    .put(capture.uvList.elements(), 0, capture.uvList.size());
+            MemoryUtil.memFloatBuffer(geometry.mapped + layout.primOffset, capture.prim.size())
+                    .put(capture.prim.elements(), 0, capture.prim.size());
+            geometry.flush();
+            RtFrameStats.FRAME.count("entityUploadBytes", layout.logicalBytes);
+            RtFrameStats.FRAME.count("entityPackedBytes", geometry.size);
+            RtFrameStats.FRAME.count("entityPackedPaddingBytes", geometry.size - layout.logicalBytes);
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.append.copy", copyStart);
+        }
+
+        long positionAddr = Math.addExact(geometry.deviceAddress, layout.positionOffset);
+        long indexAddr = Math.addExact(geometry.deviceAddress, layout.indexOffset);
+        long uvAddr = Math.addExact(geometry.deviceAddress, layout.uvOffset);
+        long primAddr = Math.addExact(geometry.deviceAddress, layout.primOffset);
+        RtAccel accel;
+        long blasStart = RtFrameStats.FRAME.startStage();
+        try {
+            accel = refitOrBuild(ctx, build, entityId, positionAddr, indexAddr, vertCount, idxCount);
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.append.blas", blasStart);
+        }
+
+        writeTableEntry(build, primAddr, indexAddr, uvAddr, motion.dispAddr,
+                motion.rigidX, motion.rigidY, motion.rigidZ);
+        build.instances.add(new RtAccel.Instance(instanceTransform, accel.deviceAddress,
+                instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
+
+        EntityAccel ea = entityAccels.get(entityId); // created by refitOrBuild above
+        releaseRefGeometry(ea);
+        ea.refAccel = accel;
+        ea.refGeometry = geometry;
+        ea.refIndexAddr = indexAddr;
+        ea.refUvAddr = uvAddr;
+        ea.refPrimAddr = primAddr;
+        ea.refPositionBytes = layout.positionBytes;
+        retainedPositionBytes = Math.addExact(retainedPositionBytes, layout.positionBytes);
+        int size = capture.verts.size();
+        if (ea.refVerts == null || ea.refVerts.length < size) {
+            ea.refVerts = new float[size];
+        }
+        System.arraycopy(capture.verts.elements(), 0, ea.refVerts, 0, size);
+        ea.refVertCount = vertCount;
+        ea.refIdxCount = idxCount;
+        ea.refShadeHash = shadeHash();
+        build.count++;
+    }
+
+    /** Defer-release an entity's superseded packed geometry while in-flight frames may still read it. */
+    private void releaseRefGeometry(EntityAccel ea) {
+        RtBuffer geometry = ea.refGeometry;
         ea.refAccel = null;
-        ea.refIndices = null;
-        ea.refUvs = null;
-        ea.refPrim = null;
-        if (idx == null && uv == null && pr == null) {
+        ea.refGeometry = null;
+        ea.refIndexAddr = 0L;
+        ea.refUvAddr = 0L;
+        ea.refPrimAddr = 0L;
+        retainedPositionBytes = Math.subtractExact(retainedPositionBytes, ea.refPositionBytes);
+        ea.refPositionBytes = 0L;
+        if (geometry == null) {
             return;
         }
         long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-        deferred.add(new Deferred(freeAt, () -> {
-            if (idx != null) {
-                idx.destroy();
-            }
-            if (uv != null) {
-                uv.destroy();
-            }
-            if (pr != null) {
-                pr.destroy();
-            }
-        }));
+        deferred.add(new Deferred(freeAt, geometry::destroy));
     }
 
     /** Upload a per-vertex displacement array to a fresh per-frame buffer; returns its address (0 if null). */
@@ -1415,9 +1473,9 @@ public final class RtEntities {
      * Refit-or-build this entity's persistent acceleration structure. Cycles the entity's ring to a slot
      * that is off all queues, then records an in-place UPDATE (cheap refit) when the slot already holds an
      * AS of the same topology, else a full ALLOW_UPDATE BUILD (first use of the slot, a topology change, or
-     * the periodic BVH-quality rebuild). The mesh buffers + scratch are per-frame transients; the AS persists.
+     * the periodic BVH-quality rebuild). Scratch is per-frame; the packed mesh owner and AS persist for reuse.
      */
-    private RtAccel refitOrBuild(RtContext ctx, FrameBuild build, int entityId, RtBuffer positions, RtBuffer indices,
+    private RtAccel refitOrBuild(RtContext ctx, FrameBuild build, int entityId, long positionAddr, long indexAddr,
                                  int vertCount, int idxCount) {
         int triCount = idxCount / 3;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -1438,7 +1496,7 @@ public final class RtEntities {
             RtBuffer scratch = allocBuffer(ctx, RtAccel.scratchBufferSize(ctx, slot.updateScratchSize), storage, false,
                     "entity refit scratch");
             RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
-            build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positions.deviceAddress, indices.deviceAddress, vertCount, idxCount, false,
+            build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positionAddr, indexAddr, vertCount, idxCount, false,
                     "entity BLAS refit"));
             build.refitScratch.add(scratch);
             slot.updatesSinceBuild++;
@@ -1452,7 +1510,7 @@ public final class RtEntities {
         } else if (slot.accel != null) {
             deferDestroyAccel(slot.accel, slot.backing);
         }
-        RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, positions, vertCount, indices, idxCount, false,
+        RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, positionAddr, vertCount, indexAddr, idxCount, false,
                 "entity BLAS");
         RtFrameStats.FRAME.count("entityVmaBufferCreates", 2); // persistent AS backing + transient build scratch
         slot.accel = ub.accel();
@@ -1496,21 +1554,18 @@ public final class RtEntities {
         }
     }
 
-    /** Immediately destroy an evicted entity's rigid-reuse cache buffers (already off-queue). */
+    /** Immediately destroy an evicted entity's packed rigid-reuse geometry (already off-queue). */
     private void releaseCacheBuffersNow(EntityAccel ea) {
         ea.refAccel = null;
-        if (ea.refIndices != null) {
-            ea.refIndices.destroy();
-            ea.refIndices = null;
+        if (ea.refGeometry != null) {
+            ea.refGeometry.destroy();
+            ea.refGeometry = null;
         }
-        if (ea.refUvs != null) {
-            ea.refUvs.destroy();
-            ea.refUvs = null;
-        }
-        if (ea.refPrim != null) {
-            ea.refPrim.destroy();
-            ea.refPrim = null;
-        }
+        ea.refIndexAddr = 0L;
+        ea.refUvAddr = 0L;
+        ea.refPrimAddr = 0L;
+        retainedPositionBytes = Math.subtractExact(retainedPositionBytes, ea.refPositionBytes);
+        ea.refPositionBytes = 0L;
     }
 
     private void setCamera(double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {

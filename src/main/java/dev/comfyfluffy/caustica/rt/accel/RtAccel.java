@@ -459,17 +459,25 @@ public final class RtAccel {
      */
     public static UpdatableBuild prepareUpdatableBlasBuild(RtContext ctx, RtBuffer positions, int vertexCount,
                                                            RtBuffer indices, int indexCount, boolean opaque, String label) {
+        return prepareUpdatableBlasBuild(ctx, positions.deviceAddress, vertexCount,
+                indices.deviceAddress, indexCount, opaque, label);
+    }
+
+    /** Address-based variant for entity geometry packed into sub-regions of one owner buffer. */
+    public static UpdatableBuild prepareUpdatableBlasBuild(RtContext ctx, long vertexAddr, int vertexCount,
+                                                           long indexAddr, int indexCount, boolean opaque, String label) {
         VkDevice vk = ctx.vk();
         String debugLabel = labelOr(label, "updatable BLAS");
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, true);
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, vertexAddr, indexAddr,
+                    vertexCount, indexCount, opaque, true);
             long accelSize = sizes.accelerationStructureSize();
             long updateScratch = sizes.updateScratchSize();
             RtBuffer backing = ctx.createBuffer(accelSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
                     debugLabel + " backing");
             RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
             RtAccel accel = createBlasOn(ctx, stack, backing, accelSize, false, debugLabel);
-            PreparedBlas op = new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress,
+            PreparedBlas op = new PreparedBlas(accel, scratch, backing, vertexAddr, indexAddr,
                     vertexCount - 1, indexCount / 3, opaque, debugLabel, true, false);
             return new UpdatableBuild(op, accel, backing, scratch, updateScratch);
         }
@@ -503,8 +511,16 @@ public final class RtAccel {
 
     private static VkAccelerationStructureBuildSizesInfoKHR queryBlasSizes(VkDevice vk, MemoryStack stack, RtBuffer positions,
                                                                            RtBuffer indices, int vertexCount, int indexCount, boolean opaque, boolean allowUpdate) {
-        VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, positions.deviceAddress,
-                indices.deviceAddress, vertexCount, opaque);
+        return queryBlasSizes(vk, stack, positions.deviceAddress, indices.deviceAddress,
+                vertexCount, indexCount, opaque, allowUpdate);
+    }
+
+    private static VkAccelerationStructureBuildSizesInfoKHR queryBlasSizes(VkDevice vk, MemoryStack stack,
+                                                                           long vertexAddr, long indexAddr,
+                                                                           int vertexCount, int indexCount,
+                                                                           boolean opaque, boolean allowUpdate) {
+        VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, vertexAddr, indexAddr,
+                vertexCount, opaque);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
                 .flags(buildFlags(allowUpdate))
