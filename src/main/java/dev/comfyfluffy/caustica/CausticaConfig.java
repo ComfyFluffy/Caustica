@@ -600,9 +600,9 @@ public final class CausticaConfig {
             }
 
             public static int entityBufferListCapacity() {
-                // At most one transient displacement per table entry; dynamic entity geometry is now
-                // cache-owned packed storage. Leave room for the combined particle mesh's five buffers.
-                return (int) Math.min(Integer.MAX_VALUE, (long) entityListCapacity() + 8L);
+                // Dynamic motion is suballocated from a frame arena and entity geometry is ring-owned.
+                // Only the combined particle mesh's four transient geometry buffers remain here.
+                return 8;
             }
 
             public static int entityMapCapacity() {
