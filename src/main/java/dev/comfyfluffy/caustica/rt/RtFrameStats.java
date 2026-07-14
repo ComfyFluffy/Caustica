@@ -70,7 +70,8 @@ public final class RtFrameStats {
                     "frame.copyOutput"
             },
             new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted", "entitiesCaptured", "refits",
-                    "entityReuse", "vmaBufferCreates", "entityModelSubmissions", "entityCuboids",
+                    "entityReuse", "entityStateReuses", "entityStateExtractions", "vmaBufferCreates",
+                    "entityModelSubmissions", "entityCuboids",
                     "entityModelQuads", "entityModelVertices", "entityBakedQuads", "entityBakedVertices",
                     "entityDirectSubmissions", "entityDirectFallbacks", "entityDirectQuads", "entityDirectVertices",
                     "entitySpecializedCuboids", "entityGenericCuboids",

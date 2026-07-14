@@ -172,6 +172,11 @@ public final class RtEntities {
     private final RtEntityCapture capture = new RtEntityCapture();
     private final PoseStack entityPoseStack = new PoseStack();
     private CameraRenderState cameraState;
+    // Vanilla LevelExtractor has already built these states before world rendering. Hold them through the
+    // LevelRenderer submission/clear so RT can consume the same immutable frame state instead of extracting
+    // every visible entity a second time. Identity keys preserve exact entity ownership without id reuse risk.
+    private final IdentityHashMap<Entity, EntityRenderState> vanillaEntityStates = new IdentityHashMap<>();
+    private boolean recordVanillaEntityStates;
 
     // Particle capture: a VertexConsumer adapter that funnels MC's billboard quads into `capture` (the
     // shared entity mesh). We extract each live particle into `particleScratch`, accumulate per-vertex
@@ -339,6 +344,19 @@ public final class RtEntities {
     }
 
     private record Motion(long dispAddr, float rigidX, float rigidY, float rigidZ) {
+    }
+
+    /** Begin vanilla's visible-entity extraction for a new frame. Called by {@code LevelExtractorMixin}. */
+    public void beginVanillaEntityExtraction() {
+        vanillaEntityStates.clear();
+        recordVanillaEntityStates = enabled();
+    }
+
+    /** Retain one vanilla-extracted state until the RT entity pass consumes it later in the same frame. */
+    public void recordVanillaEntityState(Entity entity, EntityRenderState state) {
+        if (recordVanillaEntityStates) {
+            vanillaEntityStates.put(entity, state);
+        }
     }
 
     private record EntityBuildTarget(EntityAccel entity, EntitySlot slot) {
@@ -625,12 +643,17 @@ public final class RtEntities {
             EntityPrev prev = prevVerts.get(id);
             capture.reset(prev != null ? prev.size / 3 : 0);
             try {
-                EntityRenderState state;
-                long extractStart = RtFrameStats.FRAME.startStage();
-                try {
-                    state = dispatcher.extractEntity(entity, partial);
-                } finally {
-                    RtFrameStats.FRAME.endStage("entity.capture.extract", extractStart);
+                EntityRenderState state = vanillaEntityStates.remove(entity);
+                if (state != null) {
+                    RtFrameStats.FRAME.count("entityStateReuses", 1);
+                } else {
+                    long extractStart = RtFrameStats.FRAME.startStage();
+                    try {
+                        state = dispatcher.extractEntity(entity, partial);
+                        RtFrameStats.FRAME.count("entityStateExtractions", 1);
+                    } finally {
+                        RtFrameStats.FRAME.endStage("entity.capture.extract", extractStart);
+                    }
                 }
                 // extractEntity already ran EntityRenderer.extractNameTags (shouldShowName, crosshair-look,
                 // distance cutoff, the attachment point) as a normal part of building the render state — no
@@ -701,6 +724,9 @@ public final class RtEntities {
             }
             RtFrameStats.FRAME.count("entitiesCaptured", 1);
         }
+        // Release vanilla states for culled/unsupported/over-cap entities immediately; never retain a
+        // render-state graph (notably item quad lists) beyond the frame that produced it.
+        vanillaEntityStates.clear();
         Int2ObjectOpenHashMap<EntityPrev> oldPrev = prevVerts;
         prevVerts = curVerts;
         curVerts = oldPrev;
