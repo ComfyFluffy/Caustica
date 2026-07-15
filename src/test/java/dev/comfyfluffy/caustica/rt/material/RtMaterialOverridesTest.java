@@ -5,7 +5,9 @@ import net.minecraft.resources.Identifier;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class RtMaterialOverridesTest {
     @Test
@@ -41,5 +43,21 @@ final class RtMaterialOverridesTest {
                 JsonParser.parseString("{\"format\":1,\"match\":{\"sprite\":\"minecraft:block/stone\"},"
                         + "\"base\":{\"metalness\":2}}")
                         .getAsJsonObject(), Identifier.parse("test:bad.json")));
+    }
+
+    @Test
+    void spriteWideRulesApplyToCompiledEntityResources() {
+        var entityRule = RtMaterialOverrides.parse(JsonParser.parseString("""
+                {"format":1,"match":{"sprite":"minecraft:entity/zombie/zombie"},
+                "base":{"roughness":0.7}}
+                """).getAsJsonObject(), Identifier.parse("test:entity.json"));
+        var blockRule = RtMaterialOverrides.parse(JsonParser.parseString("""
+                {"format":1,"match":{"sprite":"minecraft:entity/zombie/zombie",
+                "block":"minecraft:stone"}}
+                """).getAsJsonObject(), Identifier.parse("test:block.json"));
+
+        assertTrue(entityRule.matchesEntity(Identifier.parse("minecraft:entity/zombie/zombie")));
+        assertFalse(entityRule.matchesEntity(Identifier.parse("minecraft:entity/zombie/husk")));
+        assertFalse(blockRule.matchesEntity(Identifier.parse("minecraft:entity/zombie/zombie")));
     }
 }

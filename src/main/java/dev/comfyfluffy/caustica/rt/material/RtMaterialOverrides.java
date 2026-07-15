@@ -121,6 +121,10 @@ public final class RtMaterialOverrides {
             return value != null && sprite.equals(value.contents().name());
         }
 
+        boolean matchesEntity(Identifier value) {
+            return block == null && sprite.equals(value);
+        }
+
         boolean matches(TextureAtlasSprite value, BlockState state) {
             if (!matchesSprite(value)) return false;
             return block == null || state != null && block.equals(BuiltInRegistries.BLOCK.getKey(state.getBlock()));

@@ -17,17 +17,19 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-/** Compiles block LabPBR inputs into compact canonical pages with explicit semantic mip chains. */
+/** Compiles block and entity LabPBR inputs into canonical pages with explicit semantic mip chains. */
 public final class RtBlockMaterials {
     public static final RtBlockMaterials INSTANCE = new RtBlockMaterials();
 
-    public static final int HAS_S = 1;
-    public static final int HAS_N = 2;
+    public static final int HAS_SPEC = 1;
+    public static final int HAS_NORMAL = 2;
     public static final int HAS_HEURISTIC_EMISSION = 4;
     public static final int HAS_OVERRIDE_EMISSION_MASK = 8;
 
@@ -38,6 +40,10 @@ public final class RtBlockMaterials {
     private static final int PACK_ALIGNMENT = 1 << MAX_VALID_LOD;
 
     private final Map<TextureAtlasSprite, Entry> entries = new IdentityHashMap<>();
+    // Logical full-texture/sprite name (entity/zombie/zombie or entity/chest/normal)
+    // (entity/chest/normal) -> canonical page mapping. Unlike block entries, albedo UVs are filled by
+    // the material-table registry: full textures use [0,1], atlas sprites append their actual atlas rect.
+    private final Map<Identifier, Entry> resourceEntries = new HashMap<>();
     private final List<Page> pages = new ArrayList<>();
     private Entry fallback;
     private boolean loggedFailure;
@@ -64,6 +70,8 @@ public final class RtBlockMaterials {
 
     private static final class Candidate {
         final TextureAtlasSprite sprite;
+        final Identifier name;
+        final Identifier albedoLocation;
         final int features;
         final Identifier specLocation;
         final Identifier normalLocation;
@@ -75,14 +83,20 @@ public final class RtBlockMaterials {
         RtMaterialDesc.EmissionSummary emissionSummary = RtMaterialDesc.EmissionSummary.NONE;
         RtMaterialDesc.EmissionSummary overrideEmissionSummary = RtMaterialDesc.EmissionSummary.NONE;
 
-        Candidate(TextureAtlasSprite sprite, int features, Identifier specLocation,
-                  Identifier normalLocation, int width, int height) {
+        Candidate(TextureAtlasSprite sprite, Identifier name, Identifier albedoLocation, int features,
+                  Identifier specLocation, Identifier normalLocation, int width, int height) {
             this.sprite = sprite;
+            this.name = name;
+            this.albedoLocation = albedoLocation;
             this.features = features;
             this.specLocation = specLocation;
             this.normalLocation = normalLocation;
             this.width = width;
             this.height = height;
+        }
+
+        boolean blockSprite() {
+            return sprite != null;
         }
     }
 
@@ -118,12 +132,13 @@ public final class RtBlockMaterials {
     /** Drop the previous epoch's CPU mappings and GPU pages. Caller owns the idle/reload boundary. */
     public void reset() {
         entries.clear();
+        resourceEntries.clear();
         fallback = null;
         for (Page page : pages) page.destroy();
         pages.clear();
     }
 
-    /** Compile, pack, mip, upload, and publish every block-atlas material page. */
+    /** Compile, pack, mip, upload, and publish block-atlas plus authored entity material pages. */
     public void prepareAll(RtContext ctx, int descriptorCapacity, RtEmissionSemantics emissionSemantics,
                            RtMaterialOverrides overrides) {
         List<TextureAtlasSprite> sprites = blockSprites();
@@ -140,16 +155,16 @@ public final class RtBlockMaterials {
             Identifier normal = sibling(name, "_n.png");
             int features = 0;
             if (resourceExists(spec)) {
-                features |= HAS_S;
+                features |= HAS_SPEC;
                 specCount++;
             }
             if (resourceExists(normal)) {
-                features |= HAS_N;
+                features |= HAS_NORMAL;
                 normalCount++;
             }
             // Authored LabPBR owns emission whenever _s exists. Albedo inference is only compiled for
             // sprites proven to occur on an emitting block state.
-            if ((features & HAS_S) == 0 && emissionSemantics.permits(sprite)) {
+            if ((features & HAS_SPEC) == 0 && emissionSemantics.permits(sprite)) {
                 features |= HAS_HEURISTIC_EMISSION;
                 heuristicCount++;
             }
@@ -161,7 +176,27 @@ public final class RtBlockMaterials {
                 int width = sprite.contents().width();
                 int height = sprite.contents().height();
                 largest = Math.max(largest, Math.max(width, height) + 2 * GUTTER);
-                authored.add(new Candidate(sprite, features, spec, normal, width, height));
+                authored.add(new Candidate(sprite, name, null, features, spec, normal, width, height));
+            }
+        }
+        Map<Identifier, Integer> resourceFeatures = discoverEntityMaterialResources(sprites, overrides);
+        for (Map.Entry<Identifier, Integer> discovered : resourceFeatures.entrySet()) {
+            Identifier albedo = discovered.getKey();
+            int features = discovered.getValue();
+            try (NativeImage image = load(albedo)) {
+                if (image == null || image.getWidth() <= 0 || image.getHeight() <= 0) continue;
+                Identifier name = logicalTextureName(albedo);
+                int width = image.getWidth();
+                int height = image.getHeight();
+                Identifier spec = siblingTexture(albedo, "_s");
+                Identifier normal = siblingTexture(albedo, "_n");
+                largest = Math.max(largest, Math.max(width, height) + 2 * GUTTER);
+                authored.add(new Candidate(null, name, albedo, features, spec, normal, width, height));
+                if ((features & HAS_SPEC) != 0) specCount++;
+                if ((features & HAS_NORMAL) != 0) normalCount++;
+                if ((features & HAS_OVERRIDE_EMISSION_MASK) != 0) overrideMaskCount++;
+            } catch (Throwable t) {
+                warnOnce("RT entity material albedo load failed for " + albedo, t);
             }
         }
 
@@ -176,7 +211,7 @@ public final class RtBlockMaterials {
         }
         authored.sort(Comparator.<Candidate>comparingInt(candidate -> candidate.height).reversed()
                 .thenComparing(Comparator.comparingInt((Candidate candidate) -> candidate.width).reversed())
-                .thenComparing(candidate -> candidate.sprite.contents().name().toString()));
+                .thenComparing(candidate -> candidate.name.toString()));
 
         List<LayoutPage> layouts = new ArrayList<>();
         layouts.add(new LayoutPage(pageSize, true));
@@ -214,7 +249,7 @@ public final class RtBlockMaterials {
                     candidate.overrideEmissionSummary = decoded.overrideEmissionSummary();
                     pixels.write(candidate, decoded.levels());
                 } catch (Throwable t) {
-                    warnOnce("RT canonical material decode failed for " + candidate.sprite.contents().name(), t);
+                    warnOnce("RT canonical material decode failed for " + candidate.name, t);
                     candidate.page = -1;
                 }
             }
@@ -241,13 +276,16 @@ public final class RtBlockMaterials {
             int maxLod = Math.min(MAX_VALID_LOD,
                     31 - Integer.numberOfLeadingZeros(Math.max(candidate.width, candidate.height)));
             int slot = pages.get(candidate.page).textureSlot;
-            entries.put(candidate.sprite, new Entry(candidate.features, slot, maxLod,
+            Entry entry = new Entry(candidate.features, slot, maxLod,
                     candidate.x / (float) pageSize, candidate.y / (float) pageSize,
                     candidate.width / (float) pageSize, candidate.height / (float) pageSize,
-                    candidate.sprite.getU0(), candidate.sprite.getV0(),
-                    inverseExtent(candidate.sprite.getU1() - candidate.sprite.getU0()),
-                    inverseExtent(candidate.sprite.getV1() - candidate.sprite.getV0()),
-                    candidate.emissionSummary, candidate.overrideEmissionSummary));
+                    candidate.blockSprite() ? candidate.sprite.getU0() : 0.0f,
+                    candidate.blockSprite() ? candidate.sprite.getV0() : 0.0f,
+                    candidate.blockSprite() ? inverseExtent(candidate.sprite.getU1() - candidate.sprite.getU0()) : 1.0f,
+                    candidate.blockSprite() ? inverseExtent(candidate.sprite.getV1() - candidate.sprite.getV0()) : 1.0f,
+                    candidate.emissionSummary, candidate.overrideEmissionSummary);
+            if (candidate.blockSprite()) entries.put(candidate.sprite, entry);
+            else resourceEntries.put(candidate.name, entry);
         }
 
         long bytesPerBundle = 0L;
@@ -256,8 +294,8 @@ public final class RtBlockMaterials {
             bytesPerBundle += (long) w * w * 4L;
             w = Math.max(1, w / 2);
         }
-        CausticaMod.LOGGER.info("RT canonical material pages: sprites={}, spec={}, normal={}, heuristicEmission={}, overrideMasks={}, pages={}, size={}x{}, validLod<={}, gpuMiB={}",
-                sprites.size(), specCount, normalCount, heuristicCount, overrideMaskCount,
+        CausticaMod.LOGGER.info("RT canonical material pages: blockSprites={}, entityResources={}, spec={}, normal={}, heuristicEmission={}, overrideMasks={}, pages={}, size={}x{}, validLod<={}, gpuMiB={}",
+                sprites.size(), resourceEntries.size(), specCount, normalCount, heuristicCount, overrideMaskCount,
                 pages.size(), pageSize, pageSize, MAX_VALID_LOD,
                 String.format(java.util.Locale.ROOT, "%.2f", bytesPerBundle * pages.size() * 3.0 / (1024.0 * 1024.0)));
     }
@@ -282,6 +320,10 @@ public final class RtBlockMaterials {
         return Collections.unmodifiableMap(new IdentityHashMap<>(entries));
     }
 
+    public Map<Identifier, Entry> preparedResourceEntries() {
+        return Collections.unmodifiableMap(new HashMap<>(resourceEntries));
+    }
+
     public void destroy() {
         reset();
     }
@@ -300,8 +342,9 @@ public final class RtBlockMaterials {
     }
 
     private static Decoded decode(Candidate candidate) throws Exception {
-        NativeImage spec = (candidate.features & HAS_S) != 0 ? load(candidate.specLocation) : null;
-        NativeImage normal = (candidate.features & HAS_N) != 0 ? load(candidate.normalLocation) : null;
+        NativeImage spec = (candidate.features & HAS_SPEC) != 0 ? load(candidate.specLocation) : null;
+        NativeImage normal = (candidate.features & HAS_NORMAL) != 0 ? load(candidate.normalLocation) : null;
+        NativeImage resourceAlbedo = candidate.blockSprite() ? null : load(candidate.albedoLocation);
         try {
             int width = candidate.width;
             int height = candidate.height;
@@ -310,7 +353,9 @@ public final class RtBlockMaterials {
             float[] surface1 = new float[surface0.length];
             float[] linearAlbedo = new float[surface0.length];
             float[] authoredEmission = spec != null ? new float[width * height] : null;
-            NativeImage albedo = ((SpriteContentsAccessor) candidate.sprite.contents()).caustica$originalImage();
+            NativeImage albedo = candidate.blockSprite()
+                    ? ((SpriteContentsAccessor) candidate.sprite.contents()).caustica$originalImage()
+                    : resourceAlbedo;
             for (int y = 0; y < height; y++) {
                 for (int x = 0; x < width; x++) {
                     int i = (y * width + x) * 4;
@@ -324,7 +369,7 @@ public final class RtBlockMaterials {
                     linearAlbedo[i + 2] = ab;
                     linearAlbedo[i + 3] = aa;
                     if (spec != null) {
-                        int pixel = sample(spec, x, y, width, height);
+                        int pixel = sample(spec, x, y, width, height, candidate.blockSprite());
                         RtLabPbr.Specular decoded = RtLabPbr.decodeSpec(
                                 ARGB.red(pixel) / 255.0f, ARGB.green(pixel) / 255.0f,
                                 ARGB.blue(pixel) / 255.0f, ARGB.alpha(pixel) / 255.0f, ar, ag, ab);
@@ -341,7 +386,7 @@ public final class RtBlockMaterials {
                         surface1[i] = surface1[i + 1] = surface1[i + 2] = 0.04f;
                     }
                     if (normal != null) {
-                        int pixel = sample(normal, x, y, width, height);
+                        int pixel = sample(normal, x, y, width, height, candidate.blockSprite());
                         float nx = ARGB.red(pixel) / 127.5f - 1.0f;
                         float ny = ARGB.green(pixel) / 127.5f - 1.0f;
                         float lengthSq = nx * nx + ny * ny;
@@ -384,6 +429,7 @@ public final class RtBlockMaterials {
         } finally {
             if (spec != null) spec.close();
             if (normal != null) normal.close();
+            if (resourceAlbedo != null) resourceAlbedo.close();
         }
     }
 
@@ -462,8 +508,60 @@ public final class RtBlockMaterials {
         return sprites != null ? sprites : List.of();
     }
 
+    private static Map<Identifier, Integer> discoverEntityMaterialResources(
+            List<TextureAtlasSprite> blockSprites, RtMaterialOverrides overrides) {
+        Map<Identifier, Boolean> blockNames = new HashMap<>();
+        for (TextureAtlasSprite sprite : blockSprites) {
+            if (sprite != null) blockNames.put(sprite.contents().name(), Boolean.TRUE);
+        }
+        Map<Identifier, Integer> result = new LinkedHashMap<>();
+        Map<Identifier, Resource> authored = Minecraft.getInstance().getResourceManager().listResources(
+                "textures", id -> id.getPath().endsWith("_s.png") || id.getPath().endsWith("_n.png"));
+        List<Identifier> ordered = new ArrayList<>(authored.keySet());
+        ordered.sort(Comparator.comparing(Identifier::toString));
+        for (Identifier material : ordered) {
+            String path = material.getPath();
+            boolean spec = path.endsWith("_s.png");
+            String albedoPath = path.substring(0, path.length() - 6) + ".png";
+            Identifier albedo = Identifier.fromNamespaceAndPath(material.getNamespace(), albedoPath);
+            Identifier name = logicalTextureName(albedo);
+            if (blockNames.containsKey(name) || !resourceExists(albedo)) continue;
+            result.merge(albedo, spec ? HAS_SPEC : HAS_NORMAL, (a, b) -> a | b);
+        }
+        for (RtMaterialOverrides.Rule rule : overrides.rules()) {
+            if (rule.block() != null || blockNames.containsKey(rule.sprite())) {
+                continue;
+            }
+            Identifier albedo = textureLocation(rule.sprite());
+            if (resourceExists(albedo)) {
+                int feature = rule.emissionStrength() != null && rule.emissionStrength() > 0.0f
+                        ? HAS_OVERRIDE_EMISSION_MASK : 0;
+                result.merge(albedo, feature, (a, b) -> a | b);
+            }
+        }
+        return result;
+    }
+
     private static Identifier sibling(Identifier name, String suffix) {
         return Identifier.fromNamespaceAndPath(name.getNamespace(), "textures/" + name.getPath() + suffix);
+    }
+
+    private static Identifier textureLocation(Identifier logicalName) {
+        return Identifier.fromNamespaceAndPath(logicalName.getNamespace(),
+                "textures/" + logicalName.getPath() + ".png");
+    }
+
+    private static Identifier logicalTextureName(Identifier textureLocation) {
+        String path = textureLocation.getPath();
+        if (path.startsWith("textures/")) path = path.substring("textures/".length());
+        if (path.endsWith(".png")) path = path.substring(0, path.length() - 4);
+        return Identifier.fromNamespaceAndPath(textureLocation.getNamespace(), path);
+    }
+
+    private static Identifier siblingTexture(Identifier albedo, String suffix) {
+        String path = albedo.getPath();
+        if (path.endsWith(".png")) path = path.substring(0, path.length() - 4);
+        return Identifier.fromNamespaceAndPath(albedo.getNamespace(), path + suffix + ".png");
     }
 
     private static boolean resourceExists(Identifier location) {
@@ -478,10 +576,10 @@ public final class RtBlockMaterials {
         }
     }
 
-    private static int sample(NativeImage image, int x, int y, int width, int height) {
-        int frameHeight = Math.min(image.getHeight(), image.getWidth());
+    private static int sample(NativeImage image, int x, int y, int width, int height, boolean firstFrameOnly) {
+        int sampledHeight = firstFrameOnly ? Math.min(image.getHeight(), image.getWidth()) : image.getHeight();
         int sx = Math.min(image.getWidth() - 1, x * image.getWidth() / width);
-        int sy = Math.min(frameHeight - 1, y * frameHeight / height);
+        int sy = Math.min(sampledHeight - 1, y * sampledHeight / height);
         return image.getPixel(sx, sy);
     }
 

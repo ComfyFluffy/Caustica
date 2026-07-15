@@ -8,6 +8,7 @@ import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.gen.MaterialHeaderData;
 import dev.comfyfluffy.caustica.rt.gen.MaterialHeaderData.Float4;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.resources.Identifier;
 import net.minecraft.util.ARGB;
 import net.minecraft.world.level.block.state.BlockState;
 import org.lwjgl.system.MemoryUtil;
@@ -18,13 +19,17 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
- * Immutable, resource-epoch terrain material registry. The render thread compiles and uploads it after
- * the block material atlases are prepared; terrain workers only read the published {@link Snapshot}.
+ * Resource-epoch material registry shared by terrain, entities, block entities and item geometry. Terrain
+ * workers read an immutable {@link Snapshot}; entity atlas headers may append into pre-reserved table slots
+ * because their stitched UV rectangles only become available during capture. Published records never mutate.
  */
 public final class RtTerrainMaterials {
     public static final RtTerrainMaterials INSTANCE = new RtTerrainMaterials();
@@ -49,15 +54,27 @@ public final class RtTerrainMaterials {
     private volatile Snapshot snapshot;
     private RtBuffer table;
     private long nextEpoch;
+    private Map<Identifier, Integer> entityTextureIds = Map.of();
+    private Map<Identifier, EntityTemplate> entityTemplates = Map.of();
+    private final IdentityHashMap<TextureAtlasSprite, Integer> entitySpriteIds = new IdentityHashMap<>();
+    private int entityFallbackId;
+    private int nextDynamicId;
+    private int tableCapacity;
+
+    private record EntityTemplate(RtMaterialDesc desc, RtBlockMaterials.Entry entry) {
+    }
 
     private RtTerrainMaterials() {
     }
 
-    /** Build and atomically publish a complete registry for the currently prepared block atlas. */
+    /** Build and atomically publish the block and entity registry for the current resource epoch. */
     public void rebuild(RtContext ctx, RtBlockMaterials blockMaterials, RtMaterialOverrides overrides) {
         Map<TextureAtlasSprite, RtBlockMaterials.Entry> entriesBySprite = blockMaterials.preparedEntries();
         List<TextureAtlasSprite> sprites = new ArrayList<>(entriesBySprite.keySet());
         sprites.sort(Comparator.comparing(sprite -> sprite.contents().name().toString()));
+        Map<Identifier, RtBlockMaterials.Entry> entriesByResource = blockMaterials.preparedResourceEntries();
+        List<Identifier> entityResources = new ArrayList<>(entriesByResource.keySet());
+        entityResources.sort(Comparator.comparing(Identifier::toString));
         RtBlockMaterials.Entry fallbackEntry = blockMaterials.entry(null);
 
         int profileVariants = RtMaterials.Profile.values().length * MODEL_VARIANTS * EMISSION_VARIANTS;
@@ -88,6 +105,9 @@ public final class RtTerrainMaterials {
         int lavaId = headers.size();
         add(headers, descriptions, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.LAVA,
                 true, true, uniformWhiteSummary()), whiteAverage(), fallbackEntry);
+        int nextEntityFallbackId = headers.size();
+        add(headers, descriptions, compileEntityDesc(0, true, RtMaterialDesc.EmissionSummary.NONE),
+                transparentWhiteAverage(), fallbackEntry);
 
         IdentityHashMap<TextureAtlasSprite, int[]> ids = new IdentityHashMap<>();
         List<MutableCompiledOverride> compiledOverrides = new ArrayList<>();
@@ -96,8 +116,8 @@ public final class RtTerrainMaterials {
         }
         for (TextureAtlasSprite sprite : sprites) {
             RtBlockMaterials.Entry entry = entriesBySprite.get(sprite);
-            int baseFeatures = ((entry.features() & RtBlockMaterials.HAS_S) != 0 ? FEATURE_SPEC : 0)
-                    | ((entry.features() & RtBlockMaterials.HAS_N) != 0 ? FEATURE_NORMAL : 0)
+            int baseFeatures = ((entry.features() & RtBlockMaterials.HAS_SPEC) != 0 ? FEATURE_SPEC : 0)
+                    | ((entry.features() & RtBlockMaterials.HAS_NORMAL) != 0 ? FEATURE_NORMAL : 0)
                     | ((entry.features() & RtBlockMaterials.HAS_HEURISTIC_EMISSION) != 0
                     ? FEATURE_HEURISTIC_EMISSION : 0);
             float[] average = averageColor(sprite);
@@ -141,12 +161,37 @@ public final class RtTerrainMaterials {
             }
         }
 
-        long byteSize = Math.multiplyExact((long) headers.size(), MaterialHeaderData.BYTE_SIZE);
+        Map<Identifier, Integer> nextEntityTextureIds = new HashMap<>();
+        Map<Identifier, EntityTemplate> nextEntityTemplates = new HashMap<>();
+        Set<RtMaterialOverrides.Rule> entityMatchedOverrides = new HashSet<>();
+        for (Identifier name : entityResources) {
+            RtBlockMaterials.Entry entry = entriesByResource.get(name);
+            int features = ((entry.features() & RtBlockMaterials.HAS_SPEC) != 0 ? FEATURE_SPEC : 0)
+                    | ((entry.features() & RtBlockMaterials.HAS_NORMAL) != 0 ? FEATURE_NORMAL : 0);
+            RtMaterialDesc desc = compileEntityDesc(features, false, entry.emissionSummary());
+            for (RtMaterialOverrides.Rule rule : overrides.rules()) {
+                if (!rule.matchesEntity(name)) continue;
+                desc = rule.apply(desc, entry.overrideEmissionSummary());
+                entityMatchedOverrides.add(rule);
+                break;
+            }
+            int id = headers.size();
+            add(headers, descriptions, desc, transparentWhiteAverage(), entry);
+            nextEntityTextureIds.put(name, id);
+            nextEntityTemplates.put(name, new EntityTemplate(desc, entry));
+        }
+
+        // Full entity textures have fixed [0,1] UVs and receive IDs above. Atlas sprites need a second,
+        // append-only header with the actual stitched atlas rectangle, which is only known when the sprite
+        // first appears in capture. Reserve one dynamic slot per authored entity resource.
+        int dynamicReserve = Math.max(64, Math.multiplyExact(entityResources.size(), 2));
+        int recordCapacity = Math.addExact(headers.size(), dynamicReserve);
+        long byteSize = Math.multiplyExact((long) recordCapacity, MaterialHeaderData.BYTE_SIZE);
         if (byteSize > Integer.MAX_VALUE) {
-            throw new IllegalStateException("RT terrain material table exceeds mapped-buffer limit: " + byteSize);
+            throw new IllegalStateException("RT material table exceeds mapped-buffer limit: " + byteSize);
         }
         RtBuffer nextTable = ctx.createBuffer(byteSize, VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                true, "terrain material table");
+                true, "material table");
         try {
             ByteBuffer mapped = MemoryUtil.memByteBuffer(nextTable.mapped, (int) byteSize)
                     .order(ByteOrder.nativeOrder());
@@ -167,13 +212,19 @@ public final class RtTerrainMaterials {
                 .filter(value -> !value.ids.isEmpty())
                 .map(MutableCompiledOverride::freeze).toList();
         for (MutableCompiledOverride compiled : compiledOverrides) {
-            if (compiled.ids.isEmpty()) {
-                CausticaMod.LOGGER.warn("RT material override {} matched no block-atlas sprite ({})",
+            if (compiled.ids.isEmpty() && !entityMatchedOverrides.contains(compiled.rule)) {
+                CausticaMod.LOGGER.warn("RT material override {} matched no compiled texture ({})",
                         compiled.rule.source(), compiled.rule.sprite());
             }
         }
         Snapshot next = new Snapshot(epoch, Collections.unmodifiableMap(ids), fallbackVariants, waterId, lavaId,
                 List.copyOf(descriptions), frozenOverrides);
+        entityTextureIds = Collections.unmodifiableMap(nextEntityTextureIds);
+        entityTemplates = Collections.unmodifiableMap(nextEntityTemplates);
+        entitySpriteIds.clear();
+        entityFallbackId = nextEntityFallbackId;
+        nextDynamicId = headers.size();
+        tableCapacity = recordCapacity;
         table = nextTable;
         snapshot = next; // volatile publication: map and arrays are never mutated afterward
         if (oldTable != null) oldTable.destroy();
@@ -189,8 +240,9 @@ public final class RtTerrainMaterials {
                 == RtMaterialDesc.EmissionSource.OVERRIDE).count();
         double averageCoverage = descriptions.stream().filter(desc -> desc.emissionSummary().emissive())
                 .mapToDouble(desc -> desc.emissionSummary().coverage()).average().orElse(0.0);
-        CausticaMod.LOGGER.info("RT terrain materials: epoch={}, records={}, sprites={}, overrideRules={}, matchedOverrides={}, emissive={}, labPbrEmission={}, heuristicMasks={}, uniformEmission={}, overrideEmission={}, avgEmissionCoverage={}, tableKiB={}",
-                epoch, headers.size(), sprites.size(), overrides.rules().size(), frozenOverrides.size(), emissive,
+        CausticaMod.LOGGER.info("RT materials: epoch={}, records={}, capacity={}, blockSprites={}, entityResources={}, overrideRules={}, matchedOverrides={}, emissive={}, labPbrEmission={}, heuristicMasks={}, uniformEmission={}, overrideEmission={}, avgEmissionCoverage={}, tableKiB={}",
+                epoch, headers.size(), recordCapacity, sprites.size(), entityResources.size(), overrides.rules().size(),
+                frozenOverrides.size() + entityMatchedOverrides.size(), emissive,
                 authoredEmission, inferred, uniformEmission, overrideEmission,
                 String.format(java.util.Locale.ROOT, "%.3f", averageCoverage), byteSize / 1024);
     }
@@ -212,13 +264,56 @@ public final class RtTerrainMaterials {
 
     public long tableAddress() {
         RtBuffer current = table;
-        if (current == null) throw new IllegalStateException("RT terrain material table is not uploaded");
+        if (current == null) throw new IllegalStateException("RT material table is not uploaded");
         return current.deviceAddress;
+    }
+
+    /** Neutral canonical material used by runtime-only textures (player skins, generated glyph atlases, etc.). */
+    public int entityFallbackId() {
+        return entityFallbackId;
+    }
+
+    /** Resolve a full entity texture resource to its pack-compiled material ID. */
+    public int resolveEntityTexture(Identifier textureLocation) {
+        if (textureLocation == null) return entityFallbackId;
+        return entityTextureIds.getOrDefault(logicalTextureName(textureLocation), entityFallbackId);
+    }
+
+    /**
+     * Resolve a block-entity atlas sprite. Canonical texels were compiled at pack load; only this header's
+     * atlas-to-local UV transform is appended now. Existing IDs and page contents are never modified.
+     */
+    public synchronized int resolveEntitySprite(TextureAtlasSprite sprite) {
+        if (sprite == null) return entityFallbackId;
+        Integer current = entitySpriteIds.get(sprite);
+        if (current != null) return current;
+        EntityTemplate template = entityTemplates.get(sprite.contents().name());
+        if (template == null) return entityFallbackId;
+        if (nextDynamicId >= tableCapacity || table == null) {
+            throw new IllegalStateException("RT entity material header reserve exhausted");
+        }
+        int id = nextDynamicId++;
+        MaterialHeaderData header = header(template.desc(), transparentWhiteAverage(), template.entry(),
+                sprite.getU0(), sprite.getV0(), inverseExtent(sprite.getU1() - sprite.getU0()),
+                inverseExtent(sprite.getV1() - sprite.getV0()));
+        long offset = Math.multiplyExact((long) id, MaterialHeaderData.BYTE_SIZE);
+        ByteBuffer target = MemoryUtil.memByteBuffer(table.mapped + offset, MaterialHeaderData.BYTE_SIZE)
+                .order(ByteOrder.nativeOrder());
+        header.write(target);
+        table.flush(offset, MaterialHeaderData.BYTE_SIZE);
+        entitySpriteIds.put(sprite, id);
+        return id;
     }
 
     /** Caller must ensure no in-flight trace references the current table. */
     public void destroy() {
         snapshot = null;
+        entityTextureIds = Map.of();
+        entityTemplates = Map.of();
+        entitySpriteIds.clear();
+        entityFallbackId = 0;
+        nextDynamicId = 0;
+        tableCapacity = 0;
         if (table != null) {
             table.destroy();
             table = null;
@@ -255,20 +350,39 @@ public final class RtTerrainMaterials {
                 emissionSource, emissionStrength, emissionSummary);
     }
 
+    private static RtMaterialDesc compileEntityDesc(int features, boolean neutral,
+                                                    RtMaterialDesc.EmissionSummary emissionSummary) {
+        boolean authored = (features & (FEATURE_SPEC | FEATURE_NORMAL)) != 0;
+        RtMaterialDesc.Source source = neutral ? RtMaterialDesc.Source.NEUTRAL
+                : (authored ? RtMaterialDesc.Source.LAB_PBR : RtMaterialDesc.Source.HEURISTIC);
+        RtMaterialDesc.EmissionSource emissionSource = (features & FEATURE_SPEC) != 0
+                ? RtMaterialDesc.EmissionSource.LAB_PBR : RtMaterialDesc.EmissionSource.NONE;
+        return new RtMaterialDesc(MODEL_OPAQUE, source, features, RtMaterials.ENTITY_ROUGH, 0.0f,
+                1.0f, 0.0f, emissionSource, emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : 1.0f,
+                emissionSummary);
+    }
+
     private static void add(List<MaterialHeaderData> headers, List<RtMaterialDesc> descriptions,
                             RtMaterialDesc desc, float[] average, RtBlockMaterials.Entry entry) {
+        headers.add(header(desc, average, entry, entry.albedoU(), entry.albedoV(),
+                entry.albedoInvDu(), entry.albedoInvDv()));
+        descriptions.add(desc);
+    }
+
+    private static MaterialHeaderData header(RtMaterialDesc desc, float[] average,
+                                             RtBlockMaterials.Entry entry, float albedoU, float albedoV,
+                                             float albedoInvDu, float albedoInvDv) {
         int packedFeatures = desc.features() | (entry.maxLod() << MAX_LOD_SHIFT);
         if ((desc.features() & FEATURE_OVERRIDE_EMISSION) != 0) {
             int strength = Math.round(Math.min(MAX_OVERRIDE_EMISSION_STRENGTH, desc.emissionStrength())
                     * (EMISSION_STRENGTH_MASK / MAX_OVERRIDE_EMISSION_STRENGTH));
             packedFeatures |= strength << EMISSION_STRENGTH_SHIFT;
         }
-        headers.add(new MaterialHeaderData(desc.model(), packedFeatures, entry.textureSlot(), 0,
+        return new MaterialHeaderData(desc.model(), packedFeatures, entry.textureSlot(), 0,
                 new Float4(entry.materialU(), entry.materialV(), entry.materialDu(), entry.materialDv()),
-                new Float4(entry.albedoU(), entry.albedoV(), entry.albedoInvDu(), entry.albedoInvDv()),
+                new Float4(albedoU, albedoV, albedoInvDu, albedoInvDv),
                 new Float4(desc.roughness(), desc.metalness(), desc.ior(), desc.transmission()),
-                new Float4(average[0], average[1], average[2], average[3])));
-        descriptions.add(desc);
+                new Float4(average[0], average[1], average[2], average[3]));
     }
 
     private static float[] whiteAverage() {
@@ -314,6 +428,17 @@ public final class RtTerrainMaterials {
     private static float srgbToLinear(float value) {
         return value <= 0.04045f ? value / 12.92f
                 : (float) Math.pow((value + 0.055f) / 1.055f, 2.4f);
+    }
+
+    private static Identifier logicalTextureName(Identifier textureLocation) {
+        String path = textureLocation.getPath();
+        if (path.startsWith("textures/")) path = path.substring("textures/".length());
+        if (path.endsWith(".png")) path = path.substring(0, path.length() - 4);
+        return Identifier.fromNamespaceAndPath(textureLocation.getNamespace(), path);
+    }
+
+    private static float inverseExtent(float extent) {
+        return Math.abs(extent) > 1.0e-12f ? 1.0f / extent : 0.0f;
     }
 
     private static final class MutableCompiledOverride {

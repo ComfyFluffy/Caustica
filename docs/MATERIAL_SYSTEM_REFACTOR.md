@@ -20,6 +20,11 @@ Do not make every block sprite independently bindless. Use bindless descriptors 
 standalone entity textures. A page index plus a rectangle in the material table scales better, preserves
 coherent sampling, and permits gutters and semantic mip generation.
 
+Implementation status: terrain, full entity textures, block-entity atlases, and item-atlas geometry now share
+the compiled `MaterialHeader` table and canonical semantic-mip pages. Entity albedo remains bindless, while its
+physical channels are pack-compiled. Atlas sprites append only a previously unused header containing their
+stitched UV rectangle; runtime-only textures such as downloaded player skins use the neutral entity material.
+
 ## Problems in the current path
 
 The existing implementation works, but its data ownership is inverted:

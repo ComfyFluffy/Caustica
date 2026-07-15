@@ -1,7 +1,6 @@
 package dev.comfyfluffy.caustica.rt.entity;
 
 import com.mojang.blaze3d.vertex.VertexConsumer;
-import dev.comfyfluffy.caustica.rt.material.RtMaterials;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
@@ -16,12 +15,10 @@ import org.joml.Vector3fc;
  * {@code model.renderToBuffer(pose, this, …)}.
  *
  * <p>Accumulators use the same layout as terrain's {@code SectionMesh} (positions, indices, atlas UV,
- * per-prim {@code {normal.xyz, emission}, {tint.rgb, texSlot}, {rough, metal, 0, 0}}) so entities
+ * per-prim {@code {normal.xyz, flags}, {tint.rgb, albedoSlot}, {reserved, reserved, materialId, reserved}}) so entities
  * share the terrain upload + BLAS path verbatim.
  */
 public final class RtEntityCapture implements VertexConsumer {
-    static final int MATERIAL_SPEC = 1;
-    static final int MATERIAL_NORMAL = 2;
     private static final int DEFAULT_VERTEX_CAPACITY = 1024;
     // Same magnitude as RtTerrain.QuadCapture.OFFSET (2e-4 blocks) — proven large enough to break a BVH
     // depth tie without a visible gap at terrain/entity scale.
@@ -30,17 +27,15 @@ public final class RtEntityCapture implements VertexConsumer {
     final FloatArrayList verts = new FloatArrayList(DEFAULT_VERTEX_CAPACITY * 3);   // 3 floats/vertex (capture-space position)
     final IntArrayList idx = new IntArrayList(indexCapacity(DEFAULT_VERTEX_CAPACITY)); // 3 indices/triangle
     final FloatArrayList uvList = new FloatArrayList(DEFAULT_VERTEX_CAPACITY * 2);  // 2 floats/vertex (entity-texture UV)
-    final FloatArrayList prim = new FloatArrayList(primCapacity(DEFAULT_VERTEX_CAPACITY)); // 12 floats/triangle: normal.xyz+0, tint.rgb+texSlot, mat.{rough,metal,0,0}
+    final FloatArrayList prim = new FloatArrayList(primCapacity(DEFAULT_VERTEX_CAPACITY)); // 12 floats/triangle
 
     // Bindless texture slot for the geometry currently being submitted (set by the collector per
     // submitModel, so body + feature layers get their own texture). Stored per-prim in tint.w;
     // the hit shader samples entityTex[texSlot].
     int currentTexSlot;
-    // Compact per-submission LabPBR feature mask for the temporary standalone-entity adapter.
-    int currentMaterialFeatures;
-    // Block-atlas geometry reuses the compiled terrain material registry. Encoded as -(id+1) in mat.z;
-    // -1 means this submission uses the legacy per-type entity material path above.
-    int currentCanonicalMaterialId = -1;
+    // Canonical MaterialHeader ID for this submission. Entity, block-entity and block-atlas geometry all
+    // use the same table; albedo remains a separate bindless slot in tint.w.
+    int currentMaterialId;
     // Whether the current submission is an alpha-blended (translucent) render type — slime / sulfur-cube
     // shells, ghosts, … Stored per-prim in the otherwise-unused entity emission lane (normal.w); world.rahit
     // reads it and does stochastic transparency for those surfaces instead of a binary cutout, so the inner
@@ -78,8 +73,7 @@ public final class RtEntityCapture implements VertexConsumer {
         ensureVertexCapacity(expectedVertices);
         n = 0;
         currentTexSlot = 0;
-        currentMaterialFeatures = 0;
-        currentCanonicalMaterialId = -1;
+        currentMaterialId = 0;
         currentTranslucent = false;
         currentOrder = 0;
         uvRemap = false;
@@ -129,8 +123,7 @@ public final class RtEntityCapture implements VertexConsumer {
     /** Copy the per-submission material/UV state into a second capture used by the parity harness. */
     void copySubmissionStateTo(RtEntityCapture target) {
         target.currentTexSlot = currentTexSlot;
-        target.currentMaterialFeatures = currentMaterialFeatures;
-        target.currentCanonicalMaterialId = currentCanonicalMaterialId;
+        target.currentMaterialId = currentMaterialId;
         target.currentTranslucent = currentTranslucent;
         target.currentOrder = currentOrder;
         target.uvRemap = uvRemap;
@@ -323,15 +316,10 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(tg);
             prim.add(tb);
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot
-            prim.add(RtMaterials.ENTITY_ROUGH); // entities default to a matte dielectric
-            prim.add(0f);                       // metalness
-            if (currentCanonicalMaterialId >= 0) {
-                prim.add(-(currentCanonicalMaterialId + 1.0f)); // canonical material ID, unambiguous vs flags
-                prim.add(0f);
-            } else {
-                prim.add((float) currentMaterialFeatures); // compact standalone-entity feature mask
-                prim.add(0f); // reserved
-            }
+            prim.add(0f); // reserved: physical parameters live in MaterialHeader
+            prim.add(0f); // reserved
+            prim.add((float) currentMaterialId);
+            prim.add(0f); // reserved
         }
     }
 

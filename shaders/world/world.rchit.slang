@@ -105,28 +105,6 @@ float rayConeUnitUvLod(uint rayCone, float2 textureSizePx) {
     return clamp(log2(footprint), 0.0, RAY_CONE_MAX_LOD);
 }
 
-// Temporary standalone-entity LabPBR _s adapter: red = perceptual smoothness -> roughness; green =
-// reflectance (dielectric F0 0..229 / predefined metal 230..237 / generic metal albedo); alpha = emission
-// (255 = ignored). Block-atlas materials never execute this source decoder; they use evaluateMaterial.
-void decodeEntitySpec(float4 s, float3 albedo, out float rough, out float metal, out float3 f0, out float emission, out float sss) {
-    rough = (1.0 - s.r) * (1.0 - s.r);
-    float g = s.g * 255.0;
-    if (g < 229.5) {
-        metal = 0.0;
-        f0 = float3(s.g, s.g, s.g);
-    } else if (g < 237.5) {
-        metal = 1.0;
-        f0 = metalF0(int(g + 0.5) - 230);
-    } else {
-        metal = 1.0;
-        f0 = albedo;
-    }
-    float a = s.a * 255.0;
-    emission = a < 254.5 ? a / 254.0 : 0.0;
-    float b = s.b * 255.0;
-    sss = b > 64.5 ? (b - 65.0) / 190.0 : 0.0; // porosity 0-64 ignored; SSS 65-255 -> 0..1
-}
-
 // LabPBR _n decode (shared): rotate the tangent-space normal into world space via a TBN built from the
 // hit triangle's vertex positions (VK_KHR_ray_tracing_position_fetch) + UVs. `n` must already be
 // oriented toward the viewer (`vdir`). Clamps the result above the horizon so grazing perturbations
@@ -166,7 +144,7 @@ struct Surface {
     float ao;
 };
 
-// The sole terrain/block-atlas material evaluation path. LabPBR categorical bytes have already been
+// The sole terrain/entity material evaluation path. LabPBR categorical bytes have already been
 // decoded on the CPU; every sample below is a continuously filterable physical channel with semantic mips.
 Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float3 albedo,
         float3 geometricNormal, float3 p0, float3 p1, float3 p2,
@@ -327,43 +305,15 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 ep2 = mul(entityO2w, HitTriangleVertexPosition(2));
         float entityLod = rayConeTextureLod(rayCone, texSizePx(entityTex[NonUniformResourceIndex(texSlot)]),
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2]);
-        float blockEntityLod = rayConeTextureLod(rayCone, texSizePx(blockAtlas),
-                ep0, ep1, ep2, euv[e0], euv[e1], euv[e2]);
-
         float3 albedo = srgbToLinear(entityTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod).rgb) * pr.tint.rgb;
-        float rough = pr.mat.x;          // heuristic material default
-        float metal = pr.mat.y;
-        float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal);
-        float emission = 0.0;
-        uint emissionSource = EMISSION_SOURCE_NONE;
-        float ao = 1.0;
-        float sss = 0.0;
-        // Negative mat.z encodes -(materialId+1) for block-atlas geometry, sharing the canonical terrain
-        // page path. Non-negative mat.z is one compact per-type entity feature mask; mat.w is reserved.
-        if (pr.mat.z < -0.5) {
-            uint materialId = uint(-pr.mat.z - 0.5);
-            MaterialHeader header = ConstPtr<MaterialHeader>(pcAddr.materialTableAddr)[materialId];
-            Surface surface = evaluateMaterial(header, euvCoord, blockEntityLod, albedo, n,
-                    ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
-                    rough, metal, 0.0, true);
-            rough = surface.roughness;
-            metal = surface.metalness;
-            f0 = surface.f0;
-            emission = surface.emission;
-            emissionSource = materialEmissionSource(header, emission);
-            sss = surface.sss;
-            ao = surface.ao;
-            n = surface.normal;
-        } else if ((uint(pr.mat.z + 0.5) & MATERIAL_FEATURE_SPEC) != 0u) {
-            decodeEntitySpec(entitySpecTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod), albedo, rough, metal, f0, emission, sss);
-            emissionSource = emission > 0.0 ? EMISSION_SOURCE_LAB_PBR : EMISSION_SOURCE_NONE;
-        }
-        if (pr.mat.z >= -0.5 && (uint(pr.mat.z + 0.5) & MATERIAL_FEATURE_NORMAL) != 0u) {
-            n = perturbNormal(n, ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
-                    entityNormalTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod), ao);
-        }
+        uint materialId = uint(pr.mat.z + 0.5);
+        MaterialHeader header = ConstPtr<MaterialHeader>(pcAddr.materialTableAddr)[materialId];
+        Surface surface = evaluateMaterial(header, euvCoord, entityLod, albedo, n,
+                ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
+                header.params.x, header.params.y, 0.0, true);
+        n = surface.normal;
 
-        payload.albedo = albedo * ao;
+        payload.albedo = albedo * surface.ao;
         payload.normal = n;
         payload.hitT = RayTCurrent();
         // Per-vertex motion vector: interpolate the captured per-vertex displacement with the same
@@ -375,8 +325,9 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         } else {
             payload.motionPrev = g.rigidDisp.xyz;
         }
-        payload.f0 = f0;
-        payloadSetPacked(payload, MATERIAL_OPAQUE, rough, metal, emission, sss, emissionSource);
+        payload.f0 = surface.f0;
+        payloadSetPacked(payload, MATERIAL_OPAQUE, surface.roughness, surface.metalness,
+                surface.emission, surface.sss, materialEmissionSource(header, surface.emission));
         return;
     }
 
