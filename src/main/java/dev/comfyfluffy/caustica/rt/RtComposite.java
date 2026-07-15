@@ -315,6 +315,25 @@ public final class RtComposite {
     }
 
     /**
+     * Whether the current frame must retain vanilla world rendering while RT resource state converges.
+     *
+     * <p>The composite still runs at the normal seam so it can consume the one-frame epoch gate or observe
+     * the newly uploaded atlas. This method only prevents {@code LevelRenderer} from being cancelled before
+     * a deliberately transient {@link #composite} return. Such a return is not a renderer failure and must
+     * not trip {@code VanillaRenderController}'s permanent safety latch.</p>
+     */
+    public boolean requiresVanillaWorldFallback() {
+        if (materialEpochTraceGate) {
+            return true;
+        }
+        if (reloadRebindRequested) {
+            long atlas = blockAtlasView();
+            return atlas == 0L || atlas == boundAtlasHandle;
+        }
+        return false;
+    }
+
+    /**
      * Clear the failure latch on an explicit render-state invalidation (F3+A, dimension change) so RT
      * re-arms after a transient error instead of staying on vanilla until restart. A deterministic
      * failure just latches again on the next frame (bounded log spam: one error line per invalidation).
