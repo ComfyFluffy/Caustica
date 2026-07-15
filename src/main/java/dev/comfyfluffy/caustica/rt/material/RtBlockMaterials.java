@@ -28,6 +28,8 @@ public final class RtBlockMaterials {
 
     public static final int HAS_S = 1;
     public static final int HAS_N = 2;
+    public static final int HAS_HEURISTIC_EMISSION = 4;
+    public static final int HAS_OVERRIDE_EMISSION_MASK = 8;
 
     private static final int DEFAULT_PAGE_SIZE = 2048;
     private static final int MAX_PAGE_SIZE = 8192;
@@ -46,7 +48,9 @@ public final class RtBlockMaterials {
     /** Immutable per-sprite page mapping consumed by the material registry. */
     public record Entry(int features, int textureSlot, int maxLod,
                         float materialU, float materialV, float materialDu, float materialDv,
-                        float albedoU, float albedoV, float albedoInvDu, float albedoInvDv) {
+                        float albedoU, float albedoV, float albedoInvDu, float albedoInvDv,
+                        RtMaterialDesc.EmissionSummary emissionSummary,
+                        RtMaterialDesc.EmissionSummary overrideEmissionSummary) {
     }
 
     private record Page(RtMaterialPageTexture surface0, RtMaterialPageTexture normalAo,
@@ -68,6 +72,8 @@ public final class RtBlockMaterials {
         int page;
         int x;
         int y;
+        RtMaterialDesc.EmissionSummary emissionSummary = RtMaterialDesc.EmissionSummary.NONE;
+        RtMaterialDesc.EmissionSummary overrideEmissionSummary = RtMaterialDesc.EmissionSummary.NONE;
 
         Candidate(TextureAtlasSprite sprite, int features, Identifier specLocation,
                   Identifier normalLocation, int width, int height) {
@@ -118,11 +124,14 @@ public final class RtBlockMaterials {
     }
 
     /** Compile, pack, mip, upload, and publish every block-atlas material page. */
-    public void prepareAll(RtContext ctx, int descriptorCapacity) {
+    public void prepareAll(RtContext ctx, int descriptorCapacity, RtEmissionSemantics emissionSemantics,
+                           RtMaterialOverrides overrides) {
         List<TextureAtlasSprite> sprites = blockSprites();
         List<Candidate> authored = new ArrayList<>();
         int specCount = 0;
         int normalCount = 0;
+        int heuristicCount = 0;
+        int overrideMaskCount = 0;
         int largest = 1 + 2 * GUTTER;
         for (TextureAtlasSprite sprite : sprites) {
             if (sprite == null) continue;
@@ -137,6 +146,16 @@ public final class RtBlockMaterials {
             if (resourceExists(normal)) {
                 features |= HAS_N;
                 normalCount++;
+            }
+            // Authored LabPBR owns emission whenever _s exists. Albedo inference is only compiled for
+            // sprites proven to occur on an emitting block state.
+            if ((features & HAS_S) == 0 && emissionSemantics.permits(sprite)) {
+                features |= HAS_HEURISTIC_EMISSION;
+                heuristicCount++;
+            }
+            if (overrides.requestsEmissionMask(sprite)) {
+                features |= HAS_OVERRIDE_EMISSION_MASK;
+                overrideMaskCount++;
             }
             if (features != 0) {
                 int width = sprite.contents().width();
@@ -190,8 +209,10 @@ public final class RtBlockMaterials {
             for (Candidate candidate : authored) {
                 if (candidate.page != pageIndex) continue;
                 try {
-                    List<RtMaterialTextureData.Level> levels = decode(candidate);
-                    pixels.write(candidate, levels);
+                    Decoded decoded = decode(candidate);
+                    candidate.emissionSummary = decoded.emissionSummary();
+                    candidate.overrideEmissionSummary = decoded.overrideEmissionSummary();
+                    pixels.write(candidate, decoded.levels());
                 } catch (Throwable t) {
                     warnOnce("RT canonical material decode failed for " + candidate.sprite.contents().name(), t);
                     candidate.page = -1;
@@ -210,7 +231,8 @@ public final class RtBlockMaterials {
         int fallbackSlot = pages.get(0).textureSlot;
         float fallbackUv = GUTTER / (float) pageSize;
         fallback = new Entry(0, fallbackSlot, 0, fallbackUv, fallbackUv,
-                1.0f / pageSize, 1.0f / pageSize, 0, 0, 1, 1);
+                1.0f / pageSize, 1.0f / pageSize, 0, 0, 1, 1,
+                RtMaterialDesc.EmissionSummary.NONE, RtMaterialDesc.EmissionSummary.NONE);
         for (TextureAtlasSprite sprite : sprites) {
             if (sprite != null) entries.put(sprite, fallbackFor(sprite));
         }
@@ -224,7 +246,8 @@ public final class RtBlockMaterials {
                     candidate.width / (float) pageSize, candidate.height / (float) pageSize,
                     candidate.sprite.getU0(), candidate.sprite.getV0(),
                     inverseExtent(candidate.sprite.getU1() - candidate.sprite.getU0()),
-                    inverseExtent(candidate.sprite.getV1() - candidate.sprite.getV0())));
+                    inverseExtent(candidate.sprite.getV1() - candidate.sprite.getV0()),
+                    candidate.emissionSummary, candidate.overrideEmissionSummary));
         }
 
         long bytesPerBundle = 0L;
@@ -233,8 +256,9 @@ public final class RtBlockMaterials {
             bytesPerBundle += (long) w * w * 4L;
             w = Math.max(1, w / 2);
         }
-        CausticaMod.LOGGER.info("RT canonical material pages: sprites={}, spec={}, normal={}, pages={}x{}², validLod<={}, gpuMiB={}",
-                sprites.size(), specCount, normalCount, pages.size(), pageSize, MAX_VALID_LOD,
+        CausticaMod.LOGGER.info("RT canonical material pages: sprites={}, spec={}, normal={}, heuristicEmission={}, overrideMasks={}, pages={}, size={}x{}, validLod<={}, gpuMiB={}",
+                sprites.size(), specCount, normalCount, heuristicCount, overrideMaskCount,
+                pages.size(), pageSize, pageSize, MAX_VALID_LOD,
                 String.format(java.util.Locale.ROOT, "%.2f", bytesPerBundle * pages.size() * 3.0 / (1024.0 * 1024.0)));
     }
 
@@ -266,10 +290,16 @@ public final class RtBlockMaterials {
         return new Entry(0, fallback.textureSlot, 0,
                 fallback.materialU, fallback.materialV, fallback.materialDu, fallback.materialDv,
                 sprite.getU0(), sprite.getV0(), inverseExtent(sprite.getU1() - sprite.getU0()),
-                inverseExtent(sprite.getV1() - sprite.getV0()));
+                inverseExtent(sprite.getV1() - sprite.getV0()), RtMaterialDesc.EmissionSummary.NONE,
+                RtMaterialDesc.EmissionSummary.NONE);
     }
 
-    private static List<RtMaterialTextureData.Level> decode(Candidate candidate) throws Exception {
+    private record Decoded(List<RtMaterialTextureData.Level> levels,
+                           RtMaterialDesc.EmissionSummary emissionSummary,
+                           RtMaterialDesc.EmissionSummary overrideEmissionSummary) {
+    }
+
+    private static Decoded decode(Candidate candidate) throws Exception {
         NativeImage spec = (candidate.features & HAS_S) != 0 ? load(candidate.specLocation) : null;
         NativeImage normal = (candidate.features & HAS_N) != 0 ? load(candidate.normalLocation) : null;
         try {
@@ -278,6 +308,8 @@ public final class RtBlockMaterials {
             float[] surface0 = new float[width * height * 4];
             float[] normalAo = new float[surface0.length];
             float[] surface1 = new float[surface0.length];
+            float[] linearAlbedo = new float[surface0.length];
+            float[] authoredEmission = spec != null ? new float[width * height] : null;
             NativeImage albedo = ((SpriteContentsAccessor) candidate.sprite.contents()).caustica$originalImage();
             for (int y = 0; y < height; y++) {
                 for (int x = 0; x < width; x++) {
@@ -286,6 +318,11 @@ public final class RtBlockMaterials {
                     float ar = srgbToLinear(ARGB.red(albedoPixel) / 255.0f);
                     float ag = srgbToLinear(ARGB.green(albedoPixel) / 255.0f);
                     float ab = srgbToLinear(ARGB.blue(albedoPixel) / 255.0f);
+                    float aa = ARGB.alpha(albedoPixel) / 255.0f;
+                    linearAlbedo[i] = ar;
+                    linearAlbedo[i + 1] = ag;
+                    linearAlbedo[i + 2] = ab;
+                    linearAlbedo[i + 3] = aa;
                     if (spec != null) {
                         int pixel = sample(spec, x, y, width, height);
                         RtLabPbr.Specular decoded = RtLabPbr.decodeSpec(
@@ -294,6 +331,7 @@ public final class RtBlockMaterials {
                         surface0[i] = decoded.roughness();
                         surface0[i + 1] = decoded.metalness();
                         surface0[i + 2] = decoded.emission();
+                        authoredEmission[y * width + x] = decoded.emission() * aa;
                         surface0[i + 3] = decoded.sss();
                         surface1[i] = decoded.f0r();
                         surface1[i + 1] = decoded.f0g();
@@ -322,10 +360,27 @@ public final class RtBlockMaterials {
                     }
                 }
             }
+            RtMaterialDesc.EmissionSummary emissionSummary = RtMaterialDesc.EmissionSummary.NONE;
+            if (spec != null) {
+                emissionSummary = RtEmissionHeuristic.summarize(linearAlbedo, authoredEmission);
+            }
+            RtMaterialDesc.EmissionSummary overrideEmissionSummary = RtMaterialDesc.EmissionSummary.NONE;
+            if ((candidate.features & (HAS_HEURISTIC_EMISSION | HAS_OVERRIDE_EMISSION_MASK)) != 0) {
+                RtEmissionHeuristic.Result emission = RtEmissionHeuristic.compile(linearAlbedo);
+                float[] mask = emission.mask();
+                for (int pixel = 0; pixel < mask.length; pixel++) {
+                    if ((candidate.features & HAS_HEURISTIC_EMISSION) != 0) surface0[pixel * 4 + 2] = mask[pixel];
+                    if ((candidate.features & HAS_OVERRIDE_EMISSION_MASK) != 0) surface1[pixel * 4 + 3] = mask[pixel];
+                }
+                if ((candidate.features & HAS_HEURISTIC_EMISSION) != 0) emissionSummary = emission.summary();
+                if ((candidate.features & HAS_OVERRIDE_EMISSION_MASK) != 0) {
+                    overrideEmissionSummary = emission.summary();
+                }
+            }
             int maxLod = Math.min(MAX_VALID_LOD,
                     31 - Integer.numberOfLeadingZeros(Math.max(width, height)));
-            return RtMaterialTextureData.mipChain(new RtMaterialTextureData.Level(width, height,
-                    surface0, normalAo, surface1), maxLod);
+            return new Decoded(RtMaterialTextureData.mipChain(new RtMaterialTextureData.Level(width, height,
+                    surface0, normalAo, surface1), maxLod), emissionSummary, overrideEmissionSummary);
         } finally {
             if (spec != null) spec.close();
             if (normal != null) normal.close();
@@ -400,7 +455,7 @@ public final class RtBlockMaterials {
         }
     }
 
-    private static List<TextureAtlasSprite> blockSprites() {
+    static List<TextureAtlasSprite> blockSprites() {
         TextureAtlas atlas = (TextureAtlas) Minecraft.getInstance().getTextureManager()
                 .getTexture(TextureAtlas.LOCATION_BLOCKS);
         List<TextureAtlasSprite> sprites = ((TextureAtlasAccessor) atlas).caustica$sprites();

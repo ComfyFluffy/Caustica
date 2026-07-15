@@ -51,6 +51,8 @@ import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtEmissionSemantics;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialOverrides;
 import dev.comfyfluffy.caustica.rt.material.RtEntityMaterials;
 import dev.comfyfluffy.caustica.rt.material.RtTerrainMaterials;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
@@ -552,11 +554,13 @@ public final class RtComposite {
         // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
         // resolved samples something defined rather than an unbound (partially-bound) descriptor.
         RtBlockMaterials.INSTANCE.reset();
-        RtBlockMaterials.INSTANCE.prepareAll(ctx, bindlessTextureCapacity);
+        RtMaterialOverrides materialOverrides = RtMaterialOverrides.load();
+        RtEmissionSemantics emissionSemantics = RtEmissionSemantics.analyze();
+        RtBlockMaterials.INSTANCE.prepareAll(ctx, bindlessTextureCapacity, emissionSemantics, materialOverrides);
         RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity, RtBlockMaterials.INSTANCE.pageCount());
         worldPipeline.setBindlessTexture(0, 0, atlasView, sampler); // binding 0 (albedo), slot 0 fallback
         RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler);
-        RtTerrainMaterials.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE);
+        RtTerrainMaterials.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, materialOverrides);
         materialBindingsReady = true;
         // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
         // handle is stable across frames; the shader only samples it inside the sun/moon discs (sky

@@ -62,7 +62,7 @@ public struct Payload {
     public float  hitT;        // >= 0 on hit, < 0 on miss.
     public float3 motionPrev;  // per-vertex world displacement since last frame.
     public float3 f0;          // specular F0.
-    public uint   flags;       // bits 0..1 material, bit 2 show celestial disc on miss, bit 3 water-entering (hit only).
+    public uint   flags;       // bits 0..1 material, bit 2 celestial, bit 3 water-entering, bits 4..6 emission source.
     public uint   roughMetal;  // packHalf2x16(roughness, metalness)
     public uint   emissionSss; // packHalf2x16(emission, sss)
     public uint   rayCone;     // packHalf2x16(width, spread)
@@ -74,6 +74,13 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 // (PAYLOAD_SHOW_CELESTIAL) is only meaningful on a miss and this bit only on a hit, so they never need
 // to be read together, but they get distinct bits anyway to keep the two concerns unambiguous.
 public static const uint PAYLOAD_WATER_ENTERING = 8u;
+public static const uint PAYLOAD_EMISSION_SOURCE_SHIFT = 4u;
+public static const uint PAYLOAD_EMISSION_SOURCE_MASK = 7u;
+public static const uint EMISSION_SOURCE_NONE = 0u;
+public static const uint EMISSION_SOURCE_UNIFORM = 1u;
+public static const uint EMISSION_SOURCE_HEURISTIC = 2u;
+public static const uint EMISSION_SOURCE_LAB_PBR = 3u;
+public static const uint EMISSION_SOURCE_OVERRIDE = 4u;
 
 // Entity per-triangle record (48 B). Entity migration follows the terrain material-ID path separately.
 public struct Prim {
@@ -109,6 +116,11 @@ public struct MaterialHeader {
 
 public static const uint MATERIAL_FEATURE_SPEC = 1u;
 public static const uint MATERIAL_FEATURE_NORMAL = 2u;
+public static const uint MATERIAL_FEATURE_HEURISTIC_EMISSION = 4u;
+public static const uint MATERIAL_FEATURE_OVERRIDE_EMISSION = 8u;
+public static const uint MATERIAL_EMISSION_STRENGTH_SHIFT = 8u;
+public static const uint MATERIAL_EMISSION_STRENGTH_MASK = 255u;
+public static const float MATERIAL_MAX_OVERRIDE_EMISSION_STRENGTH = 4.0;
 public static const uint MATERIAL_MAX_LOD_SHIFT = 24u;
 public static const uint MATERIAL_MAX_LOD_MASK = 255u;
 

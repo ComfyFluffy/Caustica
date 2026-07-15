@@ -22,10 +22,19 @@ static const uint MATERIAL_WATER = 1u;
 static const uint MATERIAL_PARTICLE = 2u;
 static const uint MATERIAL_GLASS = 3u;
 
-void payloadSetPacked(inout Payload payload, uint material, float roughness, float metalness, float emission, float sss) {
-    payload.flags = material;
+void payloadSetPacked(inout Payload payload, uint material, float roughness, float metalness,
+        float emission, float sss, uint emissionSource) {
+    payload.flags = material | (emissionSource << PAYLOAD_EMISSION_SOURCE_SHIFT);
     payload.roughMetal = packHalf2(float2(roughness, metalness));
     payload.emissionSss = packHalf2(float2(emission, sss));
+}
+
+uint materialEmissionSource(MaterialHeader header, float emission) {
+    if (emission <= 0.0) return EMISSION_SOURCE_NONE;
+    if ((header.features & MATERIAL_FEATURE_OVERRIDE_EMISSION) != 0u) return EMISSION_SOURCE_OVERRIDE;
+    if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) return EMISSION_SOURCE_LAB_PBR;
+    if ((header.features & MATERIAL_FEATURE_HEURISTIC_EMISSION) != 0u) return EMISSION_SOURCE_HEURISTIC;
+    return EMISSION_SOURCE_UNIFORM;
 }
 
 // LabPBR predefined metals (green channel 230..237): complex refractive indices N (eta) and K (kappa)
@@ -178,14 +187,28 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
     float maxMaterialLod = float((header.features >> MATERIAL_MAX_LOD_SHIFT) & MATERIAL_MAX_LOD_MASK);
     float materialLod = min(lod, maxMaterialLod);
     uint page = header.texturePage;
-    if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) {
+    if ((header.features & (MATERIAL_FEATURE_SPEC | MATERIAL_FEATURE_HEURISTIC_EMISSION
+            | MATERIAL_FEATURE_OVERRIDE_EMISSION)) != 0u) {
         float4 surface0 = entitySpecTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
-        float4 surface1 = entityTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
-        surface.roughness = surface0.r;
-        surface.metalness = surface0.g;
-        surface.emission = surface0.b;
-        surface.sss = allowSss ? surface0.a : 0.0;
-        surface.f0 = surface1.rgb;
+        if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) {
+            float4 surface1 = entityTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
+            surface.roughness = surface0.r;
+            surface.metalness = surface0.g;
+            surface.emission = surface0.b;
+            surface.sss = allowSss ? surface0.a : 0.0;
+            surface.f0 = surface1.rgb;
+        } else {
+            // Eligibility is compiled from block-state semantics; the primitive's exact light level
+            // supplies strength, while the page supplies only the normalized spatial mask.
+            surface.emission = surface0.b * fallbackEmission;
+        }
+        if ((header.features & MATERIAL_FEATURE_OVERRIDE_EMISSION) != 0u) {
+            float strength = float((header.features >> MATERIAL_EMISSION_STRENGTH_SHIFT)
+                    & MATERIAL_EMISSION_STRENGTH_MASK)
+                    * (MATERIAL_MAX_OVERRIDE_EMISSION_STRENGTH / float(MATERIAL_EMISSION_STRENGTH_MASK));
+            float overrideMask = entityTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod).a;
+            surface.emission = overrideMask * strength;
+        }
     }
     if ((header.features & MATERIAL_FEATURE_NORMAL) != 0u) {
         float4 normalAo = entityNormalTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
@@ -268,7 +291,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             payload.motionPrev = g.rigidDisp.xyz;
         }
         payload.f0 = float3(0.0, 0.0, 0.0);
-        payloadSetPacked(payload, MATERIAL_PARTICLE, 1.0, 0.0, 0.0, 0.0);
+        payloadSetPacked(payload, MATERIAL_PARTICLE, 1.0, 0.0, 0.0, 0.0, EMISSION_SOURCE_NONE);
         return;
     }
     // Dynamic entities: instances with this custom-index flag bit carry real captured ModelPart
@@ -312,6 +335,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float metal = pr.mat.y;
         float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal);
         float emission = 0.0;
+        uint emissionSource = EMISSION_SOURCE_NONE;
         float ao = 1.0;
         float sss = 0.0;
         // Negative mat.z encodes -(materialId+1) for block-atlas geometry, sharing the canonical terrain
@@ -326,11 +350,13 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             metal = surface.metalness;
             f0 = surface.f0;
             emission = surface.emission;
+            emissionSource = materialEmissionSource(header, emission);
             sss = surface.sss;
             ao = surface.ao;
             n = surface.normal;
         } else if ((uint(pr.mat.z + 0.5) & MATERIAL_FEATURE_SPEC) != 0u) {
             decodeEntitySpec(entitySpecTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod), albedo, rough, metal, f0, emission, sss);
+            emissionSource = emission > 0.0 ? EMISSION_SOURCE_LAB_PBR : EMISSION_SOURCE_NONE;
         }
         if (pr.mat.z >= -0.5 && (uint(pr.mat.z + 0.5) & MATERIAL_FEATURE_NORMAL) != 0u) {
             n = perturbNormal(n, ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
@@ -350,7 +376,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             payload.motionPrev = g.rigidDisp.xyz;
         }
         payload.f0 = f0;
-        payloadSetPacked(payload, MATERIAL_OPAQUE, rough, metal, emission, sss);
+        payloadSetPacked(payload, MATERIAL_OPAQUE, rough, metal, emission, sss, emissionSource);
         return;
     }
 
@@ -416,7 +442,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         payload.motionPrev = float3(0.0, 0.0, 0.0);
         payload.f0 = glassSurface.f0;
         payloadSetPacked(payload, MATERIAL_GLASS, glassSurface.roughness,
-                glassSurface.metalness, 0.0, 0.0);
+                glassSurface.metalness, 0.0, 0.0, EMISSION_SOURCE_NONE);
         return;
     }
 
@@ -447,7 +473,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     payload.normal = n;
     payload.f0 = surface.f0;
     payloadSetPacked(payload, material, surface.roughness, surface.metalness,
-            surface.emission, surface.sss);
+            surface.emission, surface.sss, materialEmissionSource(materialHeader, surface.emission));
     if (material == MATERIAL_WATER && entering) {
         payload.flags |= PAYLOAD_WATER_ENTERING;
     }

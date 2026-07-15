@@ -56,5 +56,7 @@
 	"caustica.options.rt.debugView.4": "Roughness",
 	"caustica.options.rt.debugView.5": "Motion",
 	"caustica.options.rt.debugView.6": "Specular",
-	"caustica.options.rt.debugView.7": "Specular Motion"
+	"caustica.options.rt.debugView.7": "Specular Motion",
+	"caustica.options.rt.debugView.8": "Emission Mask",
+	"caustica.options.rt.debugView.9": "Emission Source"
 }

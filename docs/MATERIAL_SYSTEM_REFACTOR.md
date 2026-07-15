@@ -58,7 +58,10 @@ Keep LabPBR as an input adapter, not the engine's runtime material format. Add a
 JSON material description for properties LabPBR cannot express cleanly. Resource-pack authors should not have
 to produce a custom binary format.
 
-Suggested location and shape:
+Format 1 uses resources under `assets/<namespace>/caustica/materials/*.json`. An exact `match.sprite` is
+required; `match.block` optionally narrows a rule when sprites are shared. Block+sprite rules take precedence
+over sprite-wide rules, and resource identifiers break ties deterministically. Unknown fields are ignored so
+new extension data can be added without breaking older clients. Shape:
 
 ```json
 {
