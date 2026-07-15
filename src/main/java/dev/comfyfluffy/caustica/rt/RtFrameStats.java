@@ -77,7 +77,7 @@ public final class RtFrameStats {
                     "entitySpecializedCuboids", "entityGenericCuboids",
                     "entityParityChecks", "entityVmaBufferCreates", "entityGeometryBufferReuses",
                     "entityScratchBufferReuses", "entityUploadBytes", "entityMotionUploadBytes",
-                    "entityPackedBytes", "entityPackedPaddingBytes", "entityRetainedPositionBytes"},
+                    "entityPackedBytes", "entityPackedPaddingBytes", "entityRetainedGeometryBytes"},
             true);
 
     private static final List<GarbageCollectorMXBean> GC_BEANS = ManagementFactory.getGarbageCollectorMXBeans();

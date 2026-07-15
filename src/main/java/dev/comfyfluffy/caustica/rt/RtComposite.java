@@ -588,6 +588,7 @@ public final class RtComposite {
         reloadRebindRequested = true;
         materialBindingsReady = false;
         setCelestialUvAtlas(0L);
+        RtEntities.INSTANCE.onResourceReload();
         RtContext ctx = RtContext.currentOrNull();
         if (ctx != null && worldPipeline != null) {
             ctx.waitIdle();

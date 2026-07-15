@@ -54,6 +54,10 @@ final class RtCuboidEmitter {
         return template;
     }
 
+    void clear() {
+        templates.clear();
+    }
+
     /** Return packed actual cube counts: specialized in the high 32 bits, generic in the low 32 bits. */
     long emit(ModelTemplate template, PoseStack poseStack, RtEntityCapture capture, int color) {
         capture.ensureAdditionalVertexCapacity(template.maxVertices);

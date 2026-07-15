@@ -101,6 +101,12 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         return outlineColor;
     }
 
+    /** Release model/resource-pack-owned CPU caches after reload or RT shutdown. */
+    public void clearCaches() {
+        cuboidEmitter.clear();
+        blockRenderer = null;
+    }
+
     @Override
     public <S> void submitModel(Model<? super S> model, S state, PoseStack poseStack, RenderType renderType,
                                 int lightCoords, int overlayCoords, int tintedColor, TextureAtlasSprite sprite,

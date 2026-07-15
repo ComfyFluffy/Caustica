@@ -599,14 +599,9 @@ public final class CausticaConfig {
                 return Math.max(16, MAX_ENTITIES.value());
             }
 
-            public static int entityBufferListCapacity() {
-                // Dynamic motion is suballocated from a frame arena and entity geometry is ring-owned.
-                // Only the combined particle mesh's four transient geometry buffers remain here.
-                return 8;
-            }
-
             public static int entityMapCapacity() {
-                return (int) Math.min(Integer.MAX_VALUE, Math.max(16L, (long) MAX_ENTITIES.value() * 2L));
+                // Fastutil expected-size constructors apply their own load-factor headroom.
+                return Math.max(16, MAX_ENTITIES.value());
             }
         }
 

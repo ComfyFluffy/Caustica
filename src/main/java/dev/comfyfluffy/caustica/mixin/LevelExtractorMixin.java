@@ -39,6 +39,12 @@ public class LevelExtractorMixin {
         RtEntities.INSTANCE.beginVanillaEntityExtraction();
     }
 
+    @Inject(method = "extractVisibleEntities", at = @At("RETURN"))
+    private void caustica$endEntityStateCapture(Camera camera, Frustum frustum, DeltaTracker deltaTracker,
+                                                 LevelRenderState output, CallbackInfo ci) {
+        RtEntities.INSTANCE.endVanillaEntityExtraction();
+    }
+
     @Inject(method = "extractEntity(Lnet/minecraft/world/entity/Entity;F)Lnet/minecraft/client/renderer/entity/state/EntityRenderState;",
             at = @At("RETURN"))
     private void caustica$captureEntityState(Entity entity, float partialTick,
