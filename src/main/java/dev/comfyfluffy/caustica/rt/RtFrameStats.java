@@ -71,7 +71,7 @@ public final class RtFrameStats {
             },
             new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted", "entitiesCaptured", "refits",
                     "entityReuse", "entityRigidFitSuccesses", "entityRigidFitFailures",
-                    "entityStateReuses", "entityStateExtractions", "vmaBufferCreates",
+                    "vmaBufferCreates",
                     "entityModelSubmissions", "entityCuboids",
                     "entityModelQuads", "entityModelVertices", "entityBakedQuads", "entityBakedVertices",
                     "entityDirectSubmissions", "entityDirectFallbacks", "entityDirectQuads", "entityDirectVertices",

@@ -169,13 +169,6 @@ public final class RtEntities {
     private final RtEntityCapture capture = new RtEntityCapture();
     private final PoseStack entityPoseStack = new PoseStack();
     private CameraRenderState cameraState;
-    // Vanilla LevelExtractor has already built these states before world rendering. Hold them until RT consumes
-    // the same immutable frame state instead of extracting every visible entity a second time. Identity keys
-    // preserve exact entity ownership without id reuse risk.
-    private final IdentityHashMap<Entity, EntityRenderState> vanillaEntityStates =
-            new IdentityHashMap<>(entityListCapacity());
-    private boolean recordVanillaEntityStates;
-
     // Particle capture: a VertexConsumer adapter that funnels MC's billboard quads into `capture` (the
     // shared entity mesh). We extract each live particle into `particleScratch`, accumulate per-vertex
     // motion-vector displacements in `particleDisp`, and key the previous-frame center off particle
@@ -342,24 +335,6 @@ public final class RtEntities {
     }
 
     private record Motion(long dispAddr, float rigidX, float rigidY, float rigidZ) {
-    }
-
-    /** Begin vanilla's visible-entity extraction for a new frame. Called by {@code LevelExtractorMixin}. */
-    public void beginVanillaEntityExtraction() {
-        vanillaEntityStates.clear();
-        recordVanillaEntityStates = RtComposite.enabled() && !RtComposite.INSTANCE.hasFailed() && enabled();
-    }
-
-    /** Stop accepting states from unrelated extractor calls after visible-entity extraction completes. */
-    public void endVanillaEntityExtraction() {
-        recordVanillaEntityStates = false;
-    }
-
-    /** Retain one vanilla-extracted state until the RT entity pass consumes it later in the same frame. */
-    public void recordVanillaEntityState(Entity entity, EntityRenderState state) {
-        if (recordVanillaEntityStates) {
-            vanillaEntityStates.put(entity, state);
-        }
     }
 
     private static final class MotionSlice {
@@ -587,13 +562,11 @@ public final class RtEntities {
                                     double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
         processDeferred();
         if (!enabled()) {
-            vanillaEntityStates.clear();
             return new FrameEntities(base, List.of(), 0L);
         }
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
         if (level == null) {
-            vanillaEntityStates.clear();
             return new FrameEntities(base, List.of(), 0L);
         }
         float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
@@ -668,20 +641,15 @@ public final class RtEntities {
             EntityPrev prev = prevVerts.get(id);
             capture.reset(prev != null ? prev.size / 3 : 0);
             try {
-                EntityRenderState state = vanillaEntityStates.remove(entity);
-                if (state != null) {
-                    RtFrameStats.FRAME.count("entityStateReuses", 1);
-                } else {
-                    long extractStart = RtFrameStats.FRAME.startStage();
-                    try {
-                        state = dispatcher.extractEntity(entity, partial);
-                        RtFrameStats.FRAME.count("entityStateExtractions", 1);
-                    } finally {
-                        RtFrameStats.FRAME.endStage("entity.capture.extract", extractStart);
-                    }
+                EntityRenderState state;
+                long extractStart = RtFrameStats.FRAME.startStage();
+                try {
+                    state = dispatcher.extractEntity(entity, partial);
+                } finally {
+                    RtFrameStats.FRAME.endStage("entity.capture.extract", extractStart);
                 }
-                // Use the same per-entity interpolation/freeze decision vanilla used to pose this state.
-                // Mixing it with the global RT partial tick can split the mesh from its TLAS placement.
+                // Derive placement from the extracted state so the submitted pose and TLAS anchor use the
+                // same interpolation result.
                 ix = (float) state.x;
                 iy = (float) state.y;
                 iz = (float) state.z;
@@ -754,9 +722,6 @@ public final class RtEntities {
             }
             RtFrameStats.FRAME.count("entitiesCaptured", 1);
         }
-        // Release vanilla states for culled/unsupported/over-cap entities immediately; never retain a
-        // render-state graph (notably item quad lists) beyond the frame that produced it.
-        vanillaEntityStates.clear();
         Int2ObjectOpenHashMap<EntityPrev> oldPrev = prevVerts;
         prevVerts = curVerts;
         curVerts = oldPrev;
@@ -1830,8 +1795,6 @@ public final class RtEntities {
         glowBatches.clear();
         nameTagBatches.clear();
         beCandidates.clear();
-        vanillaEntityStates.clear();
-        recordVanillaEntityStates = false;
         retainedGeometryBytes = 0L;
         collector.clearCaches();
     }
