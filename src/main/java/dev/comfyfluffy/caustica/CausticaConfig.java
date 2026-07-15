@@ -583,10 +583,8 @@ public final class CausticaConfig {
             /** Debug-only: render each model submission twice and require bitwise-identical CPU captures. */
             public static final BooleanSetting CAPTURE_PARITY =
                     bool("caustica.rt.entityCaptureParity", "entities.debug.capture-parity", false);
-            public static final IntSetting MAX_ENTITIES =
-                    intAtLeast("caustica.rt.maxEntities", "entities.max-entities", 3072, 1);
-            public static final IntSetting MAX_OTHER_ENTITIES =
-                    intAtLeast("caustica.rt.maxOtherEntities", "entities.max-other-entities", 1024, 0);
+            public static final IntSetting MAX_ORDINARY_ENTITIES =
+                    intAtLeast("caustica.rt.maxOrdinaryEntities", "entities.max-ordinary-entities", 1024, 0);
             public static final IntSetting MAX_BLOCK_ENTITIES =
                     intAtLeast("caustica.rt.maxBlockEntities", "entities.block-entities.max-entities", 1024, 0);
             public static final IntSetting MAX_PARTICLES =
@@ -601,13 +599,18 @@ public final class CausticaConfig {
             private Entities() {
             }
 
+            public static int maxEntities() {
+                return Math.addExact(Math.addExact(
+                        MAX_ORDINARY_ENTITIES.value(), MAX_BLOCK_ENTITIES.value()), MAX_PARTICLES.value());
+            }
+
             public static int entityListCapacity() {
-                return Math.max(16, MAX_ENTITIES.value());
+                return Math.max(16, maxEntities());
             }
 
             public static int entityMapCapacity() {
                 // Fastutil expected-size constructors apply their own load-factor headroom.
-                return Math.max(16, MAX_OTHER_ENTITIES.value());
+                return Math.max(16, MAX_ORDINARY_ENTITIES.value());
             }
         }
 

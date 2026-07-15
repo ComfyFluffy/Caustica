@@ -43,7 +43,9 @@ import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import java.util.AbstractList;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
@@ -96,11 +98,11 @@ public final class RtEntities {
     }
 
     private static int maxEntities() {
-        return CausticaConfig.Rt.Entities.MAX_ENTITIES.value();
+        return CausticaConfig.Rt.Entities.maxEntities();
     }
 
-    private static int maxOtherEntities() {
-        return CausticaConfig.Rt.Entities.MAX_OTHER_ENTITIES.value();
+    private static int maxOrdinaryEntities() {
+        return CausticaConfig.Rt.Entities.MAX_ORDINARY_ENTITIES.value();
     }
 
     private static int maxBlockEntities() {
@@ -180,6 +182,7 @@ public final class RtEntities {
     private final RtEntityCollector collector = new RtEntityCollector();
     private final RtEntityCapture capture = new RtEntityCapture();
     private final PoseStack entityPoseStack = new PoseStack();
+    private final PoseStack blockEntityPoseStack = new PoseStack();
     private CameraRenderState cameraState;
     // Particle capture: a VertexConsumer adapter that funnels MC's billboard quads into `capture` (the
     // shared entity mesh). We extract each live particle into `particleScratch`, accumulate per-vertex
@@ -193,7 +196,18 @@ public final class RtEntities {
     private final float[] particleCenterScratch = new float[3];
 
     /** Previous frame's particle center (rebase-space) + that frame's rebase origin, for the MV diff. */
-    private record ParticlePrev(float cx, float cy, float cz, int rbx, int rby, int rbz) {
+    private static final class ParticlePrev {
+        float cx, cy, cz;
+        int rbx, rby, rbz;
+
+        void set(float cx, float cy, float cz, int rbx, int rby, int rbz) {
+            this.cx = cx;
+            this.cy = cy;
+            this.cz = cz;
+            this.rbx = rbx;
+            this.rby = rby;
+            this.rbz = rbz;
+        }
     }
 
     private RtBuffer[] tableRing;
@@ -264,6 +278,7 @@ public final class RtEntities {
     // Persistent per-block-entity geometry, keyed by BlockPos.asLong(). Built once and reused every frame.
     private final Map<Long, BeEntry> beCache = new HashMap<>();
     private final List<BeCandidate> beCandidates = new ArrayList<>();
+    private final ArrayDeque<BeCandidate> beCandidatePool = new ArrayDeque<>();
     // (Re)builds recorded so far this frame, reset each beginFrame; gates new BE builds to BE_BUILDS_PER_FRAME.
     private int beBuildsThisFrame;
 
@@ -284,7 +299,8 @@ public final class RtEntities {
     private static final class BeEntry {
         RtAccel accel;
         RtBuffer backing;                        // this entry's own AS backing
-        RtBuffer positions, indices, uvs, prim;  // this entry's own mesh buffers
+        RtBuffer geometry;                       // packed positions / indices / UVs / primitive data
+        long indexAddr, uvAddr, primAddr;
         int bx, by, bz;                          // block position (drives the per-frame instance transform)
         long meshHash;                           // hash of the captured mesh — rebuild only when it changes
         long lastSeen;                           // last frame this BE was in the scan window — for eviction
@@ -463,8 +479,22 @@ public final class RtEntities {
         }
     }
 
-    private record BeCandidate(BlockEntity be, double dist2, long posKey) {
+    private static final class BeCandidate {
+        BlockEntity be;
+        double dist2;
+        long posKey;
+
+        void set(BlockEntity be, double dist2, long posKey) {
+            this.be = be;
+            this.dist2 = dist2;
+            this.posKey = posKey;
+        }
     }
+
+    private static final Comparator<BeCandidate> BE_CANDIDATE_ORDER = (a, b) -> {
+        int byDistance = Double.compare(a.dist2, b.dist2);
+        return byDistance != 0 ? byDistance : Long.compare(a.posKey, b.posKey);
+    };
 
     /** Read-only base terrain instances plus this frame's appended dynamic instances. */
     private static final class FrameInstanceList extends AbstractList<RtAccel.Instance> {
@@ -640,7 +670,7 @@ public final class RtEntities {
         resetPoseStack(entityPoseStack);
         int capturedThisFrame = 0;
         for (Entity entity : level.entitiesForRendering()) {
-            if (build.full() || capturedThisFrame >= maxOtherEntities()) {
+            if (build.full() || capturedThisFrame >= maxOrdinaryEntities()) {
                 break;
             }
             if (entity.isInvisible()) {
@@ -911,8 +941,9 @@ public final class RtEntities {
         // extract() emits camera-relative positions; shift them into rebased space (identity instance).
         Vec3 camPos = cam.position();
         particleCapture.setOffset((float) (camPos.x - rbx), (float) (camPos.y - rby), (float) (camPos.z - rbz));
-        // Frustum-cull on the particle center (matches vanilla's extractRenderState): we iterate ALL live
-        // particles for identity, so cull the off-screen ones out of the BVH after capturing each.
+        // Reject particles whose world-space bounds are wholly outside before paying extract/build-layer
+        // cost. The center test after extraction retains the existing exact inclusion behavior for bounds
+        // which intersect the frustum.
         Frustum frustum = new Frustum(viewRotation, projection);
         frustum.prepare(camPos.x, camPos.y, camPos.z);
         IdentityHashMap<Particle, ParticlePrev> cur = particleCur;
@@ -928,6 +959,9 @@ public final class RtEntities {
                     }
                     if (!(p instanceof SingleQuadParticle sq)) {
                         continue; // item-pickup / elder-guardian particles aren't billboard quads (skip)
+                    }
+                    if (!frustum.isVisible(p.getBoundingBox())) {
+                        continue;
                     }
                     int vb = capture.verts.size(), ib = capture.idx.size();
                     int ub = capture.uvList.size(), prb = capture.prim.size();
@@ -969,8 +1003,9 @@ public final class RtEntities {
         if (capture.isEmpty()) {
             return;
         }
-        float[] disp = java.util.Arrays.copyOf(particleDisp.elements(), particleDisp.size());
-        appendCapture(ctx, build, disp, -1, PARTICLE_BIT, PARTICLE_MASK); // one combined mesh, per-particle MV
+        long dispAddr = uploadDisp(ctx, build, particleDisp);
+        appendCapture(ctx, build, new Motion(dispAddr, 0f, 0f, 0f),
+                -1, PARTICLE_BIT, PARTICLE_MASK, IDENTITY); // one combined mesh, per-particle MV
     }
 
     /** Average (rebase-space) position of a captured particle's verts — approximates the particle center. */
@@ -995,18 +1030,22 @@ public final class RtEntities {
      */
     private void appendParticleMv(Particle p, float[] center, int vertBefore, int vertAfter,
                                   int rbx, int rby, int rbz, IdentityHashMap<Particle, ParticlePrev> cur) {
-        ParticlePrev prev = particlePrev.get(p);
+        ParticlePrev prev = particlePrev.remove(p);
         // World displacement = (curCenter − prevCenter) + (rebaseCur − rebasePrev). New particle ⇒ 0 (no MV).
-        float dx = prev == null ? 0f : (center[0] - prev.cx()) + (rbx - prev.rbx());
-        float dy = prev == null ? 0f : (center[1] - prev.cy()) + (rby - prev.rby());
-        float dz = prev == null ? 0f : (center[2] - prev.cz()) + (rbz - prev.rbz());
+        float dx = prev == null ? 0f : (center[0] - prev.cx) + (rbx - prev.rbx);
+        float dy = prev == null ? 0f : (center[1] - prev.cy) + (rby - prev.rby);
+        float dz = prev == null ? 0f : (center[2] - prev.cz) + (rbz - prev.rbz);
         for (int i = vertBefore; i < vertAfter; i++) {
             particleDisp.add(dx);
             particleDisp.add(dy);
             particleDisp.add(dz);
             particleDisp.add(0f);
         }
-        cur.put(p, new ParticlePrev(center[0], center[1], center[2], rbx, rby, rbz));
+        if (prev == null) {
+            prev = new ParticlePrev();
+        }
+        prev.set(center[0], center[1], center[2], rbx, rby, rbz);
+        cur.put(p, prev);
     }
 
     /**
@@ -1026,6 +1065,11 @@ public final class RtEntities {
         int pcx = rbx >> 4, pcz = rbz >> 4;
         Vec3 cam = cameraState.pos;
         List<BeCandidate> candidates = beCandidates;
+        for (int i = 0; i < candidates.size(); i++) {
+            BeCandidate candidate = candidates.get(i);
+            candidate.be = null;
+            beCandidatePool.addLast(candidate);
+        }
         candidates.clear();
         int viewChunks = beViewChunks();
         for (int cx = pcx - viewChunks; cx <= pcx + viewChunks; cx++) {
@@ -1038,26 +1082,24 @@ public final class RtEntities {
                     double dx = p.getX() + 0.5 - cam.x;
                     double dy = p.getY() + 0.5 - cam.y;
                     double dz = p.getZ() + 0.5 - cam.z;
-                    candidates.add(new BeCandidate(be, dx * dx + dy * dy + dz * dz, p.asLong()));
+                    BeCandidate candidate = beCandidatePool.pollFirst();
+                    if (candidate == null) {
+                        candidate = new BeCandidate();
+                    }
+                    candidate.set(be, dx * dx + dy * dy + dz * dz, p.asLong());
+                    candidates.add(candidate);
                 }
             }
         }
         if (candidates.size() > 1) {
-            candidates.sort((a, b) -> {
-                int byDistance = Double.compare(a.dist2, b.dist2);
-                return byDistance != 0 ? byDistance : Long.compare(a.posKey, b.posKey);
-            });
+            candidates.sort(BE_CANDIDATE_ORDER);
         }
         int firstBlockEntity = build.count;
-        try {
-            for (BeCandidate candidate : candidates) {
-                if (build.full() || build.count - firstBlockEntity >= maxBlockEntities()) {
-                    return;
-                }
-                updateBlockEntity(ctx, build, beDispatcher, candidate.be, partial, now, rbx, rby, rbz);
+        for (BeCandidate candidate : candidates) {
+            if (build.full() || build.count - firstBlockEntity >= maxBlockEntities()) {
+                break;
             }
-        } finally {
-            candidates.clear();
+            updateBlockEntity(ctx, build, beDispatcher, candidate.be, partial, now, rbx, rby, rbz);
         }
     }
 
@@ -1072,10 +1114,12 @@ public final class RtEntities {
             }
             collector.begin(capture, false);
             // Identity pose ⇒ block-local mesh; world placement is the per-frame instance transform in emitBe.
-            beDispatcher.submit(state, new PoseStack(), collector, cameraState);
+            resetPoseStack(blockEntityPoseStack);
+            beDispatcher.submit(state, blockEntityPoseStack, collector, cameraState);
         } catch (Throwable t) {
             throw new RuntimeException("RT block-entity capture failed", t); // propagate to composite() (see entity path)
         } finally {
+            resetPoseStack(blockEntityPoseStack);
             collector.begin(null, false);
         }
         if (capture.isEmpty()) {
@@ -1120,38 +1164,41 @@ public final class RtEntities {
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = capture.verts.size() / 3;
         int idxCount = capture.idx.size();
+        EntityGeometryLayout layout = EntityGeometryLayout.create(capture.verts.size(), capture.idx.size(),
+                capture.uvList.size(), capture.prim.size());
         BlockPos p = be.getBlockPos();
         String label = "block entity " + p.getX() + "," + p.getY() + "," + p.getZ();
-        RtBuffer positions = allocBuffer(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true,
-                label + " positions");
-        RtBuffer indices = allocBuffer(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true,
-                label + " indices");
-        RtBuffer uvs = allocBuffer(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true,
-                label + " uvs");
-        RtBuffer prim = allocBuffer(ctx, (long) capture.prim.size() * Float.BYTES, storage, true,
-                label + " prim");
-        MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
-        MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
-        MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
-        MemoryUtil.memFloatBuffer(prim.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
+        long required = Math.addExact(layout.totalBytes, EntityGeometryLayout.REGION_ALIGNMENT - 1L);
+        RtBuffer geometry = allocBuffer(ctx, required, asInput | storage, true, label + " geometry");
+        layout = layout.shifted((-geometry.deviceAddress) & (EntityGeometryLayout.REGION_ALIGNMENT - 1L));
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.positionOffset, capture.verts.size())
+                .put(capture.verts.elements(), 0, capture.verts.size());
+        MemoryUtil.memIntBuffer(geometry.mapped + layout.indexOffset, capture.idx.size())
+                .put(capture.idx.elements(), 0, capture.idx.size());
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.uvOffset, capture.uvList.size())
+                .put(capture.uvList.elements(), 0, capture.uvList.size());
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.primOffset, capture.prim.size())
+                .put(capture.prim.elements(), 0, capture.prim.size());
+        geometry.flush(layout.positionOffset, layout.totalBytes - layout.positionOffset);
 
-        // Persistent BLAS reused every frame the mesh is unchanged. UpdatableBuild keeps the AS + backing
-        // and exposes the build scratch separately (released at the frames-in-flight horizon). We never
-        // refit it — a changed BE gets a fresh AS and the old one is defer-freed — so no in-place write can
-        // race an in-flight trace.
-        RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, positions, vertCount, indices, idxCount, false,
-                label + " BLAS");
-        build.blas.add(ub.op());
-        build.refitScratch.add(ub.scratch());
+        long positionAddr = Math.addExact(geometry.deviceAddress, layout.positionOffset);
+        long indexAddr = Math.addExact(geometry.deviceAddress, layout.indexOffset);
+        long uvAddr = Math.addExact(geometry.deviceAddress, layout.uvOffset);
+        long primAddr = Math.addExact(geometry.deviceAddress, layout.primOffset);
+        // The cached mesh is replaced rather than updated in place, so build without ALLOW_UPDATE.
+        RtAccel.PersistentBuild pb = RtAccel.preparePersistentBlasBuild(ctx, positionAddr, vertCount,
+                indexAddr, idxCount, false, label + " BLAS");
+        build.blas.add(pb.op());
+        build.refitScratch.add(pb.scratch());
         beBuildsThisFrame++;
 
         BeEntry e = new BeEntry();
-        e.accel = ub.accel();
-        e.backing = ub.backing();
-        e.positions = positions;
-        e.indices = indices;
-        e.uvs = uvs;
-        e.prim = prim;
+        e.accel = pb.accel();
+        e.backing = pb.backing();
+        e.geometry = geometry;
+        e.indexAddr = indexAddr;
+        e.uvAddr = uvAddr;
+        e.primAddr = primAddr;
         e.bx = p.getX();
         e.by = p.getY();
         e.bz = p.getZ();
@@ -1192,7 +1239,7 @@ public final class RtEntities {
         // passes null ⇒ dispAddr 0 ⇒ no MV. The disp buffer is a per-frame transient, so a BE that stops
         // animating reverts to MV 0 next frame.
         long dispAddr = uploadDisp(ctx, build, disp);
-        writeTableEntry(build, e.prim.deviceAddress, e.indices.deviceAddress, e.uvs.deviceAddress, dispAddr, 0f, 0f, 0f);
+        writeTableEntry(build, e.primAddr, e.indexAddr, e.uvAddr, dispAddr, 0f, 0f, 0f);
         // Block-local mesh placed by a translate-only instance transform (blockPos − rebase), like terrain.
         float[] xform = {1, 0, 0, e.bx - rbx, 0, 1, 0, e.by - rby, 0, 0, 1, e.bz - rbz};
         build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress,
@@ -1207,10 +1254,7 @@ public final class RtEntities {
         long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
         deferred.add(new Deferred(freeAt, () -> {
             RtAccel.destroyEntityAccel(e.accel, e.backing);
-            e.positions.destroy();
-            e.indices.destroy();
-            e.uvs.destroy();
-            e.prim.destroy();
+            e.geometry.destroy();
         }));
     }
 
@@ -1442,38 +1486,38 @@ public final class RtEntities {
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = capture.verts.size() / 3;
         int idxCount = capture.idx.size();
-        RtBuffer positions = allocBuffer(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true,
-                "particle positions");
-        RtBuffer indices = allocBuffer(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true,
-                "particle indices");
-        RtBuffer uvs = allocBuffer(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true,
-                "particle uvs");
-        RtBuffer prim = allocBuffer(ctx, (long) capture.prim.size() * Float.BYTES, storage, true,
-                "particle prim");
-        MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size())
+        EntityGeometryLayout layout = EntityGeometryLayout.create(capture.verts.size(), capture.idx.size(),
+                capture.uvList.size(), capture.prim.size());
+        long required = Math.addExact(layout.totalBytes, EntityGeometryLayout.REGION_ALIGNMENT - 1L);
+        RtBuffer geometry = allocBuffer(ctx, required, asInput | storage, true, "particle geometry");
+        layout = layout.shifted((-geometry.deviceAddress) & (EntityGeometryLayout.REGION_ALIGNMENT - 1L));
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.positionOffset, capture.verts.size())
                 .put(capture.verts.elements(), 0, capture.verts.size());
-        MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size())
+        MemoryUtil.memIntBuffer(geometry.mapped + layout.indexOffset, capture.idx.size())
                 .put(capture.idx.elements(), 0, capture.idx.size());
-        MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size())
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.uvOffset, capture.uvList.size())
                 .put(capture.uvList.elements(), 0, capture.uvList.size());
-        MemoryUtil.memFloatBuffer(prim.mapped, capture.prim.size())
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.primOffset, capture.prim.size())
                 .put(capture.prim.elements(), 0, capture.prim.size());
+        geometry.flush(layout.positionOffset, layout.totalBytes - layout.positionOffset);
+
+        long positionAddr = Math.addExact(geometry.deviceAddress, layout.positionOffset);
+        long indexAddr = Math.addExact(geometry.deviceAddress, layout.indexOffset);
+        long uvAddr = Math.addExact(geometry.deviceAddress, layout.uvOffset);
+        long primAddr = Math.addExact(geometry.deviceAddress, layout.primOffset);
 
         // Non-opaque so world.rahit alpha-tests the texture (cutout). Opaque texels pass to the chit.
-        RtAccel.PreparedBlas blas = RtAccel.prepareEntityBlas(ctx, positions, vertCount, indices, idxCount, false,
+        RtAccel.PreparedBlas blas = RtAccel.prepareEntityBlas(ctx, positionAddr, vertCount, indexAddr, idxCount, false,
                 "particle BLAS");
         build.blas.add(blas);
         build.pooledBlas.add(blas);
 
-        writeTableEntry(build, prim.deviceAddress, indices.deviceAddress, uvs.deviceAddress, motion.dispAddr,
+        writeTableEntry(build, primAddr, indexAddr, uvAddr, motion.dispAddr,
                 motion.rigidX, motion.rigidY, motion.rigidZ);
 
         build.instances.add(new RtAccel.Instance(instanceTransform, blas.accel.deviceAddress,
                 instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
-        build.buffers.add(positions);
-        build.buffers.add(indices);
-        build.buffers.add(uvs);
-        build.buffers.add(prim);
+        build.buffers.add(geometry);
         build.count++;
     }
 
@@ -1586,6 +1630,19 @@ public final class RtEntities {
         beginBuildIfNeeded(ctx, build);
         MotionSlice slice = build.motion.allocate(ctx, (long) disp.length * Float.BYTES);
         MemoryUtil.memFloatBuffer(slice.mapped, disp.length).put(disp, 0, disp.length);
+        slice.flush();
+        return slice.deviceAddress;
+    }
+
+    /** Upload a reusable primitive list without first copying its backing into a right-sized array. */
+    private long uploadDisp(RtContext ctx, FrameBuild build, FloatArrayList disp) {
+        int size = disp.size();
+        if (size == 0) {
+            return 0L;
+        }
+        beginBuildIfNeeded(ctx, build);
+        MotionSlice slice = build.motion.allocate(ctx, (long) size * Float.BYTES);
+        MemoryUtil.memFloatBuffer(slice.mapped, size).put(disp.elements(), 0, size);
         slice.flush();
         return slice.deviceAddress;
     }
@@ -1802,10 +1859,7 @@ public final class RtEntities {
         entityAccels.clear();
         for (BeEntry e : beCache.values()) {
             RtAccel.destroyEntityAccel(e.accel, e.backing);
-            e.positions.destroy();
-            e.indices.destroy();
-            e.uvs.destroy();
-            e.prim.destroy();
+            e.geometry.destroy();
         }
         beCache.clear();
         if (tableRing != null) {
@@ -1822,7 +1876,9 @@ public final class RtEntities {
         particleDisp.clear();
         glowBatches.clear();
         nameTagBatches.clear();
+        resetPoseStack(blockEntityPoseStack);
         beCandidates.clear();
+        beCandidatePool.clear();
         retainedGeometryBytes = 0L;
         collector.clearCaches();
     }

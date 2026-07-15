@@ -321,6 +321,15 @@ public final class RtAccel {
     public record UpdatableBuild(PreparedBlas op, RtAccel accel, RtBuffer backing, RtBuffer scratch, long updateScratchSize) {
     }
 
+    /**
+     * Initial BUILD for a caller-owned persistent BLAS that will never be updated in place. The caller
+     * retains {@code accel} + {@code backing}, retires {@code scratch} after the build completes, and later
+     * destroys the pair with {@link #destroyEntityAccel}. This avoids ALLOW_UPDATE overhead for immutable
+     * cached geometry such as block entities.
+     */
+    public record PersistentBuild(PreparedBlas op, RtAccel accel, RtBuffer backing, RtBuffer scratch) {
+    }
+
     /** Allocate a BLAS (AS + backing + scratch) and query sizes, deferring the build to {@link #recordBlasBuilds}. */
     public static PreparedBlas prepareTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                                     RtBuffer indices, int indexCount, boolean opaque, String label) {
@@ -438,17 +447,33 @@ public final class RtAccel {
      */
     public static PreparedBlas prepareEntityBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                                  RtBuffer indices, int indexCount, boolean opaque, String label) {
+        return prepareEntityBlas(ctx, positions.deviceAddress, vertexCount,
+                indices.deviceAddress, indexCount, opaque, label);
+    }
+
+    /** Address-based variant for transient entity geometry packed into sub-regions of one owner buffer. */
+    public static PreparedBlas prepareEntityBlas(RtContext ctx, long vertexAddr, int vertexCount,
+                                                 long indexAddr, int indexCount, boolean opaque, String label) {
         VkDevice vk = ctx.vk();
         String debugLabel = labelOr(label, "entity BLAS");
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, false);
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, vertexAddr, indexAddr,
+                    vertexCount, indexCount, opaque, false);
             RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
                     debugLabel + " backing");
             RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
             RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), false, debugLabel);
-            return new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
+            return new PreparedBlas(accel, scratch, backing, vertexAddr, indexAddr, vertexCount - 1,
                     indexCount / 3, opaque, debugLabel, false, false);
         }
+    }
+
+    /** Prepare a non-updatable persistent BLAS over packed caller-owned geometry. */
+    public static PersistentBuild preparePersistentBlasBuild(RtContext ctx, long vertexAddr, int vertexCount,
+                                                             long indexAddr, int indexCount, boolean opaque,
+                                                             String label) {
+        PreparedBlas op = prepareEntityBlas(ctx, vertexAddr, vertexCount, indexAddr, indexCount, opaque, label);
+        return new PersistentBuild(op, op.accel, op.externalBacking, op.scratch);
     }
 
     /**
@@ -503,7 +528,7 @@ public final class RtAccel {
         blas.scratch.destroy();
     }
 
-    /** Destroy a caller-owned-backing (updatable-entity) AS: destroy the handle, then its backing buffer. */
+    /** Destroy a caller-owned-backing persistent AS: destroy the handle, then its backing buffer. */
     public static void destroyEntityAccel(RtAccel accel, RtBuffer backing) {
         accel.destroy(); // ownsBacking == false → handle only
         backing.destroy();
