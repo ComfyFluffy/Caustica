@@ -290,7 +290,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private void setBlockMaterial(TextureAtlasSprite sprite) {
         if (sprite != null && TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
             capture.currentCanonicalMaterialId = RtTerrainMaterials.INSTANCE.requireSnapshot()
-                    .resolve(sprite, RtMaterials.Profile.DEFAULT, false);
+                    .resolve(sprite, RtMaterials.Profile.DEFAULT, false, false);
             capture.currentMaterialFeatures = 0;
         } else {
             capture.currentCanonicalMaterialId = -1;

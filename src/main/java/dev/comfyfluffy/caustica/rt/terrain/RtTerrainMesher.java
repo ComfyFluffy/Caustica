@@ -427,7 +427,7 @@ final class RtTerrainMesher {
             q.emission = state != null ? state.getLightEmission() / 15f : 0f;
             TextureAtlasSprite sprite = quad.materialInfo().sprite();
             q.sprite = sprite;
-            q.materialId = materials.resolve(sprite, RtMaterials.profile(state), q.translucent);
+            q.materialId = materials.resolve(sprite, state, q.translucent);
         }
 
         /** Acquire a pooled PendingQuad for the current block (grown on demand, count reset by flushBlock). */

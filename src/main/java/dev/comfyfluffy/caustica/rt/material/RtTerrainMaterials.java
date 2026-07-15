@@ -9,6 +9,7 @@ import dev.comfyfluffy.caustica.rt.gen.MaterialHeaderData;
 import dev.comfyfluffy.caustica.rt.gen.MaterialHeaderData.Float4;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.util.ARGB;
+import net.minecraft.world.level.block.state.BlockState;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VK10;
 
@@ -36,6 +37,7 @@ public final class RtTerrainMaterials {
     private static final int MAX_LOD_SHIFT = 24;
 
     private static final int MODEL_VARIANTS = 2; // ordinary opaque/cutout and thin glass
+    private static final int EMISSION_VARIANTS = 2; // state-gated emission disabled/enabled
     private static final int VARIANT_OPAQUE = 0;
     private static final int VARIANT_GLASS = 1;
 
@@ -53,26 +55,33 @@ public final class RtTerrainMaterials {
         sprites.sort(Comparator.comparing(sprite -> sprite.contents().name().toString()));
         RtBlockMaterials.Entry fallbackEntry = blockMaterials.entry(null);
 
-        int profileVariants = RtMaterials.Profile.values().length * MODEL_VARIANTS;
+        int profileVariants = RtMaterials.Profile.values().length * MODEL_VARIANTS * EMISSION_VARIANTS;
         List<MaterialHeaderData> headers = new ArrayList<>(3 + profileVariants
                 + sprites.size() * profileVariants);
-        headers.add(header(MODEL_OPAQUE, 0, RtMaterials.Profile.DEFAULT, transparentWhiteAverage(), fallbackEntry));
-        int[] fallbackVariants = new int[RtMaterials.Profile.values().length * MODEL_VARIANTS];
+        List<RtMaterialDesc> descriptions = new ArrayList<>(headers.size());
+        add(headers, descriptions, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.DEFAULT,
+                false, true), transparentWhiteAverage(), fallbackEntry);
+        int[] fallbackVariants = new int[profileVariants];
         for (RtMaterials.Profile profile : RtMaterials.Profile.values()) {
-            int opaqueIndex = index(profile, false);
-            if (profile == RtMaterials.Profile.DEFAULT) {
-                fallbackVariants[opaqueIndex] = 0;
-            } else {
-                fallbackVariants[opaqueIndex] = headers.size();
-                headers.add(header(MODEL_OPAQUE, 0, profile, transparentWhiteAverage(), fallbackEntry));
+            for (boolean glass : new boolean[]{false, true}) {
+                for (boolean emitting : new boolean[]{false, true}) {
+                    int variant = index(profile, glass, emitting);
+                    if (profile == RtMaterials.Profile.DEFAULT && !glass && !emitting) {
+                        fallbackVariants[variant] = 0;
+                        continue;
+                    }
+                    fallbackVariants[variant] = headers.size();
+                    add(headers, descriptions, compileDesc(glass ? MODEL_GLASS : MODEL_OPAQUE, 0,
+                                    profile, emitting, true), transparentWhiteAverage(), fallbackEntry);
+                }
             }
-            fallbackVariants[index(profile, true)] = headers.size();
-            headers.add(header(MODEL_GLASS, 0, profile, transparentWhiteAverage(), fallbackEntry));
         }
         int waterId = headers.size();
-        headers.add(header(MODEL_WATER, 0, RtMaterials.Profile.WATER, whiteAverage(), fallbackEntry));
+        add(headers, descriptions, compileDesc(MODEL_WATER, 0, RtMaterials.Profile.WATER,
+                false, true), whiteAverage(), fallbackEntry);
         int lavaId = headers.size();
-        headers.add(header(MODEL_OPAQUE, 0, RtMaterials.Profile.LAVA, whiteAverage(), fallbackEntry));
+        add(headers, descriptions, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.LAVA,
+                true, true), whiteAverage(), fallbackEntry);
 
         IdentityHashMap<TextureAtlasSprite, int[]> ids = new IdentityHashMap<>();
         for (TextureAtlasSprite sprite : sprites) {
@@ -80,12 +89,15 @@ public final class RtTerrainMaterials {
             int features = ((entry.features() & RtBlockMaterials.HAS_S) != 0 ? FEATURE_SPEC : 0)
                     | ((entry.features() & RtBlockMaterials.HAS_N) != 0 ? FEATURE_NORMAL : 0);
             float[] average = averageColor(sprite);
-            int[] variants = new int[RtMaterials.Profile.values().length * MODEL_VARIANTS];
+            int[] variants = new int[profileVariants];
             for (RtMaterials.Profile profile : RtMaterials.Profile.values()) {
-                variants[index(profile, false)] = headers.size();
-                headers.add(header(MODEL_OPAQUE, features, profile, average, entry));
-                variants[index(profile, true)] = headers.size();
-                headers.add(header(MODEL_GLASS, features, profile, average, entry));
+                for (boolean glass : new boolean[]{false, true}) {
+                    for (boolean emitting : new boolean[]{false, true}) {
+                        variants[index(profile, glass, emitting)] = headers.size();
+                        add(headers, descriptions, compileDesc(glass ? MODEL_GLASS : MODEL_OPAQUE,
+                                features, profile, emitting, false), average, entry);
+                    }
+                }
             }
             ids.put(sprite, variants);
         }
@@ -113,7 +125,7 @@ public final class RtTerrainMaterials {
         RtBuffer oldTable = table;
         long epoch = ++nextEpoch;
         Snapshot next = new Snapshot(epoch, Collections.unmodifiableMap(ids), fallbackVariants, waterId, lavaId,
-                headers.size());
+                List.copyOf(descriptions));
         table = nextTable;
         snapshot = next; // volatile publication: map and arrays are never mutated afterward
         if (oldTable != null) oldTable.destroy();
@@ -151,22 +163,36 @@ public final class RtTerrainMaterials {
         }
     }
 
-    private static int index(RtMaterials.Profile profile, boolean glass) {
-        return profile.ordinal() * MODEL_VARIANTS + (glass ? VARIANT_GLASS : VARIANT_OPAQUE);
+    private static int index(RtMaterials.Profile profile, boolean glass, boolean emitting) {
+        return (profile.ordinal() * MODEL_VARIANTS + (glass ? VARIANT_GLASS : VARIANT_OPAQUE))
+                * EMISSION_VARIANTS + (emitting ? 1 : 0);
     }
 
-    private static MaterialHeaderData header(int model, int features, RtMaterials.Profile profile,
-                                             float[] average, RtBlockMaterials.Entry entry) {
+    private static RtMaterialDesc compileDesc(int model, int features, RtMaterials.Profile profile,
+                                              boolean emitting, boolean neutral) {
         float roughness = model == MODEL_GLASS ? 0.05f : profile.roughness();
         float metalness = model == MODEL_GLASS ? 0.0f : profile.metalness();
         float ior = model == MODEL_WATER ? 1.333f : (model == MODEL_GLASS ? 1.52f : 1.0f);
         float transmission = model == MODEL_WATER || model == MODEL_GLASS ? 1.0f : 0.0f;
-        int packedFeatures = features | (entry.maxLod() << MAX_LOD_SHIFT);
-        return new MaterialHeaderData(model, packedFeatures, entry.textureSlot(), 0,
+        boolean labPbr = (features & (FEATURE_SPEC | FEATURE_NORMAL)) != 0;
+        RtMaterialDesc.Source source = neutral ? RtMaterialDesc.Source.NEUTRAL
+                : (labPbr ? RtMaterialDesc.Source.LAB_PBR : RtMaterialDesc.Source.HEURISTIC);
+        RtMaterialDesc.EmissionSource emissionSource = (features & FEATURE_SPEC) != 0
+                ? RtMaterialDesc.EmissionSource.LAB_PBR
+                : (emitting ? RtMaterialDesc.EmissionSource.STATE_UNIFORM : RtMaterialDesc.EmissionSource.NONE);
+        return new RtMaterialDesc(model, source, features, roughness, metalness, ior, transmission,
+                emissionSource, emitting ? 1.0f : 0.0f, RtMaterialDesc.EmissionSummary.NONE);
+    }
+
+    private static void add(List<MaterialHeaderData> headers, List<RtMaterialDesc> descriptions,
+                            RtMaterialDesc desc, float[] average, RtBlockMaterials.Entry entry) {
+        int packedFeatures = desc.features() | (entry.maxLod() << MAX_LOD_SHIFT);
+        headers.add(new MaterialHeaderData(desc.model(), packedFeatures, entry.textureSlot(), 0,
                 new Float4(entry.materialU(), entry.materialV(), entry.materialDu(), entry.materialDv()),
                 new Float4(entry.albedoU(), entry.albedoV(), entry.albedoInvDu(), entry.albedoInvDv()),
-                new Float4(roughness, metalness, ior, transmission),
-                new Float4(average[0], average[1], average[2], average[3]));
+                new Float4(desc.roughness(), desc.metalness(), desc.ior(), desc.transmission()),
+                new Float4(average[0], average[1], average[2], average[3])));
+        descriptions.add(desc);
     }
 
     private static float[] whiteAverage() {
@@ -205,16 +231,16 @@ public final class RtTerrainMaterials {
         private final int[] fallbackVariants;
         private final int waterId;
         private final int lavaId;
-        private final int materialCount;
+        private final List<RtMaterialDesc> descriptions;
 
         private Snapshot(long epoch, Map<TextureAtlasSprite, int[]> ids, int[] fallbackVariants,
-                         int waterId, int lavaId, int materialCount) {
+                         int waterId, int lavaId, List<RtMaterialDesc> descriptions) {
             this.epoch = epoch;
             this.ids = ids;
             this.fallbackVariants = fallbackVariants;
             this.waterId = waterId;
             this.lavaId = lavaId;
-            this.materialCount = materialCount;
+            this.descriptions = descriptions;
         }
 
         public long epoch() {
@@ -230,12 +256,20 @@ public final class RtTerrainMaterials {
         }
 
         public int materialCount() {
-            return materialCount;
+            return descriptions.size();
         }
 
-        public int resolve(TextureAtlasSprite sprite, RtMaterials.Profile profile, boolean glass) {
+        public RtMaterialDesc material(int materialId) {
+            return descriptions.get(materialId);
+        }
+
+        public int resolve(TextureAtlasSprite sprite, BlockState state, boolean glass) {
+            return resolve(sprite, RtMaterials.profile(state), glass, state != null && state.getLightEmission() > 0);
+        }
+
+        public int resolve(TextureAtlasSprite sprite, RtMaterials.Profile profile, boolean glass, boolean emitting) {
             int[] variants = ids.get(sprite);
-            int variant = index(profile, glass);
+            int variant = index(profile, glass, emitting);
             return variants != null ? variants[variant] : fallbackVariants[variant];
         }
     }

@@ -8,9 +8,8 @@ import net.minecraft.world.level.block.state.BlockState;
 import java.util.Set;
 
 /**
- * Heuristic PBR material classifier for blocks that carry only albedo. Assigns each block a
- * {@code (roughness, metalness)} pair from its {@link SoundType} (metal/glass) plus a small set of
- * known smooth dielectrics. Per-prim {@code mat} lanes store the pair; the GGX BRDF reads them.
+ * Semantic profile classifier used only while resolving a compiled material ID. Physical values are
+ * copied into immutable {@link RtMaterialDesc} records at resource load; terrain primitives carry IDs.
  */
 public final class RtMaterials {
     private RtMaterials() {}
