@@ -12,6 +12,7 @@ import dev.comfyfluffy.caustica.rt.RtFrameStats;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialAbi;
 import dev.comfyfluffy.caustica.rt.material.RtMaterials;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -113,6 +114,7 @@ final class RtTerrainMesher {
             bucketTris[b] = buckets[b].triCount();
             triCount += bucketTris[b];
         }
+        RtMaterialAbi.requireTriangleParity(primFloats, idxCount);
 
         float[] positions = new float[vertFloats];
         int[] indices = new int[idxCount];

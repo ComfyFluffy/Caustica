@@ -38,6 +38,7 @@ public final class RtParallelAtlas {
     public static final int HAS_N = 2;
 
     private final Identifier sourceAtlas;
+    private final String debugLabel;
     private final Atlas specAtlas;
     private final Atlas normalAtlas;
     private int atlasW, atlasH;
@@ -50,6 +51,7 @@ public final class RtParallelAtlas {
     /** @param label a short, unique-per-source-atlas debug label (DynamicTexture names derive from it). */
     public RtParallelAtlas(Identifier sourceAtlas, String label) {
         this.sourceAtlas = sourceAtlas;
+        this.debugLabel = label;
         this.specAtlas = new Atlas("_s.png", label + "_s");
         this.normalAtlas = new Atlas("_n.png", label + "_n");
     }
@@ -193,6 +195,14 @@ public final class RtParallelAtlas {
             seen.put(sprite, loadSpriteFlags(sprite));
         });
         flush();
+        int specCount = 0;
+        int normalCount = 0;
+        for (int flags : seen.values()) {
+            if ((flags & HAS_S) != 0) specCount++;
+            if ((flags & HAS_N) != 0) normalCount++;
+        }
+        RtMaterialDiagnostics.reportAtlas(debugLabel, seen.size(), specCount, normalCount,
+                atlasW, atlasH, Integer.BYTES, 2);
     }
 
     /**
