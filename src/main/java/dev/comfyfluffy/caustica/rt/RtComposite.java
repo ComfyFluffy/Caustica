@@ -325,6 +325,13 @@ public final class RtComposite {
      * not trip {@code VanillaRenderController}'s permanent safety latch.</p>
      */
     public boolean requiresVanillaWorldFallback() {
+        // Pipeline creation publishes a new material epoch and deliberately makes composite() return
+        // false once so RtTerrain can apply the matching full clear. Keep vanilla alive for that bring-up
+        // frame; otherwise LevelRenderer is cancelled before composite() discovers it must fall back and
+        // VanillaRenderController permanently latches the resulting missing replacement frame.
+        if (worldPipeline == null || !materialBindingsReady) {
+            return true;
+        }
         if (materialEpochTraceGate) {
             return true;
         }
