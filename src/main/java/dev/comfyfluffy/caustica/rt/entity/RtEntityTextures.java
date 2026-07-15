@@ -78,12 +78,13 @@ public final class RtEntityTextures {
     // Descriptor array capacity of the currently alive world pipeline. A higher config value applies after
     // reset/recreate; a lower value stops allocating new slots immediately without invalidating old ones.
     private int capacity = maxTextures();
+    private int reservedTailSlots;
     private int nextSlot = 1;
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
 
     // Entity LabPBR: per-type _n/_s textures cached by resource Identifier (null = known-missing), closed
-    // on reset(). Per-slot presence (→ prim mat.w/mat.z) + a guard so a slot's _n/_s are resolved once
+    // on reset(). Per-slot presence feeds one compact capture feature mask; the guard resolves _n/_s once
     // (slots can be re-seen via the same shared texture handle every frame).
     private final Map<Identifier, DynamicTexture> materialCache = new HashMap<>();
     private boolean[] slotHasN = new boolean[capacity];
@@ -118,12 +119,12 @@ public final class RtEntityTextures {
         return slot;
     }
 
-    /** Whether the slot has a LabPBR {@code _n} (normal) map bound → the entity prim's {@code mat.w}. */
+    /** Whether the slot has a LabPBR {@code _n} (normal) map bound. */
     public boolean slotHasNormal(int slot) {
         return slot > 0 && slot < slotHasN.length && slotHasN[slot];
     }
 
-    /** Whether the slot has a LabPBR {@code _s} (specular) map bound → the entity prim's {@code mat.z}. */
+    /** Whether the slot has a LabPBR {@code _s} (specular) map bound. */
     public boolean slotHasSpec(int slot) {
         return slot > 0 && slot < slotHasS.length && slotHasS[slot];
     }
@@ -243,7 +244,13 @@ public final class RtEntityTextures {
 
     /** Drop the registry for a pipeline whose bindless descriptor arrays have this capacity. */
     public void reset(int descriptorCapacity) {
+        reset(descriptorCapacity, 0);
+    }
+
+    /** Reset while reserving the highest slots for canonical block-material page bundles. */
+    public void reset(int descriptorCapacity, int reservedTailSlots) {
         capacity = Math.max(1, descriptorCapacity);
+        this.reservedTailSlots = Math.max(0, Math.min(capacity - 1, reservedTailSlots));
         viewCache.clear();
         viewSlotCache.clear();
         atlasSlotCache.clear();
@@ -264,7 +271,7 @@ public final class RtEntityTextures {
     }
 
     private int slotLimit() {
-        return Math.min(capacity, maxTextures());
+        return Math.min(capacity - reservedTailSlots, maxTextures());
     }
 
     /**

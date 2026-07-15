@@ -11,12 +11,8 @@ import world_common;
 [[vk::push_constant]] PushAddr pcAddr;
 
 [[vk::binding(2, 0)]]  Sampler2D blockAtlas;
-// Parallel LabPBR _s (specular) and _n (normal) atlases, stitched to mirror the block atlas sprite
-// layout (RtBlockMaterials), sampled at the SAME uv as blockAtlas. MaterialHeader feature bits gate reads.
-[[vk::binding(9, 0)]]  Sampler2D blockSpecAtlas;
-[[vk::binding(10, 0)]] Sampler2D blockNormalAtlas;
-// Bindless entity textures — a runtime-sized array indexed per-prim (tint.w) by the entity hit path.
-// Slot 0 is a fallback. Parallel per-type LabPBR _n / _s at the same slot.
+// Shared bindless bundle arrays. Entity slots contain albedo/raw LabPBR maps. Reserved high slots contain
+// canonical material surface1/normalAo/surface0 pages, selected by MaterialHeader.texturePage.
 [[vk::binding(0, 1)]] Sampler2D entityTex[];
 [[vk::binding(1, 1)]] Sampler2D entityNormalTex[];
 [[vk::binding(2, 1)]] Sampler2D entitySpecTex[];
@@ -100,10 +96,10 @@ float rayConeUnitUvLod(uint rayCone, float2 textureSizePx) {
     return clamp(log2(footprint), 0.0, RAY_CONE_MAX_LOD);
 }
 
-// LabPBR _s decode (shared by terrain + entities): red = perceptual smoothness -> roughness; green =
+// Temporary standalone-entity LabPBR _s adapter: red = perceptual smoothness -> roughness; green =
 // reflectance (dielectric F0 0..229 / predefined metal 230..237 / generic metal albedo); alpha = emission
-// (255 = ignored). `albedo` feeds the generic-metal F0.
-void decodeSpec(float4 s, float3 albedo, out float rough, out float metal, out float3 f0, out float emission, out float sss) {
+// (255 = ignored). Block-atlas materials never execute this source decoder; they use evaluateMaterial.
+void decodeEntitySpec(float4 s, float3 albedo, out float rough, out float metal, out float3 f0, out float emission, out float sss) {
     rough = (1.0 - s.r) * (1.0 - s.r);
     float g = s.g * 255.0;
     if (g < 229.5) {
@@ -149,6 +145,54 @@ float3 perturbNormal(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float
     }
     ao = lerp(1.0, ntex.b, NORMAL_AO_STRENGTH);
     return nm;
+}
+
+struct Surface {
+    float3 normal;
+    float3 f0;
+    float roughness;
+    float metalness;
+    float emission;
+    float sss;
+    float ao;
+};
+
+// The sole terrain/block-atlas material evaluation path. LabPBR categorical bytes have already been
+// decoded on the CPU; every sample below is a continuously filterable physical channel with semantic mips.
+Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float3 albedo,
+        float3 geometricNormal, float3 p0, float3 p1, float3 p2,
+        float2 uv0, float2 uv1, float2 uv2, float3 vdir,
+        float fallbackRoughness, float fallbackMetalness, float fallbackEmission, bool allowSss) {
+    Surface surface;
+    surface.normal = geometricNormal;
+    surface.roughness = fallbackRoughness;
+    surface.metalness = fallbackMetalness;
+    surface.f0 = lerp(float3(0.04, 0.04, 0.04), albedo, fallbackMetalness);
+    surface.emission = fallbackEmission;
+    surface.sss = 0.0;
+    surface.ao = 1.0;
+
+    float2 localUv = clamp((atlasUv - header.albedoUv.xy) * header.albedoUv.zw,
+            float2(0.0, 0.0), float2(1.0, 1.0));
+    float2 pageUv = header.materialUv.xy + localUv * header.materialUv.zw;
+    float maxMaterialLod = float((header.features >> MATERIAL_MAX_LOD_SHIFT) & MATERIAL_MAX_LOD_MASK);
+    float materialLod = min(lod, maxMaterialLod);
+    uint page = header.texturePage;
+    if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) {
+        float4 surface0 = entitySpecTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
+        float4 surface1 = entityTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
+        surface.roughness = surface0.r;
+        surface.metalness = surface0.g;
+        surface.emission = surface0.b;
+        surface.sss = allowSss ? surface0.a : 0.0;
+        surface.f0 = surface1.rgb;
+    }
+    if ((header.features & MATERIAL_FEATURE_NORMAL) != 0u) {
+        float4 normalAo = entityNormalTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
+        surface.normal = perturbNormal(geometricNormal, p0, p1, p2, uv0, uv1, uv2,
+                vdir, normalAo, surface.ao);
+    }
+    return surface;
 }
 
 // Block-breaking overlay: shared by opaque terrain AND stained-glass/ice. Reconstructs the hit position
@@ -270,18 +314,25 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float emission = 0.0;
         float ao = 1.0;
         float sss = 0.0;
-        // LabPBR _s / _n for entities. mat.z/mat.w encode the source: 2 = block atlas (block-like
-        // entities — block items / falling / contained blocks; sampled from the terrain parallel atlases
-        // at the same UV), 1 = per-type bindless entity arrays.
-        if (pr.mat.z > 1.5) {
-            decodeSpec(blockSpecAtlas.SampleLevel(euvCoord, blockEntityLod), albedo, rough, metal, f0, emission, sss);
-        } else if (pr.mat.z > 0.5) {
-            decodeSpec(entitySpecTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod), albedo, rough, metal, f0, emission, sss);
+        // Negative mat.z encodes -(materialId+1) for block-atlas geometry, sharing the canonical terrain
+        // page path. Non-negative mat.z is one compact per-type entity feature mask; mat.w is reserved.
+        if (pr.mat.z < -0.5) {
+            uint materialId = uint(-pr.mat.z - 0.5);
+            MaterialHeader header = ConstPtr<MaterialHeader>(pcAddr.materialTableAddr)[materialId];
+            Surface surface = evaluateMaterial(header, euvCoord, blockEntityLod, albedo, n,
+                    ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
+                    rough, metal, 0.0, true);
+            rough = surface.roughness;
+            metal = surface.metalness;
+            f0 = surface.f0;
+            emission = surface.emission;
+            sss = surface.sss;
+            ao = surface.ao;
+            n = surface.normal;
+        } else if ((uint(pr.mat.z + 0.5) & MATERIAL_FEATURE_SPEC) != 0u) {
+            decodeEntitySpec(entitySpecTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod), albedo, rough, metal, f0, emission, sss);
         }
-        if (pr.mat.w > 1.5) {
-            n = perturbNormal(n, ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
-                    blockNormalAtlas.SampleLevel(euvCoord, blockEntityLod), ao);
-        } else if (pr.mat.w > 0.5) {
+        if (pr.mat.z >= -0.5 && (uint(pr.mat.z + 0.5) & MATERIAL_FEATURE_NORMAL) != 0u) {
             n = perturbNormal(n, ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
                     entityNormalTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod), ao);
         }
@@ -345,29 +396,27 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         n = -n;
     }
 
-    // LabPBR normal map (_n), gated by the compiled material feature mask.
-    float ao = 1.0;
-    if ((materialHeader.features & MATERIAL_FEATURE_NORMAL) != 0u) {
-        n = perturbNormal(n, tp0, tp1, tp2, uv0, uv1, uv2, vdir,
-                blockNormalAtlas.SampleLevel(uv, blockLod), ao);
-    }
-
     // Stained glass / ice: a thin colored filter resolved in raygen
     // (material 3). albedo carries the transmission tint = texel rgb mixed toward white by (1 − opacity),
     // so a more opaque texel tints transmitted light more strongly.
     if (materialHeader.model == MATERIAL_GLASS) {
         float4 gtex = blockAtlas.SampleLevel(uv, blockLod);
         float3 gtexRgb = srgbToLinear(gtex.rgb);
+        float3 glassAlbedo = lerp(float3(1.0, 1.0, 1.0), gtexRgb * tint, gtex.a);
+        Surface glassSurface = evaluateMaterial(materialHeader, uv, blockLod, glassAlbedo, n,
+                tp0, tp1, tp2, uv0, uv1, uv2, vdir,
+                materialHeader.params.x, materialHeader.params.y, 0.0, false);
+        n = glassSurface.normal;
         // Translucent blocks (glass, ice, …) are breakable too — apply the same overlay here, reusing
         // gtex (already sampled above) rather than re-fetching blockAtlas.
-        payload.albedo = applyBreaking(lerp(float3(1.0, 1.0, 1.0), gtexRgb * tint * ao, gtex.a),
+        payload.albedo = applyBreaking(glassAlbedo * glassSurface.ao,
                 rayCone, WorldRayOrigin(), WorldRayDirection(), RayTCurrent(), n);
         payload.normal = n;
         payload.hitT = RayTCurrent();
         payload.motionPrev = float3(0.0, 0.0, 0.0);
-        payload.f0 = float3(0.04, 0.04, 0.04);
-        payloadSetPacked(payload, MATERIAL_GLASS, materialHeader.params.x,
-                materialHeader.params.y, 0.0, 0.0);
+        payload.f0 = glassSurface.f0;
+        payloadSetPacked(payload, MATERIAL_GLASS, glassSurface.roughness,
+                glassSurface.metalness, 0.0, 0.0);
         return;
     }
 
@@ -375,37 +424,30 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // shades the surface as a clear dielectric and only needs the tint to derive the per-channel
     // Beer–Lambert absorption. Opaque terrain uses textured albedo.
     payload.albedo = materialHeader.model == MATERIAL_WATER
-            ? tint : srgbToLinear(blockAtlas.SampleLevel(uv, blockLod).rgb) * tint * ao;
-    payload.normal = n;
+            ? tint : srgbToLinear(blockAtlas.SampleLevel(uv, blockLod).rgb) * tint;
     payload.hitT = RayTCurrent();
     payload.motionPrev = float3(0.0, 0.0, 0.0); // static terrain: camera-only motion vector
     uint material = materialHeader.model == MATERIAL_WATER ? MATERIAL_WATER : MATERIAL_OPAQUE;
 
-    // Block-breaking overlay: opaque/cutout terrain (water skips — fluids aren't breakable, so
-    // breakCount==0 short-circuits it anyway; translucent glass/ice is handled at its own early-return
-    // above, reusing the gtex it already sampled instead of re-fetching blockAtlas here).
-    if (material != MATERIAL_WATER) {
-        payload.albedo = applyBreaking(payload.albedo, rayCone, WorldRayOrigin(), WorldRayDirection(), RayTCurrent(), n);
-    }
-
-    // Compiled defaults, overridden per-texel by LabPBR _s when present.
-    float rough = materialHeader.params.x;
-    float metal = materialHeader.params.y;
-    float3 f0 = lerp(float3(0.04, 0.04, 0.04), payload.albedo, metal);
     // normal.w packs the 0..1 block-light level plus a +2 offset flag for non-SOLID (cutout /
     // translucent) render layers, set at extraction so the hit can opt SOLID terrain out of SSS below.
     float ew = pr.normal.w;
     bool nonSolid = ew >= 1.5;
     float emission = nonSolid ? ew - 2.0 : ew; // heuristic emission source (block light level)
-    // LabPBR _s, gated by the material feature mask. When an _s map is authored we trust ITS emission and
-    // REPLACE the block-light heuristic, so emissive texels come from the pack, not the light level.
-    float sss = 0.0;
-    if ((materialHeader.features & MATERIAL_FEATURE_SPEC) != 0u) {
-        decodeSpec(blockSpecAtlas.SampleLevel(uv, blockLod), payload.albedo, rough, metal, f0, emission, sss);
-        if (!nonSolid) sss = 0.0; // SSS only on non-SOLID terrain (leaves/foliage); SOLID blocks opt out
+    Surface surface = evaluateMaterial(materialHeader, uv, blockLod, payload.albedo, n,
+            tp0, tp1, tp2, uv0, uv1, uv2, vdir,
+            materialHeader.params.x, materialHeader.params.y, emission, nonSolid);
+    n = surface.normal;
+    payload.albedo *= surface.ao;
+    // Block-breaking overlay: opaque/cutout terrain (water skips — fluids aren't breakable). Evaluate
+    // it after normal mapping so decal projection uses the same shading orientation as the old path.
+    if (material != MATERIAL_WATER) {
+        payload.albedo = applyBreaking(payload.albedo, rayCone, WorldRayOrigin(), WorldRayDirection(), RayTCurrent(), n);
     }
-    payload.f0 = f0;
-    payloadSetPacked(payload, material, rough, metal, emission, sss);
+    payload.normal = n;
+    payload.f0 = surface.f0;
+    payloadSetPacked(payload, material, surface.roughness, surface.metalness,
+            surface.emission, surface.sss);
     if (material == MATERIAL_WATER && entering) {
         payload.flags |= PAYLOAD_WATER_ENTERING;
     }

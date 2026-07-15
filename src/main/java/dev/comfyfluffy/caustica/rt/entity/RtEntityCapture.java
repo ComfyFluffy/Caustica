@@ -20,6 +20,8 @@ import org.joml.Vector3fc;
  * share the terrain upload + BLAS path verbatim.
  */
 public final class RtEntityCapture implements VertexConsumer {
+    static final int MATERIAL_SPEC = 1;
+    static final int MATERIAL_NORMAL = 2;
     private static final int DEFAULT_VERTEX_CAPACITY = 1024;
     // Same magnitude as RtTerrain.QuadCapture.OFFSET (2e-4 blocks) — proven large enough to break a BVH
     // depth tie without a visible gap at terrain/entity scale.
@@ -34,15 +36,11 @@ public final class RtEntityCapture implements VertexConsumer {
     // submitModel, so body + feature layers get their own texture). Stored per-prim in tint.w;
     // the hit shader samples entityTex[texSlot].
     int currentTexSlot;
-    // Whether the current submission's bindless slot has a LabPBR _s / _n map (→ prim mat.z/mat.w).
-    // Set by the collector per submission; mobs (per-type textures) may have them, atlas-sourced quads don't.
-    boolean currentHasS;
-    boolean currentHasN;
-    // Block-atlas geometry (dropped/held block items, falling blocks, contained block displays) samples the
-    // BLOCK atlas, so its LabPBR _s/_n live in the terrain parallel atlases (blockSpecAtlas/blockNormalAtlas)
-    // — NOT the per-type bindless arrays. When set, currentHasS/currentHasN refer to those: emitQuad encodes
-    // mat.z/mat.w as 2 (block atlas) instead of 1 (bindless entity), so world.rchit samples the right atlas.
-    boolean currentBlockAtlas;
+    // Compact per-submission LabPBR feature mask for the temporary standalone-entity adapter.
+    int currentMaterialFeatures;
+    // Block-atlas geometry reuses the compiled terrain material registry. Encoded as -(id+1) in mat.z;
+    // -1 means this submission uses the legacy per-type entity material path above.
+    int currentCanonicalMaterialId = -1;
     // Whether the current submission is an alpha-blended (translucent) render type — slime / sulfur-cube
     // shells, ghosts, … Stored per-prim in the otherwise-unused entity emission lane (normal.w); world.rahit
     // reads it and does stochastic transparency for those surfaces instead of a binary cutout, so the inner
@@ -80,9 +78,8 @@ public final class RtEntityCapture implements VertexConsumer {
         ensureVertexCapacity(expectedVertices);
         n = 0;
         currentTexSlot = 0;
-        currentHasS = false;
-        currentHasN = false;
-        currentBlockAtlas = false;
+        currentMaterialFeatures = 0;
+        currentCanonicalMaterialId = -1;
         currentTranslucent = false;
         currentOrder = 0;
         uvRemap = false;
@@ -132,9 +129,8 @@ public final class RtEntityCapture implements VertexConsumer {
     /** Copy the per-submission material/UV state into a second capture used by the parity harness. */
     void copySubmissionStateTo(RtEntityCapture target) {
         target.currentTexSlot = currentTexSlot;
-        target.currentHasS = currentHasS;
-        target.currentHasN = currentHasN;
-        target.currentBlockAtlas = currentBlockAtlas;
+        target.currentMaterialFeatures = currentMaterialFeatures;
+        target.currentCanonicalMaterialId = currentCanonicalMaterialId;
         target.currentTranslucent = currentTranslucent;
         target.currentOrder = currentOrder;
         target.uvRemap = uvRemap;
@@ -329,11 +325,13 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot
             prim.add(RtMaterials.ENTITY_ROUGH); // entities default to a matte dielectric
             prim.add(0f);                       // metalness
-            // mat.z / mat.w: LabPBR _s / _n presence + source. 0 = none, 1 = per-type bindless entity atlas,
-            // 2 = block atlas (block-like entities; sampled from the terrain _s/_n atlases).
-            float matSource = currentBlockAtlas ? 2f : 1f;
-            prim.add(currentHasS ? matSource : 0f); // mat.z
-            prim.add(currentHasN ? matSource : 0f); // mat.w
+            if (currentCanonicalMaterialId >= 0) {
+                prim.add(-(currentCanonicalMaterialId + 1.0f)); // canonical material ID, unambiguous vs flags
+                prim.add(0f);
+            } else {
+                prim.add((float) currentMaterialFeatures); // compact standalone-entity feature mask
+                prim.add(0f); // reserved
+            }
         }
     }
 

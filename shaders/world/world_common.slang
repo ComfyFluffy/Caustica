@@ -93,20 +93,24 @@ public struct TerrainPrim {
     public uint aux1;
 };
 
-// Compiled terrain material record (48 B). This compatibility header initially reproduces the old
-// roughness/metalness/LabPBR/translucent-average behavior; later milestones can consume the reserved
-// lanes without changing geometry. Java serialization is generated from Slang reflection.
+// Compiled material record (80 B). Source-format data has already been decoded into canonical pages;
+// texturePage indexes the shared bindless bundle arrays. materialUv maps sprite-local UV into the packed
+// page, while albedoUv maps the vanilla atlas rectangle back to sprite-local UV.
 public struct MaterialHeader {
     public uint model;
-    public uint features;
-    public uint extensionOffset;
-    public uint reserved;
+    public uint features;        // low feature bits; bits 24..31 = maximum valid material-page LOD
+    public uint texturePage;
+    public uint extensionOffset; // zero when no optional extension record is present
+    public float4 materialUv; // packed-page uvMin.xy + uvExtent.xy
+    public float4 albedoUv;   // vanilla atlas uvMin.xy + inverse uvExtent.xy
     public float4 params;  // roughness, metalness, IOR, transmission
     public float4 average; // whole-sprite linear-input average RGBA for translucent shadow filtering
 };
 
 public static const uint MATERIAL_FEATURE_SPEC = 1u;
 public static const uint MATERIAL_FEATURE_NORMAL = 2u;
+public static const uint MATERIAL_MAX_LOD_SHIFT = 24u;
+public static const uint MATERIAL_MAX_LOD_MASK = 255u;
 
 // Per-section geometry record: packed buffer addresses + per-bucket triangle offsets
 // (gl_PrimitiveID restarts at 0 per geometry, so hit shaders re-add triBase[geometryIndex]).

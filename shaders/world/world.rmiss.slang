@@ -14,7 +14,7 @@ import world_common;
 
 // Vanilla celestials atlas (sun + moon-phase sprites), bound by RtComposite. Sampled with an explicit
 // LOD (no derivatives in a miss shader). The sun/moon discs are drawn from its real texels.
-[[vk::binding(11, 0)]] Sampler2D celestialsAtlas;
+[[vk::binding(9, 0)]] Sampler2D celestialsAtlas;
 
 static const float PI = 3.14159265359;
 float pow2(float x) { return x * x; }

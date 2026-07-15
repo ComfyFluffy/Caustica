@@ -33,6 +33,7 @@ public final class RtTerrainMaterials {
     public static final int MODEL_GLASS = 3;
     public static final int FEATURE_SPEC = 1;
     public static final int FEATURE_NORMAL = 2;
+    private static final int MAX_LOD_SHIFT = 24;
 
     private static final int MODEL_VARIANTS = 2; // ordinary opaque/cutout and thin glass
     private static final int VARIANT_OPAQUE = 0;
@@ -47,14 +48,15 @@ public final class RtTerrainMaterials {
 
     /** Build and atomically publish a complete registry for the currently prepared block atlas. */
     public void rebuild(RtContext ctx, RtBlockMaterials blockMaterials) {
-        Map<TextureAtlasSprite, Integer> flagsBySprite = blockMaterials.preparedFlags();
-        List<TextureAtlasSprite> sprites = new ArrayList<>(flagsBySprite.keySet());
+        Map<TextureAtlasSprite, RtBlockMaterials.Entry> entriesBySprite = blockMaterials.preparedEntries();
+        List<TextureAtlasSprite> sprites = new ArrayList<>(entriesBySprite.keySet());
         sprites.sort(Comparator.comparing(sprite -> sprite.contents().name().toString()));
+        RtBlockMaterials.Entry fallbackEntry = blockMaterials.entry(null);
 
         int profileVariants = RtMaterials.Profile.values().length * MODEL_VARIANTS;
         List<MaterialHeaderData> headers = new ArrayList<>(3 + profileVariants
                 + sprites.size() * profileVariants);
-        headers.add(header(MODEL_OPAQUE, 0, RtMaterials.Profile.DEFAULT, transparentWhiteAverage()));
+        headers.add(header(MODEL_OPAQUE, 0, RtMaterials.Profile.DEFAULT, transparentWhiteAverage(), fallbackEntry));
         int[] fallbackVariants = new int[RtMaterials.Profile.values().length * MODEL_VARIANTS];
         for (RtMaterials.Profile profile : RtMaterials.Profile.values()) {
             int opaqueIndex = index(profile, false);
@@ -62,28 +64,28 @@ public final class RtTerrainMaterials {
                 fallbackVariants[opaqueIndex] = 0;
             } else {
                 fallbackVariants[opaqueIndex] = headers.size();
-                headers.add(header(MODEL_OPAQUE, 0, profile, transparentWhiteAverage()));
+                headers.add(header(MODEL_OPAQUE, 0, profile, transparentWhiteAverage(), fallbackEntry));
             }
             fallbackVariants[index(profile, true)] = headers.size();
-            headers.add(header(MODEL_GLASS, 0, profile, transparentWhiteAverage()));
+            headers.add(header(MODEL_GLASS, 0, profile, transparentWhiteAverage(), fallbackEntry));
         }
         int waterId = headers.size();
-        headers.add(header(MODEL_WATER, 0, RtMaterials.Profile.WATER, whiteAverage()));
+        headers.add(header(MODEL_WATER, 0, RtMaterials.Profile.WATER, whiteAverage(), fallbackEntry));
         int lavaId = headers.size();
-        headers.add(header(MODEL_OPAQUE, 0, RtMaterials.Profile.LAVA, whiteAverage()));
+        headers.add(header(MODEL_OPAQUE, 0, RtMaterials.Profile.LAVA, whiteAverage(), fallbackEntry));
 
         IdentityHashMap<TextureAtlasSprite, int[]> ids = new IdentityHashMap<>();
         for (TextureAtlasSprite sprite : sprites) {
-            int sourceFlags = flagsBySprite.getOrDefault(sprite, 0);
-            int features = ((sourceFlags & RtParallelAtlas.HAS_S) != 0 ? FEATURE_SPEC : 0)
-                    | ((sourceFlags & RtParallelAtlas.HAS_N) != 0 ? FEATURE_NORMAL : 0);
+            RtBlockMaterials.Entry entry = entriesBySprite.get(sprite);
+            int features = ((entry.features() & RtBlockMaterials.HAS_S) != 0 ? FEATURE_SPEC : 0)
+                    | ((entry.features() & RtBlockMaterials.HAS_N) != 0 ? FEATURE_NORMAL : 0);
             float[] average = averageColor(sprite);
             int[] variants = new int[RtMaterials.Profile.values().length * MODEL_VARIANTS];
             for (RtMaterials.Profile profile : RtMaterials.Profile.values()) {
                 variants[index(profile, false)] = headers.size();
-                headers.add(header(MODEL_OPAQUE, features, profile, average));
+                headers.add(header(MODEL_OPAQUE, features, profile, average, entry));
                 variants[index(profile, true)] = headers.size();
-                headers.add(header(MODEL_GLASS, features, profile, average));
+                headers.add(header(MODEL_GLASS, features, profile, average, entry));
             }
             ids.put(sprite, variants);
         }
@@ -154,12 +156,15 @@ public final class RtTerrainMaterials {
     }
 
     private static MaterialHeaderData header(int model, int features, RtMaterials.Profile profile,
-                                             float[] average) {
+                                             float[] average, RtBlockMaterials.Entry entry) {
         float roughness = model == MODEL_GLASS ? 0.05f : profile.roughness();
         float metalness = model == MODEL_GLASS ? 0.0f : profile.metalness();
         float ior = model == MODEL_WATER ? 1.333f : (model == MODEL_GLASS ? 1.52f : 1.0f);
         float transmission = model == MODEL_WATER || model == MODEL_GLASS ? 1.0f : 0.0f;
-        return new MaterialHeaderData(model, features, 0, 0,
+        int packedFeatures = features | (entry.maxLod() << MAX_LOD_SHIFT);
+        return new MaterialHeaderData(model, packedFeatures, entry.textureSlot(), 0,
+                new Float4(entry.materialU(), entry.materialV(), entry.materialDu(), entry.materialDv()),
+                new Float4(entry.albedoU(), entry.albedoV(), entry.albedoInvDu(), entry.albedoInvDv()),
                 new Float4(roughness, metalness, ior, transmission),
                 new Float4(average[0], average[1], average[2], average[3]));
     }

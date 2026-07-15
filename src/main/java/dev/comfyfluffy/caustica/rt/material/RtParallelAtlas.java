@@ -29,13 +29,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>Generalized from the block-atlas case ({@link RtBlockMaterials}) so the same machinery serves the
  * block-entity atlases (chest / sign / bed / shulker / banner …) via {@link RtEntityMaterials}: the
  * source atlas is a constructor parameter. A sprite whose {@code _s}/{@code _n} map is missing keeps the
- * caller's fallback (signalled per-prim via the free {@code mat.z}/{@code mat.w} lanes).
+ * caller's fallback (signalled through the entity material feature mask).
  *
  * <p>Upload reuses MC's own texture path ({@link DynamicTexture}); each {@code GpuTextureView} handle is
  * stable across re-uploads, so descriptors are bound once.
  */
 public final class RtParallelAtlas {
-    /** Per-sprite flag bits returned by {@link #ensure} (stored in {@code mat.z}/{@code mat.w}). */
+    /** Per-sprite feature bits returned by {@link #ensure}. */
     public static final int HAS_S = 1;
     public static final int HAS_N = 2;
 
@@ -73,7 +73,7 @@ public final class RtParallelAtlas {
 
         void create() {
             close();
-            image = new NativeImage(atlasW, atlasH, true); // zeroed: unfilled texels are gated by mat.z/.w
+            image = new NativeImage(atlasW, atlasH, true); // zeroed: unfilled texels are feature-gated
             tex = new DynamicTexture(() -> label, image);  // creates + uploads the GpuTexture
             dirty = false;
         }

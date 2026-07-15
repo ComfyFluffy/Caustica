@@ -326,6 +326,9 @@ public final class RtComposite {
         if (materialEpochTraceGate) {
             return true;
         }
+        if (worldPipeline != null && RtEntityTextures.maxTextures() > bindlessTextureCapacity) {
+            return true;
+        }
         if (reloadRebindRequested) {
             long atlas = blockAtlasView();
             return atlas == 0L || atlas == boundAtlasHandle;
@@ -499,7 +502,7 @@ public final class RtComposite {
             bindlessTextureCapacity = RtEntityTextures.maxTextures();
             worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(),
                     new String[]{"world.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
-                    PushAddrData.BYTE_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true, true);
+                    PushAddrData.BYTE_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true);
             // Per-frame push data lives in this BDA ring; the pipeline only pushes its address.
             if (pushRing == null) {
                 pushRing = new RtBuffer[PUSH_RING];
@@ -537,8 +540,8 @@ public final class RtComposite {
 
     /**
      * Resolve + bind every world-pipeline texture: the block atlas (binding 2 + bindless fallback slot 0)
-     * and the LabPBR {@code _s}/{@code _n} parallel atlases (bindings 9/10). Shared by first creation and
-     * the post-reload rebind. Resets the entity bindless registry, recreates the material atlases, builds
+     * and the canonical material page bundles in reserved bindless slots. Shared by first creation and
+     * the post-reload rebind. Resets the entity bindless registry, recreates material pages, builds
      * the immutable terrain material snapshot, and invalidates old-epoch geometry before tracing resumes.
      */
     private void bindWorldTextures(RtContext ctx) {
@@ -548,24 +551,13 @@ public final class RtComposite {
         worldPipeline.setAtlasSampler(atlasView, sampler);
         // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
         // resolved samples something defined rather than an unbound (partially-bound) descriptor.
-        RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity);
+        RtBlockMaterials.INSTANCE.reset();
+        RtBlockMaterials.INSTANCE.prepareAll(ctx, bindlessTextureCapacity);
+        RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity, RtBlockMaterials.INSTANCE.pageCount());
         worldPipeline.setBindlessTexture(0, 0, atlasView, sampler); // binding 0 (albedo), slot 0 fallback
-        // LabPBR _s + _n parallel atlases. Bind the (block-atlas-sized) atlases; their pixels fill
-        // lazily as terrain extraction encounters sprites and refresh via flush(). Fall back to the block
-        // atlas view if an atlas didn't initialize so bindings 9/10 always hold a valid descriptor —
-        // the shader only samples them when a material-table feature is set, so fallback is never read.
-        if (worldPipeline.hasBlockMaterialAtlases()) {
-            RtBlockMaterials.INSTANCE.reset();
-            // Build the full _s/_n atlases now (parallel decode + blit), before terrain tessellates, so
-            // ensure() is a pure lookup on the build path instead of decoding each sprite's maps lazily.
-            RtBlockMaterials.INSTANCE.prepareAll();
-            RtTerrainMaterials.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE);
-            long specView = RtBlockMaterials.INSTANCE.viewS();
-            long normalView = RtBlockMaterials.INSTANCE.viewN();
-            worldPipeline.setBlockSpecAtlas(specView != 0L ? specView : atlasView, sampler);
-            worldPipeline.setBlockNormalAtlas(normalView != 0L ? normalView : atlasView, sampler);
-            materialBindingsReady = true;
-        }
+        RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler);
+        RtTerrainMaterials.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE);
+        materialBindingsReady = true;
         // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
         // handle is stable across frames; the shader only samples it inside the sun/moon discs (sky
         // directions), so the block-atlas fallback is never read if the celestials atlas isn't ready.
@@ -861,9 +853,6 @@ public final class RtComposite {
             ).write(push);
             // Upload any entity textures registered this frame into the bindless set before the trace.
             RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
-            // Re-upload the LabPBR _s atlas if extraction added sprites since the last frame (the
-            // view handle is stable, so no re-bind needed). Before the trace records, like uploadPending.
-            RtBlockMaterials.INSTANCE.flush();
             RtEntityMaterials.INSTANCE.flushAll(); // block-entity parallel _s/_n blitted during capture
             // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
             // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
@@ -1241,7 +1230,7 @@ public final class RtComposite {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
                         .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
-                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_LINEAR)
                         .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
                         .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
                         .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
