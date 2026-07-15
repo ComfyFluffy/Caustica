@@ -1306,9 +1306,11 @@ public final class RtEntities {
                 RtFrameStats.FRAME.endStage("entity.capture.rigidReuse.yaw", yawStart);
             }
             if (localTransform == null) {
+                RtFrameStats.FRAME.count("entityRigidFitFailures", 1);
                 ea.retryYawFitAfter = now + 8L;
                 return false;
             }
+            RtFrameStats.FRAME.count("entityRigidFitSuccesses", 1);
             ea.retryYawFitAfter = 0L;
         }
         // Same topology + rigid pose, but tint/sprite/material lanes may still have changed (dyed sheep,
