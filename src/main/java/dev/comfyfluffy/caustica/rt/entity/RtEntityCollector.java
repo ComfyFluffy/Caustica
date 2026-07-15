@@ -132,7 +132,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                 if (TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
                     // A block entity drawing from the block atlas (rare) → reuse the terrain _s/_n atlases.
                     capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation());
-                    setBlockMaterial(sprite);
+                    setSpriteMaterial(sprite);
                 } else {
                     // Dedicated block-entity atlas: albedo remains atlas-bound, while the immutable
                     // canonical texels were pack-compiled. Appending the first-seen sprite header only
@@ -274,14 +274,14 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         capture.currentTexSlot = sprite != null
                 ? RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation())
                 : 0;
-        setBlockMaterial(sprite); // block-atlas sprites (block items/falling/contained blocks) → terrain _s/_n
+        setSpriteMaterial(sprite);
         capture.currentTranslucent = false; // block/item geometry is opaque (the inner content we want solid)
         capture.currentOrder = 0; // baked-quad paths never stack decal layers
         capture.addBakedQuad(pose, q, tintColor(q.materialInfo().tintIndex(), tintLayers));
     }
 
     /** Resolve block-atlas geometry through the same immutable material snapshot as terrain. */
-    private void setBlockMaterial(TextureAtlasSprite sprite) {
+    private void setSpriteMaterial(TextureAtlasSprite sprite) {
         if (sprite != null && TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
             capture.currentMaterialId = RtTerrainMaterials.INSTANCE.requireSnapshot()
                     .resolve(sprite, RtMaterials.Profile.DEFAULT, false, false);
@@ -510,7 +510,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             @Override
             public void put(float x, float y, float z, BakedQuad quad, QuadInstance instance) {
                 capture.currentTexSlot = slot;
-                setBlockMaterial(quad.materialInfo().sprite()); // resolve the block-atlas material ID
+                setSpriteMaterial(quad.materialInfo().sprite());
                 capture.currentTranslucent = false; // falling blocks are opaque
                 capture.currentOrder = 0; // baked-quad paths never stack decal layers
                 capture.addBakedQuad(pose, quad, -1); // white tint (falling blocks rarely biome-tinted)

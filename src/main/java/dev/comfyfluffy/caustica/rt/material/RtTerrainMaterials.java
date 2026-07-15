@@ -56,12 +56,19 @@ public final class RtTerrainMaterials {
     private long nextEpoch;
     private Map<Identifier, Integer> entityTextureIds = Map.of();
     private Map<Identifier, EntityTemplate> entityTemplates = Map.of();
-    private final IdentityHashMap<TextureAtlasSprite, Integer> entitySpriteIds = new IdentityHashMap<>();
+    private final Map<EntitySpriteKey, Integer> entitySpriteIds = new HashMap<>();
     private int entityFallbackId;
     private int nextDynamicId;
     private int tableCapacity;
 
     private record EntityTemplate(RtMaterialDesc desc, RtBlockMaterials.Entry entry) {
+    }
+
+    /** Stable within one atlas epoch even if capture presents a different sprite wrapper instance. */
+    private record EntitySpriteKey(Identifier name, Identifier atlas) {
+        static EntitySpriteKey of(TextureAtlasSprite sprite) {
+            return new EntitySpriteKey(sprite.contents().name(), sprite.atlasLocation());
+        }
     }
 
     private RtTerrainMaterials() {
@@ -285,9 +292,10 @@ public final class RtTerrainMaterials {
      */
     public synchronized int resolveEntitySprite(TextureAtlasSprite sprite) {
         if (sprite == null) return entityFallbackId;
-        Integer current = entitySpriteIds.get(sprite);
+        EntitySpriteKey key = EntitySpriteKey.of(sprite);
+        Integer current = entitySpriteIds.get(key);
         if (current != null) return current;
-        EntityTemplate template = entityTemplates.get(sprite.contents().name());
+        EntityTemplate template = entityTemplates.get(key.name());
         if (template == null) return entityFallbackId;
         if (nextDynamicId >= tableCapacity || table == null) {
             throw new IllegalStateException("RT entity material header reserve exhausted");
@@ -301,7 +309,7 @@ public final class RtTerrainMaterials {
                 .order(ByteOrder.nativeOrder());
         header.write(target);
         table.flush(offset, MaterialHeaderData.BYTE_SIZE);
-        entitySpriteIds.put(sprite, id);
+        entitySpriteIds.put(key, id);
         return id;
     }
 

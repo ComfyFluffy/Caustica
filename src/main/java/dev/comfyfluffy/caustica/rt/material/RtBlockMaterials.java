@@ -18,11 +18,13 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /** Compiles block and entity LabPBR inputs into canonical pages with explicit semantic mip chains. */
 public final class RtBlockMaterials {
@@ -40,8 +42,8 @@ public final class RtBlockMaterials {
     private static final int PACK_ALIGNMENT = 1 << MAX_VALID_LOD;
 
     private final Map<TextureAtlasSprite, Entry> entries = new IdentityHashMap<>();
-    // Logical full-texture/sprite name (entity/zombie/zombie or entity/chest/normal)
-    // (entity/chest/normal) -> canonical page mapping. Unlike block entries, albedo UVs are filled by
+    // Logical full-texture/sprite name (entity/zombie/zombie or entity/chest/normal) to canonical page
+    // mapping. Unlike block entries, albedo UVs are filled by
     // the material-table registry: full textures use [0,1], atlas sprites append their actual atlas rect.
     private final Map<Identifier, Entry> resourceEntries = new HashMap<>();
     private final List<Page> pages = new ArrayList<>();
@@ -510,9 +512,9 @@ public final class RtBlockMaterials {
 
     private static Map<Identifier, Integer> discoverEntityMaterialResources(
             List<TextureAtlasSprite> blockSprites, RtMaterialOverrides overrides) {
-        Map<Identifier, Boolean> blockNames = new HashMap<>();
+        Set<Identifier> blockNames = new HashSet<>();
         for (TextureAtlasSprite sprite : blockSprites) {
-            if (sprite != null) blockNames.put(sprite.contents().name(), Boolean.TRUE);
+            if (sprite != null) blockNames.add(sprite.contents().name());
         }
         Map<Identifier, Integer> result = new LinkedHashMap<>();
         Map<Identifier, Resource> authored = Minecraft.getInstance().getResourceManager().listResources(
@@ -525,11 +527,11 @@ public final class RtBlockMaterials {
             String albedoPath = path.substring(0, path.length() - 6) + ".png";
             Identifier albedo = Identifier.fromNamespaceAndPath(material.getNamespace(), albedoPath);
             Identifier name = logicalTextureName(albedo);
-            if (blockNames.containsKey(name) || !resourceExists(albedo)) continue;
+            if (blockNames.contains(name) || !resourceExists(albedo)) continue;
             result.merge(albedo, spec ? HAS_SPEC : HAS_NORMAL, (a, b) -> a | b);
         }
         for (RtMaterialOverrides.Rule rule : overrides.rules()) {
-            if (rule.block() != null || blockNames.containsKey(rule.sprite())) {
+            if (rule.block() != null || blockNames.contains(rule.sprite())) {
                 continue;
             }
             Identifier albedo = textureLocation(rule.sprite());

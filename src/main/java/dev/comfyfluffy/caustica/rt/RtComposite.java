@@ -334,7 +334,7 @@ public final class RtComposite {
         if (materialEpochTraceGate) {
             return true;
         }
-        if (worldPipeline != null && RtEntityTextures.maxTextures() > bindlessTextureCapacity) {
+        if (RtEntityTextures.maxTextures() > bindlessTextureCapacity) {
             return true;
         }
         if (reloadRebindRequested) {
@@ -550,7 +550,7 @@ public final class RtComposite {
      * Resolve + bind every world-pipeline texture: the block atlas (binding 2 + bindless fallback slot 0)
      * and the canonical material page bundles in reserved bindless slots. Shared by first creation and
      * the post-reload rebind. Resets the entity bindless registry, recreates material pages, builds
-     * the immutable terrain material snapshot, and invalidates old-epoch geometry before tracing resumes.
+     * the shared material registry, and invalidates old-epoch geometry before tracing resumes.
      */
     private void bindWorldTextures(RtContext ctx) {
         long sampler = atlasSampler(ctx);
