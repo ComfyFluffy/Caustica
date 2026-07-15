@@ -69,7 +69,8 @@ public final class RtFrameStats {
                     "frame.displayMap",
                     "frame.copyOutput"
             },
-            new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted", "entitiesCaptured", "refits",
+            new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted",
+                    "entitiesCaptured", "blockEntitiesCaptured", "particlesCaptured", "refits",
                     "entityReuse", "entityRigidFitSuccesses", "entityRigidFitFailures",
                     "vmaBufferCreates",
                     "entityModelSubmissions", "entityCuboids",

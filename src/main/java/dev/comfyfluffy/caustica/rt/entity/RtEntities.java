@@ -99,6 +99,18 @@ public final class RtEntities {
         return CausticaConfig.Rt.Entities.MAX_ENTITIES.value();
     }
 
+    private static int maxOtherEntities() {
+        return CausticaConfig.Rt.Entities.MAX_OTHER_ENTITIES.value();
+    }
+
+    private static int maxBlockEntities() {
+        return CausticaConfig.Rt.Entities.MAX_BLOCK_ENTITIES.value();
+    }
+
+    private static int maxParticles() {
+        return CausticaConfig.Rt.Entities.MAX_PARTICLES.value();
+    }
+
     private static int entityListCapacity() {
         return CausticaConfig.Rt.Entities.entityListCapacity();
     }
@@ -540,14 +552,15 @@ public final class RtEntities {
         MotionArena motion;                     // suballocated entity/BE/particle displacement uploads
         long tableBase;
         long geomTableAddr;
-        int count;
+        int count;        // geometry-table entries / TLAS instances
+        int logicalCount; // ordinary entities + block entities + individual particles
 
         FrameBuild(List<RtAccel.Instance> base) {
             this.base = base;
         }
 
         boolean full() {
-            return count >= maxEntities();
+            return logicalCount >= maxEntities();
         }
     }
 
@@ -625,8 +638,9 @@ public final class RtEntities {
         glowCamOffsetY = (float) (cameraState.pos.y - rby);
         glowCamOffsetZ = (float) (cameraState.pos.z - rbz);
         resetPoseStack(entityPoseStack);
+        int capturedThisFrame = 0;
         for (Entity entity : level.entitiesForRendering()) {
-            if (build.full()) {
+            if (build.full() || capturedThisFrame >= maxOtherEntities()) {
                 break;
             }
             if (entity.isInvisible()) {
@@ -720,7 +734,9 @@ public final class RtEntities {
                 appendCapture(ctx, build, motion, id, ENTITY_BIT, mask,
                         translationTransform(ix - rbx, iy - rby, iz - rbz));
             }
+            build.logicalCount++;
             RtFrameStats.FRAME.count("entitiesCaptured", 1);
+            capturedThisFrame++;
         }
         Int2ObjectOpenHashMap<EntityPrev> oldPrev = prevVerts;
         prevVerts = curVerts;
@@ -873,7 +889,8 @@ public final class RtEntities {
      */
     private void captureParticles(RtContext ctx, FrameBuild build, Minecraft mc, float partial,
                                   int rbx, int rby, int rbz, Matrix4f projection, Matrix4f viewRotation) {
-        if (!particlesEnabled() || build.full()) {
+        int particleLimit = maxParticles();
+        if (!particlesEnabled() || particleLimit == 0 || build.full()) {
             particlePrev.clear();
             particleCur.clear();
             return;
@@ -900,10 +917,15 @@ public final class RtEntities {
         frustum.prepare(camPos.x, camPos.y, camPos.z);
         IdentityHashMap<Particle, ParticlePrev> cur = particleCur;
         cur.clear();
+        int particlesCaptured = 0;
         try {
+            particleGroups:
             for (ParticleGroup<?> group : groups.values()) {
                 Queue<? extends Particle> queue = ((ParticleGroupAccessor) group).caustica$getParticles();
                 for (Particle p : queue) {
+                    if (build.full() || particlesCaptured >= particleLimit) {
+                        break particleGroups;
+                    }
                     if (!(p instanceof SingleQuadParticle sq)) {
                         continue; // item-pickup / elder-guardian particles aren't billboard quads (skip)
                     }
@@ -931,6 +953,8 @@ public final class RtEntities {
                         continue;
                     }
                     appendParticleMv(p, particleCenterScratch, vertBefore, vertAfter, rbx, rby, rbz, cur);
+                    build.logicalCount++;
+                    particlesCaptured++;
                 }
             }
         } catch (Throwable t) {
@@ -938,6 +962,7 @@ public final class RtEntities {
             particleDisp.clear();
             throw new RuntimeException("RT particle capture failed", t); // propagate to composite() (see entity path)
         }
+        RtFrameStats.FRAME.count("particlesCaptured", particlesCaptured);
         IdentityHashMap<Particle, ParticlePrev> oldPrev = particlePrev;
         particlePrev = cur;
         particleCur = oldPrev;
@@ -1023,9 +1048,10 @@ public final class RtEntities {
                 return byDistance != 0 ? byDistance : Long.compare(a.posKey, b.posKey);
             });
         }
+        int firstBlockEntity = build.count;
         try {
             for (BeCandidate candidate : candidates) {
-                if (build.full()) {
+                if (build.full() || build.count - firstBlockEntity >= maxBlockEntities()) {
                     return;
                 }
                 updateBlockEntity(ctx, build, beDispatcher, candidate.be, partial, now, rbx, rby, rbz);
@@ -1172,6 +1198,8 @@ public final class RtEntities {
         build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress,
                 ENTITY_BIT | (build.count & 0x7FFFFF), 0xFF, RtAccel.SBT_ENTITY_OFFSET));
         build.count++;
+        build.logicalCount++;
+        RtFrameStats.FRAME.count("blockEntitiesCaptured", 1);
     }
 
     /** Retire a cached block entity's persistent AS + mesh buffers once off all in-flight queues. */

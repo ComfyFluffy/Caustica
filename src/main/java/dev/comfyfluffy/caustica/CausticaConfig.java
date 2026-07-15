@@ -584,7 +584,13 @@ public final class CausticaConfig {
             public static final BooleanSetting CAPTURE_PARITY =
                     bool("caustica.rt.entityCaptureParity", "entities.debug.capture-parity", false);
             public static final IntSetting MAX_ENTITIES =
-                    intAtLeast("caustica.rt.maxEntities", "entities.max-entities", 1024, 1);
+                    intAtLeast("caustica.rt.maxEntities", "entities.max-entities", 3072, 1);
+            public static final IntSetting MAX_OTHER_ENTITIES =
+                    intAtLeast("caustica.rt.maxOtherEntities", "entities.max-other-entities", 1024, 0);
+            public static final IntSetting MAX_BLOCK_ENTITIES =
+                    intAtLeast("caustica.rt.maxBlockEntities", "entities.block-entities.max-entities", 1024, 0);
+            public static final IntSetting MAX_PARTICLES =
+                    intAtLeast("caustica.rt.maxParticles", "particles.max-particles", 1024, 0);
             public static final IntSetting BE_VIEW_CHUNKS =
                     intAtLeast("caustica.rt.beViewChunks", "entities.block-entities.view-chunks", 8, 0);
             public static final IntSetting BE_BUILDS_PER_FRAME =
@@ -601,7 +607,7 @@ public final class CausticaConfig {
 
             public static int entityMapCapacity() {
                 // Fastutil expected-size constructors apply their own load-factor headroom.
-                return Math.max(16, MAX_ENTITIES.value());
+                return Math.max(16, MAX_OTHER_ENTITIES.value());
             }
         }
 
