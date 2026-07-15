@@ -10,12 +10,13 @@ module world_common;
 public typealias ConstPtr<T> = Ptr<T, Access.Read, AddressSpace.Device, Std430DataLayout>;
 
 // Push constant block. Only the first 8 bytes (worldPushAddr) are meaningful to rgen/rchit/rmiss;
-// the hot inline lanes (tableAddr/entityTableAddr/frameIndex) exist so world.rahit's per-hit
+// the hot inline lanes (tableAddr/entityTableAddr/materialTableAddr/frameIndex) exist so hit-stage
 // Section/EntityGeom fetch skips the extra global-memory load of dereferencing WorldPush first.
 public struct PushAddr {
     public uint64_t worldPushAddr;
     public uint64_t tableAddr;
     public uint64_t entityTableAddr;
+    public uint64_t materialTableAddr;
     public uint frameIndex;
 };
 
@@ -74,14 +75,38 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 // to be read together, but they get distinct bits anyway to keep the two concerns unambiguous.
 public static const uint PAYLOAD_WATER_ENTERING = 8u;
 
-// Terrain per-triangle record (48 B, stride must match RtTerrain's upload).
-// mat = {roughness, metalness, hasS, hasN} for solid/cutout; TRANSLUCENT-bucket prims repurpose it as
-// a precomputed whole-sprite average color {r,g,b,a} (RtTerrain.emit()/translucentAvgColor).
+// Entity per-triangle record (48 B). Entity migration follows the terrain material-ID path separately.
 public struct Prim {
     public float4 normal;
     public float4 tint;
     public float4 mat;
 };
+
+// Terrain per-triangle record (48 B). The final 16-byte lane contains integer geometry-local metadata;
+// shared surface parameters live once in MaterialHeader instead of being copied into every triangle.
+public struct TerrainPrim {
+    public float4 normal;
+    public float4 tint;
+    public uint materialId;
+    public uint flags;
+    public uint aux0;
+    public uint aux1;
+};
+
+// Compiled terrain material record (48 B). This compatibility header initially reproduces the old
+// roughness/metalness/LabPBR/translucent-average behavior; later milestones can consume the reserved
+// lanes without changing geometry. Java serialization is generated from Slang reflection.
+public struct MaterialHeader {
+    public uint model;
+    public uint features;
+    public uint extensionOffset;
+    public uint reserved;
+    public float4 params;  // roughness, metalness, IOR, transmission
+    public float4 average; // whole-sprite linear-input average RGBA for translucent shadow filtering
+};
+
+public static const uint MATERIAL_FEATURE_SPEC = 1u;
+public static const uint MATERIAL_FEATURE_NORMAL = 2u;
 
 // Per-section geometry record: packed buffer addresses + per-bucket triangle offsets
 // (gl_PrimitiveID restarts at 0 per geometry, so hit shaders re-add triBase[geometryIndex]).

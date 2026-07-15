@@ -87,7 +87,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     // Water radiance rays use a closest-hit-only SBT record. Shadow rays run this record: tint sunlight by
     // the biome water color, then keep walking so submerged terrain is lit by colored transmission.
     if (bucket == BUCKET_WATER) {
-        Prim pr = ConstPtr<Prim>(sec.primAddr)[tri];
+        TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
         shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, WATER_SHADOW_TINT);
         // Record the NEAREST water crossing (any-hit order is arbitrary) in the otherwise-unused alpha
         // lane. For an underwater shading point this is the exit point of its sun shadow ray, where
@@ -98,21 +98,23 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
 
     // Translucent radiance rays use a closest-hit-only SBT record; shadow rays tint and pass through here.
     // This doesn't touch the atlas at all: a shadow ray only needs the pane's overall tint/opacity, so
-    // pr.mat carries a precomputed whole-sprite average {r,g,b,a} with biome tint baked in at pack time
-    // (RtTerrain.emit()/translucentAvgColor) — one 16-byte mat lane, no scattered UV gather.
+    // MaterialHeader carries a precomputed whole-sprite average {r,g,b,a}; per-primitive biome tint is
+    // applied here. The average is compiled once per resource epoch rather than copied per triangle.
     //
     // Modeled as Beer-Lambert absorption (matching the water medium in world.rgen): a per-channel
     // extinction derived from how dark the average is, scaled by the average alpha (how much of the
     // sprite is glass-colorant vs. see-through frame), so saturated panes darken transmitted light
     // non-linearly. Multiplying into shadowVis.rgb compounds correctly across stacked panes.
     if (bucket == BUCKET_TRANSLUCENT) {
-        Prim pr = ConstPtr<Prim>(sec.primAddr)[tri];
-        float3 avgColor = max(pr.mat.rgb, float3(1.0e-3, 1.0e-3, 1.0e-3));
+        TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
+        MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pcAddr.materialTableAddr)[pr.materialId];
+        float3 avgColor = max(materialHeader.average.rgb * pr.tint.rgb,
+                float3(1.0e-3, 1.0e-3, 1.0e-3));
         float3 colorExtinction = max(-log(avgColor), float3(0.0, 0.0, 0.0));
         // The neutral floor is a flat per-hit dimming, NOT scaled by alpha: vanilla clear glass has a low
         // natural alpha, so folding it into the alpha-scaled term crushed it to near-zero for exactly the
         // white/clear-glass case it's meant to cover.
-        shadowVis.rgb *= exp(-colorExtinction * pr.mat.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
+        shadowVis.rgb *= exp(-colorExtinction * materialHeader.average.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
         IgnoreHit();
     }
 

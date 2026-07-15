@@ -70,9 +70,9 @@ public final class RtFrameStats {
                     "frame.copyOutput"
             },
             new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted",
-                    "entitiesCaptured", "blockEntitiesCaptured", "particlesCaptured", "refits",
-                    "entityReuse", "entityRigidFitSuccesses", "entityRigidFitFailures",
-                    "vmaBufferCreates",
+                    "terrainMaterialEpochRejects", "entitiesCaptured", "blockEntitiesCaptured",
+                    "particlesCaptured", "refits", "entityReuse", "entityRigidFitSuccesses",
+                    "entityRigidFitFailures", "vmaBufferCreates",
                     "entityModelSubmissions", "entityCuboids",
                     "entityModelQuads", "entityModelVertices", "entityBakedQuads", "entityBakedVertices",
                     "entityDirectSubmissions", "entityDirectFallbacks", "entityDirectQuads", "entityDirectVertices",

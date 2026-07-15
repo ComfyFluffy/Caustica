@@ -52,6 +52,7 @@ import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.material.RtEntityMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtTerrainMaterials;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
@@ -171,6 +172,9 @@ public final class RtComposite {
     private int bindlessTextureCapacity;
     // True after the LabPBR atlases have been resolved/bound for the currently alive world pipeline.
     private boolean materialBindingsReady;
+    // Set when a new material epoch is published. The first composite returns to vanilla so the next
+    // client tick can apply RtTerrain's full-clear before any old-epoch primitive IDs are traced.
+    private boolean materialEpochTraceGate;
     // World push data (256 B) lives in a host-visible BDA ring; only the 8-byte slot address is pushed
     // inline (256-byte NVIDIA push constant ceiling is otherwise exhausted by the world push struct).
     // One slot per in-flight frame, cycled per frame so an in-flight slot is never overwritten.
@@ -428,6 +432,10 @@ public final class RtComposite {
             exposure.ensureResources(ctx);
             refreshPipelineShapeIfNeeded(ctx);
             RtPipeline active = ensureWorld(ctx);
+            if (materialEpochTraceGate) {
+                materialEpochTraceGate = false;
+                return false;
+            }
             refreshMaterialBindingsIfNeeded(ctx);
             updateMotion();
             recordFrame(ctx, active, nativeColor);
@@ -446,9 +454,8 @@ public final class RtComposite {
 
     /**
      * Bring the world pipeline + LabPBR atlases up as soon as we're in a world and the block atlas is
-     * loaded — <em>before</em> terrain tessellates — so per-prim material flags ({@code hasS}/{@code
-     * hasN}) resolve from the first section. That makes PBR-on-join structural rather than relying on a
-     * re-extract after the fact. Driven from the client tick ahead of {@link RtTerrain#update}. No-op once
+     * loaded — <em>before</em> terrain tessellates — so the immutable material snapshot is available to
+     * the first worker section. Driven from the client tick ahead of {@link RtTerrain#update}. No-op once
      * the pipeline exists, while a reload rebuild is pending (the reload path rebuilds against the new
      * atlas), or until we're in a world with the atlas ready. The heavy {@code _s}/{@code _n} atlases are
      * deliberately not built at the menu — only once a world is entered.
@@ -512,11 +519,8 @@ public final class RtComposite {
     /**
      * Resolve + bind every world-pipeline texture: the block atlas (binding 2 + bindless fallback slot 0)
      * and the LabPBR {@code _s}/{@code _n} parallel atlases (bindings 9/10). Shared by first creation and
-     * the post-reload rebind. Resets the entity bindless registry and recreates the {@code _s}/{@code _n}
-     * atlases at the current block-atlas size, then re-extracts all terrain ({@link RtTerrain#markAllDirty})
-     * so per-prim material flags are recomputed against the (re)built atlases. On first creation this runs
-     * before terrain is resident (see {@link #ensureResourcesReady}), so the re-extract is a no-op and PBR
-     * is structural; on a resource reload it refreshes the flags of the already-resident terrain.
+     * the post-reload rebind. Resets the entity bindless registry, recreates the material atlases, builds
+     * the immutable terrain material snapshot, and invalidates old-epoch geometry before tracing resumes.
      */
     private void bindWorldTextures(RtContext ctx) {
         long sampler = atlasSampler(ctx);
@@ -530,12 +534,13 @@ public final class RtComposite {
         // LabPBR _s + _n parallel atlases. Bind the (block-atlas-sized) atlases; their pixels fill
         // lazily as terrain extraction encounters sprites and refresh via flush(). Fall back to the block
         // atlas view if an atlas didn't initialize so bindings 9/10 always hold a valid descriptor —
-        // the shader only samples them when a prim is flagged (mat.z/mat.w), so the fallback is never read.
+        // the shader only samples them when a material-table feature is set, so fallback is never read.
         if (worldPipeline.hasBlockMaterialAtlases()) {
             RtBlockMaterials.INSTANCE.reset();
             // Build the full _s/_n atlases now (parallel decode + blit), before terrain tessellates, so
             // ensure() is a pure lookup on the build path instead of decoding each sprite's maps lazily.
             RtBlockMaterials.INSTANCE.prepareAll();
+            RtTerrainMaterials.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE);
             long specView = RtBlockMaterials.INSTANCE.viewS();
             long normalView = RtBlockMaterials.INSTANCE.viewN();
             worldPipeline.setBlockSpecAtlas(specView != 0L ? specView : atlasView, sampler);
@@ -550,7 +555,10 @@ public final class RtComposite {
             worldPipeline.setSkyAtlas(celView != 0L ? celView : atlasView, sampler);
         }
         setCelestialUvAtlas(celView);
-        RtTerrain.markAllDirty();
+        // Atlas UVs and material IDs are one resource epoch. Drop old terrain as a unit rather than
+        // incrementally displaying old UVs/IDs against the new atlas/table.
+        RtTerrain.requestFullClear();
+        materialEpochTraceGate = true;
     }
 
     private void refreshMaterialBindingsIfNeeded(RtContext ctx) {
@@ -581,8 +589,7 @@ public final class RtComposite {
      * the world pipeline outright</b> — dropping every descriptor reference (block atlas binding 2 +
      * bindless set) — so MC can free its textures cleanly. The pipeline is cheap to rebuild (no terrain
      * re-upload); {@code ensureWorld} recreates it on the first world frame after the reload, once the new
-     * atlas is ready (gated in {@link #composite}). Terrain stays resident and is re-extracted via
-     * {@code markAllDirty()} so material flags pick up the new pack.
+     * atlas is ready (gated in {@link #composite}). The new material epoch clears terrain before trace.
      */
     public void onResourceReloadStart() {
         reloadRebindRequested = true;
@@ -590,11 +597,14 @@ public final class RtComposite {
         setCelestialUvAtlas(0L);
         RtEntities.INSTANCE.onResourceReload();
         RtContext ctx = RtContext.currentOrNull();
-        if (ctx != null && worldPipeline != null) {
+        if (ctx != null) {
             ctx.waitIdle();
-            worldPipeline.destroy();
-            worldPipeline = null;
-            bindlessTextureCapacity = 0;
+            if (worldPipeline != null) {
+                worldPipeline.destroy();
+                worldPipeline = null;
+                bindlessTextureCapacity = 0;
+            }
+            RtTerrainMaterials.INSTANCE.destroy();
         }
     }
 
@@ -861,6 +871,7 @@ public final class RtComposite {
             // don't pay for a second global-memory dereference through pcAddr.worldPushAddr first.
             ByteBuffer pushAddr = stack.malloc(PushAddrData.BYTE_SIZE);
             new PushAddrData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
+                    RtTerrainMaterials.INSTANCE.tableAddress(),
                     (int) frameCounter).write(pushAddr);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.trace")) {
@@ -1187,6 +1198,8 @@ public final class RtComposite {
         }
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
+        materialEpochTraceGate = false;
+        RtTerrainMaterials.INSTANCE.destroy();
         if (pushRing != null) {
             for (RtBuffer b : pushRing) {
                 if (b != null) {

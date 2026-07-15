@@ -15,15 +15,35 @@ import java.util.Set;
 public final class RtMaterials {
     private RtMaterials() {}
 
-    private static final float DEFAULT_ROUGH = 0.9f;
-    private static final float METAL_ROUGH = 0.3f;
-    private static final float GLASS_ROUGH = 0.1f;
-    private static final float SMOOTH_ROUGH = 0.35f;
+    public enum Profile {
+        DEFAULT(0.9f, 0.0f),
+        METAL(0.3f, 1.0f),
+        GLASS(0.1f, 0.0f),
+        SMOOTH(0.35f, 0.0f),
+        WATER(0.08f, 0.0f),
+        LAVA(0.7f, 0.0f);
+
+        private final float roughness;
+        private final float metalness;
+
+        Profile(float roughness, float metalness) {
+            this.roughness = roughness;
+            this.metalness = metalness;
+        }
+
+        public float roughness() {
+            return roughness;
+        }
+
+        public float metalness() {
+            return metalness;
+        }
+    }
 
     /** Water roughness; near-smooth so DLSS-RR resolves stable reflections. */
-    public static final float WATER_ROUGH = 0.08f;
+    public static final float WATER_ROUGH = Profile.WATER.roughness();
     /** Lava: opaque emitter, moderately rough. */
-    public static final float LAVA_ROUGH = 0.7f;
+    public static final float LAVA_ROUGH = Profile.LAVA.roughness();
     /** Default entity roughness. */
     public static final float ENTITY_ROUGH = 0.8f;
 
@@ -36,25 +56,22 @@ public final class RtMaterials {
 
     /** Perceptual roughness for this block's surface. */
     public static float roughness(BlockState state) {
-        if (state == null) {
-            return DEFAULT_ROUGH;
-        }
+        return profile(state).roughness();
+    }
+
+    /** Stable, finite heuristic profile used as part of a compiled material key. */
+    public static Profile profile(BlockState state) {
+        if (state == null) return Profile.DEFAULT;
         SoundType sound = state.getSoundType();
-        if (isMetal(sound)) {
-            return METAL_ROUGH;
-        }
-        if (sound == SoundType.GLASS) {
-            return GLASS_ROUGH;
-        }
-        if (SMOOTH.contains(state.getBlock())) {
-            return SMOOTH_ROUGH;
-        }
-        return DEFAULT_ROUGH;
+        if (isMetal(sound)) return Profile.METAL;
+        if (sound == SoundType.GLASS) return Profile.GLASS;
+        if (SMOOTH.contains(state.getBlock())) return Profile.SMOOTH;
+        return Profile.DEFAULT;
     }
 
     /** Metalness (1 = conductor: F0 tinted by albedo, no diffuse; 0 = dielectric). */
     public static float metalness(BlockState state) {
-        return state != null && isMetal(state.getSoundType()) ? 1f : 0f;
+        return profile(state).metalness();
     }
 
     private static boolean isMetal(SoundType sound) {

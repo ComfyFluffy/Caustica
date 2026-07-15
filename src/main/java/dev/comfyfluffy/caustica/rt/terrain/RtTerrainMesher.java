@@ -3,7 +3,6 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import com.mojang.blaze3d.vertex.QuadInstance;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.comfyfluffy.caustica.CausticaConfig;
-import dev.comfyfluffy.caustica.mixin.SpriteContentsAccessor;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
@@ -11,9 +10,9 @@ import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
-import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.material.RtMaterialAbi;
 import dev.comfyfluffy.caustica.rt.material.RtMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtTerrainMaterials;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
@@ -25,7 +24,6 @@ import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import it.unimi.dsi.fastutil.objects.ObjectIterator;
-import com.mojang.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.color.block.BlockTintSource;
@@ -47,14 +45,11 @@ import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
-import net.minecraft.util.ARGB;
 import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 final class RtTerrainMesher {
     /**
@@ -83,14 +78,18 @@ final class RtTerrainMesher {
     /**
      * Tessellate one section to a section-local CPU mesh and precompute pure-CPU sidecar data such as
      * the terrain opacity micromap. <b>Pure CPU + snapshot reads only</b> — no Vulkan, no shared mutable
-     * state — so this is the unit a worker thread runs. Terrain LabPBR sprite references are carried to
-     * buffer preparation; the render thread resolves them through the material atlas at publication.
+     * state — so this is the unit a worker thread runs. The task captures one immutable material snapshot
+     * and writes its IDs directly; publication performs no resource lookup or primitive-buffer patch.
      * Returns the mesh (possibly empty — caller checks {@code idx}).
      */
     static CpuSection buildCpuSection(BlockAndTintGetter region, BlockStateModelSet modelSet,
                                               ModelBlockRenderer renderer, QuadCapture capture,
                                               FluidRenderer fluidRenderer, FluidCapture fluidCapture,
-                                              SectionMesh mesh, BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
+                                              SectionMesh mesh, BlockPos.MutableBlockPos m,
+                                              RtTerrainMaterials.Snapshot materials,
+                                              int scx, int scy, int scz) {
+        capture.materials = materials;
+        fluidCapture.materials = materials;
         tessellate(region, modelSet, renderer, capture, fluidRenderer, fluidCapture, mesh, m, scx, scy, scz);
         if (mesh.isEmpty()) {
             return new CpuSection(null, null);
@@ -120,9 +119,8 @@ final class RtTerrainMesher {
         int[] indices = new int[idxCount];
         float[] uvs = new float[uvFloats];
         float[] material = new float[primFloats];
-        TextureAtlasSprite[] materialSprites = new TextureAtlasSprite[triCount];
         int[] triBase = new int[buckets.length];
-        int posOff = 0, idxOff = 0, uvOff = 0, matOff = 0, spriteOff = 0, vertBase = 0, triAcc = 0;
+        int posOff = 0, idxOff = 0, uvOff = 0, matOff = 0, vertBase = 0, triAcc = 0;
         for (int b = 0; b < buckets.length; b++) {
             Geom geom = buckets[b];
             triBase[b] = triAcc;
@@ -141,16 +139,14 @@ final class RtTerrainMesher {
             System.arraycopy(geom.cornerUv.elements(), 0, uvs, uvOff, uvSize);
             int matSize = geom.prim.size();
             System.arraycopy(geom.prim.elements(), 0, material, matOff, matSize);
-            geom.materialSprites.copyInto(materialSprites, spriteOff);
             posOff += vertSize;
             idxOff += idxSize;
             uvOff += uvSize;
             matOff += matSize;
-            spriteOff += bucketTris[b];
             vertBase += vertSize / 3;
             triAcc += bucketTris[b];
         }
-        return new PackedSection(positions, indices, uvs, material, materialSprites, bucketTris, triBase);
+        return new PackedSection(positions, indices, uvs, material, bucketTris, triBase);
     }
 
     private static void tessellate(BlockAndTintGetter region, BlockStateModelSet modelSet,
@@ -205,50 +201,7 @@ final class RtTerrainMesher {
 
     /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays. */
     record PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
-                                 TextureAtlasSprite[] materialSprites,
-                                 int[] bucketTris, int[] triBase) {
-    }
-
-    // Whole-sprite average {r, g, b, a} for TRANSLUCENT-bucket sprites (stained glass, ice, …), keyed by
-    // sprite identity. world.rahit's shadow-ray path reads this (packed into the prim's otherwise-unused
-    // mat lane for translucent triangles — see emit()) instead of sampling blockAtlas per-hit: a shadow
-    // ray only needs the pane's overall tint/opacity, not per-texel pattern detail, and this is by far
-    // the hottest per-hit texture read in the any-hit shader. Computed lazily from worker threads during
-    // tessellation, so it must be concurrency-safe; sprite objects (and this cache) are invalidated for
-    // free by the next atlas stitch replacing them with new instances.
-    private static final Map<TextureAtlasSprite, float[]> TRANSLUCENT_AVG_CACHE = new ConcurrentHashMap<>();
-
-    private static float[] translucentAvgColor(TextureAtlasSprite sprite) {
-        float[] cached = TRANSLUCENT_AVG_CACHE.get(sprite);
-        if (cached != null) {
-            return cached;
-        }
-        float[] avg = computeAvgColor(sprite);
-        TRANSLUCENT_AVG_CACHE.put(sprite, avg);
-        return avg;
-    }
-
-    /** Average {r, g, b, a} (0..1) over every texel of a sprite's first frame. */
-    private static float[] computeAvgColor(TextureAtlasSprite sprite) {
-        var contents = sprite.contents();
-        int width = contents.width();
-        int height = contents.height();
-        NativeImage image = ((SpriteContentsAccessor) contents).caustica$originalImage();
-        if (image == null || width <= 0 || height <= 0) {
-            return new float[]{1f, 1f, 1f, 0f};
-        }
-        long sr = 0, sg = 0, sb = 0, sa = 0;
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int px = image.getPixel(x, y); // frame 0 always occupies the image's top-left tile
-                sr += ARGB.red(px);
-                sg += ARGB.green(px);
-                sb += ARGB.blue(px);
-                sa += ARGB.alpha(px);
-            }
-        }
-        float count = (float) width * height * 255f;
-        return new float[]{sr / count, sg / count, sb / count, sa / count};
+                         int[] bucketTris, int[] triBase) {
     }
 
 
@@ -336,13 +289,8 @@ final class RtTerrainMesher {
         // aligned with `idx`'s triangle order so the hit shader reads cornerUv[3*pid + k] directly with no
         // index->vertex-UV gather. The index buffer is still emitted (above) for the BLAS build.
         final FloatArrayList cornerUv;
-        // 12 floats/triangle: normal.xyz+emission, tint.rgb+material, mat.{rough,metal,hasS,hasN} —
-        // except TRANSLUCENT triangles, whose mat lane instead holds a precomputed sprite avg {r,g,b,a}
-        // (see emit()/translucentAvgColor).
+        // 12 lanes/triangle: normal float4, tint float4, then TerrainPrim's uint material metadata.
         final FloatArrayList prim;
-        // One sprite per prim record (per triangle), aligned with `prim`. Resolved on the render thread
-        // because RtBlockMaterials.ensure can lazy-load material maps.
-        final SpriteList materialSprites;
         // One sprite per triangle for opacity micromap classification.
         final SpriteList ommSprites;
 
@@ -353,7 +301,6 @@ final class RtTerrainMesher {
             idx = new IntArrayList(cap * 3);
             cornerUv = new FloatArrayList(cap * 6);
             prim = new FloatArrayList(cap * 12);
-            materialSprites = new SpriteList(cap);
             ommSprites = new SpriteList(cap);
         }
 
@@ -366,7 +313,6 @@ final class RtTerrainMesher {
             idx.clear();
             cornerUv.clear();
             prim.clear();
-            materialSprites.clear();
             ommSprites.clear();
         }
     }
@@ -410,6 +356,7 @@ final class RtTerrainMesher {
     /** Captures the quads vanilla's model renderer emits into the current section's mesh. */
     private static final class QuadCapture implements BlockQuadOutput {
         SectionMesh cur; // set before each tesselateBlock call
+        RtTerrainMaterials.Snapshot materials;
 
         // Per-block context for biome tint, set before each tesselateBlock call. We resolve the tint
         // straight from BlockColors (pure biome color) rather than QuadInstance.getColor, which bakes
@@ -478,15 +425,9 @@ final class RtTerrainMesher {
 
             // Emissive: vanilla block light level (0..15) -> 0..1, stashed in the free normal.w slot.
             q.emission = state != null ? state.getLightEmission() / 15f : 0f;
-            // Heuristic PBR material (roughness, metalness) for the GGX BRDF / DLSS-RR guides.
-            q.rough = RtMaterials.roughness(state);
-            q.metal = RtMaterials.metalness(state);
             TextureAtlasSprite sprite = quad.materialInfo().sprite();
             q.sprite = sprite;
-            // TRANSLUCENT prims repurpose the mat lane for a precomputed avg color/alpha (emit(), for
-            // world.rahit's shadow path) instead of LabPBR hasS/hasN flags, so keep materialSprite null —
-            // resolveMaterials() already skips null entries, which avoids it clobbering that lane.
-            q.materialSprite = q.translucent ? null : sprite;
+            q.materialId = materials.resolve(sprite, RtMaterials.profile(state), q.translucent);
         }
 
         /** Acquire a pooled PendingQuad for the current block (grown on demand, count reset by flushBlock). */
@@ -622,17 +563,7 @@ final class RtTerrainMesher {
             addTriUv(g, q.uv[0], q.uv[1], q.uv[2]);
             addTriUv(g, q.uv[0], q.uv[2], q.uv[3]);
             FloatArrayList prim = g.prim;
-            // TRANSLUCENT prims never read mat.{rough,metal,hasS,hasN} in either hit shader (world.rchit's
-            // stained-glass/ice early return hardcodes roughness/metalness and never checks hasS/hasN), so
-            // the mat lane is repurposed to carry this sprite's precomputed whole-texture average {r,g,b,a}
-            // instead — world.rahit's shadow path reads it rather than sampling blockAtlas per-hit. Biome
-            // tint is pre-multiplied into the stored rgb here (a per-quad CPU-side multiply) so that shadow
-            // path never needs pr.tint.rgb at all — just the one 16-byte mat lane, not a second scattered
-            // load elsewhere in the 48-byte Prim record. rchit's radiance path still reads the real,
-            // un-multiplied tint.rgb from the prim's own tint lane (written below as usual) for its
-            // per-texel shading, so this doesn't affect how glass looks head-on.
-            float[] avgColor = q.translucent ? translucentAvgColor(q.sprite) : null;
-            for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
+            for (int t = 0; t < 2; t++) {
                 prim.add(q.nx);
                 prim.add(q.ny);
                 prim.add(q.nz);
@@ -642,19 +573,11 @@ final class RtTerrainMesher {
                 prim.add(q.tr);
                 prim.add(q.tg);
                 prim.add(q.tb);
-                prim.add(q.translucent ? 2f : 0f); // tint.w material flag: 2 = stained glass / ice (0 opaque)
-                if (avgColor != null) {
-                    prim.add(avgColor[0] * q.tr);
-                    prim.add(avgColor[1] * q.tg);
-                    prim.add(avgColor[2] * q.tb);
-                    prim.add(avgColor[3]);
-                } else {
-                    prim.add(q.rough);
-                    prim.add(q.metal);
-                    prim.add(0f); // hasS placeholder; patched by resolveMaterials()
-                    prim.add(0f); // hasN placeholder
-                }
-                g.materialSprites.add(q.materialSprite);
+                prim.add(0f);
+                prim.add(Float.intBitsToFloat(q.materialId)); // TerrainPrim.materialId uint bits
+                prim.add(0f); // flags
+                prim.add(0f); // aux0
+                prim.add(0f); // aux1
                 g.ommSprites.add(q.sprite);
             }
         }
@@ -668,8 +591,9 @@ final class RtTerrainMesher {
         boolean cutout; // non-SOLID render layer (alpha-tested) — also an overlay candidate
         boolean translucent; // TRANSLUCENT layer (stained glass / ice): colored-transmission dielectric
         boolean tinted; // tintIndex >= 0 — the tinted member of a base+overlay pair
-        float tr, tg, tb, emission, rough, metal;
-        TextureAtlasSprite sprite, materialSprite;
+        float tr, tg, tb, emission;
+        int materialId;
+        TextureAtlasSprite sprite;
     }
 
     /** Append one triangle's 3 corner UVs (6 floats) from packed UVPairs. UVPair packs u in the high 32
@@ -710,6 +634,7 @@ final class RtTerrainMesher {
      */
     private static final class FluidCapture implements VertexConsumer, FluidRenderer.Output {
         SectionMesh cur;     // set before each section
+        RtTerrainMaterials.Snapshot materials;
         float emission;      // set per fluid block (lava = 1, water = 0)
         boolean water;       // set per fluid block: true for water (dielectric), false for lava
         private int n;
@@ -770,9 +695,7 @@ final class RtTerrainMesher {
                 ny /= len;
                 nz /= len;
             }
-            float material = water ? 1f : 0f; // tint.w: 1 = water dielectric, 0 = opaque (lava)
-            // Water is a near-smooth dielectric; lava is a moderately rough opaque emitter.
-            float rough = water ? RtMaterials.WATER_ROUGH : RtMaterials.LAVA_ROUGH;
+            int materialId = water ? materials.waterId() : materials.lavaId();
             // Biome water tint: vanilla's FluidRenderer bakes BiomeColors.getAverageWaterColor into the
             // per-vertex colour, so the average of the quad's four colours is this water body's tint. The
             // path tracer turns it into a per-channel Beer–Lambert extinction (ocean blue vs swamp green).
@@ -798,12 +721,11 @@ final class RtTerrainMesher {
                 prim.add(tr);
                 prim.add(tg);
                 prim.add(tb);
-                prim.add(material);
-                prim.add(rough);
-                prim.add(0f); // metalness (fluids are dielectric)
-                prim.add(0f); // hasS (fluids carry no LabPBR atlas material)
-                prim.add(0f); // hasN
-                g.materialSprites.add(null);
+                prim.add(0f);
+                prim.add(Float.intBitsToFloat(materialId));
+                prim.add(0f);
+                prim.add(0f);
+                prim.add(0f);
                 g.ommSprites.add(null);
             }
         }

@@ -222,6 +222,14 @@ abstract class GenerateShaderRecords extends DefaultTask {
         Map worldType = probeArray.type.elementType as Map
         int worldByteSize = probeArray.type.uniformStride as int
 
+        def materialParameter = reflection.parameters.find { it.name == "materialHeaderLayoutProbe" }
+        def materialProbeArray = materialParameter?.type?.resultType?.fields?.find { it.name == "values" }
+        if (materialProbeArray?.type?.kind != "array" || materialProbeArray.type.elementType?.name != "MaterialHeader") {
+            throw new GradleException("unexpected MaterialHeader reflection probe shape")
+        }
+        Map materialHeaderType = materialProbeArray.type.elementType as Map
+        int materialHeaderByteSize = materialProbeArray.type.uniformStride as int
+
         def pushParameter = reflection.parameters.find { it.name == "pushAddrLayoutProbe" }
         if (pushParameter?.type?.elementType?.name != "PushAddr") {
             throw new GradleException("Slang reflection omitted pushAddrLayoutProbe")
@@ -239,5 +247,7 @@ abstract class GenerateShaderRecords extends DefaultTask {
                 generateJava(worldType, worldByteSize, "WorldPushData"), "UTF-8")
         new File(packageDir, "PushAddrData.java").setText(
                 generateJava(pushAddrType, pushAddrByteSize, "PushAddrData"), "UTF-8")
+        new File(packageDir, "MaterialHeaderData.java").setText(
+                generateJava(materialHeaderType, materialHeaderByteSize, "MaterialHeaderData"), "UTF-8")
     }
 }

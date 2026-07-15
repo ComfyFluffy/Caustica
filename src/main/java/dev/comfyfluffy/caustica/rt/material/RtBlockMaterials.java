@@ -3,6 +3,8 @@ package dev.comfyfluffy.caustica.rt.material;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 
+import java.util.Map;
+
 /**
  * LabPBR {@code _s}/{@code _n} parallel atlases mirroring the block atlas. A thin wrapper over
  * {@link RtParallelAtlas}; {@link #prepareAll} pre-enumerates all block-atlas sprites so terrain
@@ -33,6 +35,11 @@ public final class RtBlockMaterials {
     /** The {@link #HAS_S}|{@link #HAS_N} presence bitmask for a block-atlas sprite. */
     public int ensure(TextureAtlasSprite sprite) {
         return atlas.ensure(sprite);
+    }
+
+    /** Immutable material-map flags captured after {@link #prepareAll}. */
+    public Map<TextureAtlasSprite, Integer> preparedFlags() {
+        return atlas.preparedFlags();
     }
 
     /** Re-upload atlases that gained sprites since last flush. Call before the trace records. */

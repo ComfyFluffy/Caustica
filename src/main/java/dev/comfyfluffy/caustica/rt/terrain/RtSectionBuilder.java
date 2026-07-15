@@ -3,10 +3,8 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
-import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.material.RtMaterialAbi;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrainMesher.PackedSection;
-import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import org.lwjgl.system.MemoryUtil;
 
 /** Worker-owned terrain buffer allocation/fill and BLAS preparation. */
@@ -53,11 +51,11 @@ final class RtSectionBuilder {
             blas = RtAccel.prepareTerrainBlas(ctx, positions, vertCount, indices,
                     packed.bucketTris(), ommInput, label + " BLAS");
             return new PreparedSection(key, positions, indices, uvs, material, blas,
-                    packed.triBase(), packed.materialSprites(), sox, soy, soz);
+                    packed.triBase(), sox, soy, soz);
         } catch (Throwable t) {
             if (blas != null) {
                 destroy(new PreparedSection(key, positions, indices, uvs, material, blas,
-                        packed.triBase(), packed.materialSprites(), sox, soy, soz));
+                        packed.triBase(), sox, soy, soz));
             } else {
                 if (material != null) material.destroy();
                 if (uvs != null) uvs.destroy();
@@ -66,21 +64,6 @@ final class RtSectionBuilder {
             }
             throw t;
         }
-    }
-
-    /** Patch primitive records' hasS/hasN lanes via render-thread material ingestion. */
-    static void resolveMaterials(PreparedSection prepared) {
-        for (int t = 0; t < prepared.materialSprites.length; t++) {
-            TextureAtlasSprite sprite = prepared.materialSprites[t];
-            if (sprite == null) {
-                continue;
-            }
-            int flags = RtBlockMaterials.INSTANCE.ensure(sprite);
-            long base = prepared.material.mapped + ((long) t * 12 + 10) * Float.BYTES;
-            MemoryUtil.memPutFloat(base, (flags & RtBlockMaterials.HAS_S) != 0 ? 1f : 0f);
-            MemoryUtil.memPutFloat(base + Float.BYTES, (flags & RtBlockMaterials.HAS_N) != 0 ? 1f : 0f);
-        }
-        prepared.material.flush();
     }
 
     static void destroy(PreparedSection prepared) {
@@ -95,6 +78,6 @@ final class RtSectionBuilder {
     /** Worker-owned native section state paired with its prepared BLAS. */
     record PreparedSection(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs,
                            RtBuffer material, RtAccel.PreparedBlas blas, int[] triBase,
-                           TextureAtlasSprite[] materialSprites, int sx, int sy, int sz) {
+                           int sx, int sy, int sz) {
     }
 }

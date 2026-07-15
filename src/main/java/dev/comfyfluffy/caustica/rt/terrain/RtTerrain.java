@@ -5,7 +5,6 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import com.mojang.blaze3d.vertex.QuadInstance;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.comfyfluffy.caustica.CausticaConfig;
-import dev.comfyfluffy.caustica.mixin.SpriteContentsAccessor;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
@@ -14,8 +13,7 @@ import dev.comfyfluffy.caustica.rt.RtFrameStats;
 import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
-import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
-import dev.comfyfluffy.caustica.rt.material.RtMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtTerrainMaterials;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
@@ -26,7 +24,6 @@ import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import it.unimi.dsi.fastutil.objects.ObjectIterator;
-import com.mojang.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.color.block.BlockTintSource;
@@ -48,14 +45,11 @@ import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
-import net.minecraft.util.ARGB;
 import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static dev.comfyfluffy.caustica.rt.terrain.RtTerrainMesher.WORKER_TESS;
@@ -166,9 +160,6 @@ public final class RtTerrain {
     // InvalidateRenderStateCallback = vanilla LevelExtractor.allChanged() (dimension change via setLevel,
     // render-distance change, F3+A). Consumed in tick(), where the RT context is available.
     private volatile boolean fullClearRequested;
-    // Re-extract every live section to recompute LabPBR material flags against (re)loaded atlases — used
-    // after a resource reload, which does NOT route through allChanged(). Consumed in tick().
-    private volatile boolean reresolveAllRequested;
     private volatile boolean dirtyPending;
     // Rebase origin (player block at the last TLAS rebuild) for the instance transforms + ray camOffset.
     public int blockX;
@@ -234,7 +225,7 @@ public final class RtTerrain {
      * and dispatch immutable snapshots to workers, bounded by configured per-pass counts.
      */
     public static void frame(RtContext ctx) {
-        INSTANCE.frameStream(ctx);
+        if (RtTerrainMaterials.INSTANCE.isReady()) INSTANCE.frameStream(ctx);
     }
 
     public static void shutdown(RtContext ctx) {
@@ -283,19 +274,8 @@ public final class RtTerrain {
      * dimension change (via {@code setLevel}), a render-distance change, and F3+A. Thread-safe.
      */
     public static void requestFullClear() {
-        INSTANCE.fullClearRequested = true;
-    }
-
-    /**
-     * Mark every resident (and known-empty) section for re-extraction so its per-prim LabPBR material
-     * flags ({@code hasS}/{@code hasN}) are recomputed against freshly (re)loaded atlases. Used after a
-     * resource reload, which does <em>not</em> route through {@code allChanged()}. Geometry stays live
-     * until each section's rebuild swaps in. Applied on the next {@link #tick} (render thread).
-     */
-    public static void markAllDirty() {
-        // The atlas (and thus sprite identities + UVs) changed — drop cached per-triangle classifications.
         RtTerrainOmm.clearCache();
-        INSTANCE.reresolveAllRequested = true;
+        INSTANCE.fullClearRequested = true;
     }
 
     private void tick(RtContext ctx) {
@@ -306,6 +286,9 @@ public final class RtTerrain {
             clear(ctx, false); // left the world — drop all geometry (drains + frees, incl. any in-flight build)
             return;
         }
+        if (!RtTerrainMaterials.INSTANCE.isReady()) {
+            return; // resource reload gap: keep old work dormant until the new epoch requests a full clear
+        }
 
         // Full clear on an explicit invalidation — vanilla's LevelExtractor.allChanged() via the Fabric
         // InvalidateRenderStateCallback. That fires on a dimension switch (setLevel → allChanged),
@@ -315,16 +298,6 @@ public final class RtTerrain {
         if (fullClearRequested) {
             fullClearRequested = false;
             clear(ctx, false);
-        }
-
-        // Re-extract all live sections after a resource reload so material flags pick up the new atlases.
-        if (reresolveAllRequested) {
-            reresolveAllRequested = false;
-            synchronized (dirtyLock) {
-                dirty.addAll(resident.keySet());
-                dirty.addAll(empty);
-                dirtyPending = true;
-            }
         }
 
         int pbx = mc.player.getBlockX();
@@ -997,7 +970,9 @@ public final class RtTerrain {
         if (dirtyGroup != NO_DIRTY_GROUP && !dirtyGroups.containsKey(dirtyGroup)) {
             dirtyGroup = NO_DIRTY_GROUP;
         }
-        SectionTask task = new SectionTask(key, token, sx << 4, sy << 4, sz << 4, dirtyGroup);
+        RtTerrainMaterials.Snapshot materialSnapshot = RtTerrainMaterials.INSTANCE.requireSnapshot();
+        SectionTask task = new SectionTask(key, token, sx << 4, sy << 4, sz << 4, dirtyGroup,
+                materialSnapshot.epoch());
         beginActiveTask();
         try {
             RtWorkerPool.INSTANCE.submit(() -> {
@@ -1007,7 +982,7 @@ public final class RtTerrain {
                     ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, dispatch.blockColors());
                     FluidRenderer fluidRenderer = new FluidRenderer(dispatch.fluidModelSet());
                     CpuSection cpu = buildCpuSection(region, dispatch.modelSet(), renderer, ws.capture,
-                            fluidRenderer, ws.fluidCapture, ws.mesh, ws.pos, sx, sy, sz);
+                            fluidRenderer, ws.fluidCapture, ws.mesh, ws.pos, materialSnapshot, sx, sy, sz);
                     PackedSection packed = cpu.packed();
                     if (packed == null) {
                         completeTask(task, null, null, null);
@@ -1098,10 +1073,18 @@ public final class RtTerrain {
             }
             SectionTask task = result.task();
             long expected = inFlight.get(task.key);
-            boolean valid = expected == task.token;
+            boolean tokenValid = expected == task.token;
+            boolean valid = tokenValid && task.materialEpoch == RtTerrainMaterials.INSTANCE.epoch();
             if (!valid) {
+                if (tokenValid) {
+                    inFlight.remove(task.key);
+                    long staleGroup = inFlightDirtyGroup.remove(task.key);
+                    if (staleGroup != NO_DIRTY_GROUP) cancelDirtyGroup(staleGroup);
+                    enqueueMissingIfNeeded(task.key);
+                    RtFrameStats.FRAME.count("terrainMaterialEpochRejects", 1);
+                }
                 destroyCompletedResult(ctx, result);
-                continue; // stale result; a newer dispatch (or none) supersedes it
+                continue;
             }
             inFlight.remove(task.key);
             long dirtyGroup = inFlightDirtyGroup.remove(task.key);
@@ -1119,7 +1102,6 @@ public final class RtTerrain {
             PreparedSection built = result.prepared();
             if (built != null) {
                 try {
-                    RtSectionBuilder.resolveMaterials(built);
                     ctx.gpuExecutor().markPublished(result.build());
                     RtFrameStats.FRAME.count("terrainBuildsCompleted", 1);
                 } catch (Throwable t) {
@@ -1265,13 +1247,15 @@ public final class RtTerrain {
         final int soy;
         final int soz;
         final long dirtyGroup;
-        SectionTask(long key, long token, int sox, int soy, int soz, long dirtyGroup) {
+        final long materialEpoch;
+        SectionTask(long key, long token, int sox, int soy, int soz, long dirtyGroup, long materialEpoch) {
             this.key = key;
             this.token = token;
             this.sox = sox;
             this.soy = soy;
             this.soz = soz;
             this.dirtyGroup = dirtyGroup;
+            this.materialEpoch = materialEpoch;
         }
     }
 

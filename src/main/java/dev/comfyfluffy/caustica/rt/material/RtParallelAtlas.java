@@ -14,6 +14,8 @@ import net.minecraft.server.packs.resources.Resource;
 
 import java.io.InputStream;
 import java.util.List;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -227,6 +229,11 @@ public final class RtParallelAtlas {
         int flags = loadSpriteFlags(sprite);
         seen.put(sprite, flags);
         return flags;
+    }
+
+    /** Immutable identity-keyed view of the fully prepared sprite flags. */
+    public Map<TextureAtlasSprite, Integer> preparedFlags() {
+        return Collections.unmodifiableMap(new IdentityHashMap<>(seen));
     }
 
     /** Re-upload the atlases that gained sprites since the last flush. Call before the trace records. */

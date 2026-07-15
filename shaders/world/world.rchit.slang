@@ -12,8 +12,7 @@ import world_common;
 
 [[vk::binding(2, 0)]]  Sampler2D blockAtlas;
 // Parallel LabPBR _s (specular) and _n (normal) atlases, stitched to mirror the block atlas sprite
-// layout (RtBlockMaterials), sampled at the SAME uv as blockAtlas. Read only when the prim is flagged
-// (pr.mat.z for _s, pr.mat.w for _n).
+// layout (RtBlockMaterials), sampled at the SAME uv as blockAtlas. MaterialHeader feature bits gate reads.
 [[vk::binding(9, 0)]]  Sampler2D blockSpecAtlas;
 [[vk::binding(10, 0)]] Sampler2D blockNormalAtlas;
 // Bindless entity textures — a runtime-sized array indexed per-prim (tint.w) by the entity hit path.
@@ -310,7 +309,8 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // triangle base to land in the section's packed prim/uv arrays (concatenated in BUCKET order).
     // Water prims keep tint.w == 1, converted to the packed material enum below.
     uint pid = PrimitiveIndex() + sec.triBase[GeometryIndex()];
-    Prim pr = ConstPtr<Prim>(sec.primAddr)[pid];
+    TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[pid];
+    MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pcAddr.materialTableAddr)[pr.materialId];
     float3 n = normalize(pr.normal.xyz);
     float3 tint = pr.tint.rgb;
 
@@ -345,17 +345,17 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         n = -n;
     }
 
-    // LabPBR normal map (_n), gated by mat.w — shared decode (TBN from position-fetch + UVs).
+    // LabPBR normal map (_n), gated by the compiled material feature mask.
     float ao = 1.0;
-    if (pr.mat.w > 0.5) {
+    if ((materialHeader.features & MATERIAL_FEATURE_NORMAL) != 0u) {
         n = perturbNormal(n, tp0, tp1, tp2, uv0, uv1, uv2, vdir,
                 blockNormalAtlas.SampleLevel(uv, blockLod), ao);
     }
 
-    // Stained glass / ice (tint.w == 2, flagged at extraction): a thin colored filter resolved in raygen
+    // Stained glass / ice: a thin colored filter resolved in raygen
     // (material 3). albedo carries the transmission tint = texel rgb mixed toward white by (1 − opacity),
     // so a more opaque texel tints transmitted light more strongly.
-    if (pr.tint.w > 1.5) {
+    if (materialHeader.model == MATERIAL_GLASS) {
         float4 gtex = blockAtlas.SampleLevel(uv, blockLod);
         float3 gtexRgb = srgbToLinear(gtex.rgb);
         // Translucent blocks (glass, ice, …) are breakable too — apply the same overlay here, reusing
@@ -366,39 +366,41 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         payload.hitT = RayTCurrent();
         payload.motionPrev = float3(0.0, 0.0, 0.0);
         payload.f0 = float3(0.04, 0.04, 0.04);
-        payloadSetPacked(payload, MATERIAL_GLASS, 0.05, 0.0, 0.0, 0.0);
+        payloadSetPacked(payload, MATERIAL_GLASS, materialHeader.params.x,
+                materialHeader.params.y, 0.0, 0.0);
         return;
     }
 
     // Water (tint.w == 1) carries the pure biome water tint (no grey water-texture multiply): raygen
     // shades the surface as a clear dielectric and only needs the tint to derive the per-channel
     // Beer–Lambert absorption. Opaque terrain uses textured albedo.
-    payload.albedo = (pr.tint.w > 0.5) ? tint : srgbToLinear(blockAtlas.SampleLevel(uv, blockLod).rgb) * tint * ao;
+    payload.albedo = materialHeader.model == MATERIAL_WATER
+            ? tint : srgbToLinear(blockAtlas.SampleLevel(uv, blockLod).rgb) * tint * ao;
     payload.normal = n;
     payload.hitT = RayTCurrent();
     payload.motionPrev = float3(0.0, 0.0, 0.0); // static terrain: camera-only motion vector
-    uint material = pr.tint.w > 0.5 ? MATERIAL_WATER : MATERIAL_OPAQUE;
+    uint material = materialHeader.model == MATERIAL_WATER ? MATERIAL_WATER : MATERIAL_OPAQUE;
 
     // Block-breaking overlay: opaque/cutout terrain (water skips — fluids aren't breakable, so
     // breakCount==0 short-circuits it anyway; translucent glass/ice is handled at its own early-return
     // above, reusing the gtex it already sampled instead of re-fetching blockAtlas here).
-    if (pr.tint.w < 0.5) {
+    if (material != MATERIAL_WATER) {
         payload.albedo = applyBreaking(payload.albedo, rayCone, WorldRayOrigin(), WorldRayDirection(), RayTCurrent(), n);
     }
 
-    // Heuristic defaults, overridden per-texel by LabPBR _s when present (flagged in mat.z).
-    float rough = pr.mat.x;
-    float metal = pr.mat.y;
+    // Compiled defaults, overridden per-texel by LabPBR _s when present.
+    float rough = materialHeader.params.x;
+    float metal = materialHeader.params.y;
     float3 f0 = lerp(float3(0.04, 0.04, 0.04), payload.albedo, metal);
     // normal.w packs the 0..1 block-light level plus a +2 offset flag for non-SOLID (cutout /
     // translucent) render layers, set at extraction so the hit can opt SOLID terrain out of SSS below.
     float ew = pr.normal.w;
     bool nonSolid = ew >= 1.5;
     float emission = nonSolid ? ew - 2.0 : ew; // heuristic emission source (block light level)
-    // LabPBR _s, gated by mat.z — shared decode. When an _s map is authored we trust ITS emission and
+    // LabPBR _s, gated by the material feature mask. When an _s map is authored we trust ITS emission and
     // REPLACE the block-light heuristic, so emissive texels come from the pack, not the light level.
     float sss = 0.0;
-    if (pr.mat.z > 0.5) {
+    if ((materialHeader.features & MATERIAL_FEATURE_SPEC) != 0u) {
         decodeSpec(blockSpecAtlas.SampleLevel(uv, blockLod), payload.albedo, rough, metal, f0, emission, sss);
         if (!nonSolid) sss = 0.0; // SSS only on non-SOLID terrain (leaves/foliage); SOLID blocks opt out
     }
