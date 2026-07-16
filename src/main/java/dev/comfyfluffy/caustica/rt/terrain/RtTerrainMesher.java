@@ -12,7 +12,7 @@ import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.material.RtMaterialAbi;
 import dev.comfyfluffy.caustica.rt.material.RtMaterials;
-import dev.comfyfluffy.caustica.rt.material.RtTerrainMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
@@ -86,7 +86,7 @@ final class RtTerrainMesher {
                                               ModelBlockRenderer renderer, QuadCapture capture,
                                               FluidRenderer fluidRenderer, FluidCapture fluidCapture,
                                               SectionMesh mesh, BlockPos.MutableBlockPos m,
-                                              RtTerrainMaterials.Snapshot materials,
+                                              RtMaterialRegistry.Snapshot materials,
                                               int scx, int scy, int scz) {
         capture.materials = materials;
         fluidCapture.materials = materials;
@@ -356,7 +356,7 @@ final class RtTerrainMesher {
     /** Captures the quads vanilla's model renderer emits into the current section's mesh. */
     private static final class QuadCapture implements BlockQuadOutput {
         SectionMesh cur; // set before each tesselateBlock call
-        RtTerrainMaterials.Snapshot materials;
+        RtMaterialRegistry.Snapshot materials;
 
         // Per-block context for biome tint, set before each tesselateBlock call. We resolve the tint
         // straight from BlockColors (pure biome color) rather than QuadInstance.getColor, which bakes
@@ -634,7 +634,7 @@ final class RtTerrainMesher {
      */
     private static final class FluidCapture implements VertexConsumer, FluidRenderer.Output {
         SectionMesh cur;     // set before each section
-        RtTerrainMaterials.Snapshot materials;
+        RtMaterialRegistry.Snapshot materials;
         float emission;      // set per fluid block (lava = 1, water = 0)
         boolean water;       // set per fluid block: true for water (dielectric), false for lava
         private int n;

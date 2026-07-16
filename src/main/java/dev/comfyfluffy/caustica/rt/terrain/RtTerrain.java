@@ -13,7 +13,7 @@ import dev.comfyfluffy.caustica.rt.RtFrameStats;
 import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
-import dev.comfyfluffy.caustica.rt.material.RtTerrainMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
@@ -225,7 +225,7 @@ public final class RtTerrain {
      * and dispatch immutable snapshots to workers, bounded by configured per-pass counts.
      */
     public static void frame(RtContext ctx) {
-        if (RtTerrainMaterials.INSTANCE.isReady()) INSTANCE.frameStream(ctx);
+        if (RtMaterialRegistry.INSTANCE.isReady()) INSTANCE.frameStream(ctx);
     }
 
     public static void shutdown(RtContext ctx) {
@@ -286,7 +286,7 @@ public final class RtTerrain {
             clear(ctx, false); // left the world — drop all geometry (drains + frees, incl. any in-flight build)
             return;
         }
-        if (!RtTerrainMaterials.INSTANCE.isReady()) {
+        if (!RtMaterialRegistry.INSTANCE.isReady()) {
             return; // resource reload gap: keep old work dormant until the new epoch requests a full clear
         }
 
@@ -970,7 +970,7 @@ public final class RtTerrain {
         if (dirtyGroup != NO_DIRTY_GROUP && !dirtyGroups.containsKey(dirtyGroup)) {
             dirtyGroup = NO_DIRTY_GROUP;
         }
-        RtTerrainMaterials.Snapshot materialSnapshot = RtTerrainMaterials.INSTANCE.requireSnapshot();
+        RtMaterialRegistry.Snapshot materialSnapshot = RtMaterialRegistry.INSTANCE.requireSnapshot();
         SectionTask task = new SectionTask(key, token, sx << 4, sy << 4, sz << 4, dirtyGroup,
                 materialSnapshot.epoch());
         beginActiveTask();
@@ -1074,7 +1074,7 @@ public final class RtTerrain {
             SectionTask task = result.task();
             long expected = inFlight.get(task.key);
             boolean tokenValid = expected == task.token;
-            boolean valid = tokenValid && task.materialEpoch == RtTerrainMaterials.INSTANCE.epoch();
+            boolean valid = tokenValid && task.materialEpoch == RtMaterialRegistry.INSTANCE.epoch();
             if (!valid) {
                 if (tokenValid) {
                     inFlight.remove(task.key);

@@ -30,7 +30,7 @@ import java.util.Set;
 public final class RtBlockMaterials {
     public static final RtBlockMaterials INSTANCE = new RtBlockMaterials();
 
-    // Entry.features uses the shared MaterialHeader feature bits (RtTerrainMaterials.FEATURE_*).
+    // Entry.features uses the shared MaterialHeader feature bits (RtMaterialRegistry.FEATURE_*).
     // FEATURE_OVERRIDE_EMISSION here means "override mask baked into surface1.a for this candidate".
 
     private static final int DEFAULT_PAGE_SIZE = 2048;
@@ -155,21 +155,21 @@ public final class RtBlockMaterials {
             Identifier normal = sibling(name, "_n.png");
             int features = 0;
             if (resourceExists(spec)) {
-                features |= RtTerrainMaterials.FEATURE_SPEC;
+                features |= RtMaterialRegistry.FEATURE_SPEC;
                 specCount++;
             }
             if (resourceExists(normal)) {
-                features |= RtTerrainMaterials.FEATURE_NORMAL;
+                features |= RtMaterialRegistry.FEATURE_NORMAL;
                 normalCount++;
             }
             // Authored LabPBR owns emission whenever _s exists. Albedo inference is only compiled for
             // sprites proven to occur on an emitting block state.
-            if ((features & RtTerrainMaterials.FEATURE_SPEC) == 0 && emissionSemantics.permits(sprite)) {
-                features |= RtTerrainMaterials.FEATURE_HEURISTIC_EMISSION;
+            if ((features & RtMaterialRegistry.FEATURE_SPEC) == 0 && emissionSemantics.permits(sprite)) {
+                features |= RtMaterialRegistry.FEATURE_HEURISTIC_EMISSION;
                 heuristicCount++;
             }
             if (overrides.requestsEmissionMask(sprite)) {
-                features |= RtTerrainMaterials.FEATURE_OVERRIDE_EMISSION;
+                features |= RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION;
                 overrideMaskCount++;
             }
             if (features != 0) {
@@ -192,9 +192,9 @@ public final class RtBlockMaterials {
                 Identifier normal = siblingTexture(albedo, "_n");
                 largest = Math.max(largest, Math.max(width, height) + 2 * GUTTER);
                 authored.add(new Candidate(null, name, albedo, features, spec, normal, width, height));
-                if ((features & RtTerrainMaterials.FEATURE_SPEC) != 0) specCount++;
-                if ((features & RtTerrainMaterials.FEATURE_NORMAL) != 0) normalCount++;
-                if ((features & RtTerrainMaterials.FEATURE_OVERRIDE_EMISSION) != 0) overrideMaskCount++;
+                if ((features & RtMaterialRegistry.FEATURE_SPEC) != 0) specCount++;
+                if ((features & RtMaterialRegistry.FEATURE_NORMAL) != 0) normalCount++;
+                if ((features & RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION) != 0) overrideMaskCount++;
             } catch (Throwable t) {
                 warnOnce("RT entity material albedo load failed for " + albedo, t);
             }
@@ -338,9 +338,9 @@ public final class RtBlockMaterials {
     }
 
     private static Decoded decode(Candidate candidate) throws Exception {
-        NativeImage spec = (candidate.features & RtTerrainMaterials.FEATURE_SPEC) != 0
+        NativeImage spec = (candidate.features & RtMaterialRegistry.FEATURE_SPEC) != 0
                 ? load(candidate.specLocation) : null;
-        NativeImage normal = (candidate.features & RtTerrainMaterials.FEATURE_NORMAL) != 0
+        NativeImage normal = (candidate.features & RtMaterialRegistry.FEATURE_NORMAL) != 0
                 ? load(candidate.normalLocation) : null;
         NativeImage resourceAlbedo = candidate.blockSprite() ? null : load(candidate.albedoLocation);
         try {
@@ -408,8 +408,8 @@ public final class RtBlockMaterials {
                 emissionSummary = RtEmissionHeuristic.summarize(linearAlbedo, authoredEmission);
             }
             RtMaterialDesc.EmissionSummary overrideEmissionSummary = RtMaterialDesc.EmissionSummary.NONE;
-            boolean heuristic = (candidate.features & RtTerrainMaterials.FEATURE_HEURISTIC_EMISSION) != 0;
-            boolean overrideMask = (candidate.features & RtTerrainMaterials.FEATURE_OVERRIDE_EMISSION) != 0;
+            boolean heuristic = (candidate.features & RtMaterialRegistry.FEATURE_HEURISTIC_EMISSION) != 0;
+            boolean overrideMask = (candidate.features & RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION) != 0;
             if (heuristic || overrideMask) {
                 RtEmissionHeuristic.Result emission = RtEmissionHeuristic.compile(linearAlbedo);
                 float[] mask = emission.mask();
@@ -523,8 +523,8 @@ public final class RtBlockMaterials {
             Identifier albedo = Identifier.fromNamespaceAndPath(material.getNamespace(), albedoPath);
             Identifier name = logicalTextureName(albedo);
             if (blockNames.contains(name) || !resourceExists(albedo)) continue;
-            result.merge(albedo, spec ? RtTerrainMaterials.FEATURE_SPEC
-                    : RtTerrainMaterials.FEATURE_NORMAL, (a, b) -> a | b);
+            result.merge(albedo, spec ? RtMaterialRegistry.FEATURE_SPEC
+                    : RtMaterialRegistry.FEATURE_NORMAL, (a, b) -> a | b);
         }
         for (RtMaterialOverrides.Rule rule : overrides.rules()) {
             if (rule.block() != null || blockNames.contains(rule.sprite())) {
@@ -533,7 +533,7 @@ public final class RtBlockMaterials {
             Identifier albedo = textureLocation(rule.sprite());
             if (resourceExists(albedo)) {
                 int feature = rule.emissionStrength() != null && rule.emissionStrength() > 0.0f
-                        ? RtTerrainMaterials.FEATURE_OVERRIDE_EMISSION : 0;
+                        ? RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION : 0;
                 result.merge(albedo, feature, (a, b) -> a | b);
             }
         }

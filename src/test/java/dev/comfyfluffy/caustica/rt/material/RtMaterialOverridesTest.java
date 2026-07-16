@@ -20,11 +20,11 @@ final class RtMaterialOverridesTest {
                 "transmission":{"factor":1.0,"ior":1.52}}
                 """).getAsJsonObject(), Identifier.parse("test:caustica/materials/glass.json"));
         assertEquals(Identifier.parse("minecraft:block/blue_stained_glass"), rule.sprite());
-        assertEquals(RtTerrainMaterials.MODEL_GLASS, rule.model());
+        assertEquals(RtMaterialRegistry.MODEL_GLASS, rule.model());
         assertEquals(1.52f, rule.ior());
         assertEquals(0.0f, rule.emissionStrength());
-        RtMaterialDesc base = new RtMaterialDesc(RtTerrainMaterials.MODEL_OPAQUE,
-                RtMaterialDesc.Source.LAB_PBR, RtTerrainMaterials.FEATURE_SPEC,
+        RtMaterialDesc base = new RtMaterialDesc(RtMaterialRegistry.MODEL_OPAQUE,
+                RtMaterialDesc.Source.LAB_PBR, RtMaterialRegistry.FEATURE_SPEC,
                 0.8f, 0.0f, 1.0f, 0.0f, RtMaterialDesc.EmissionSource.LAB_PBR,
                 1.0f, new RtMaterialDesc.EmissionSummary(0.2f, 0.1f, 0.05f, 0.1f, 0.5f));
         RtMaterialDesc applied = rule.apply(base, RtMaterialDesc.EmissionSummary.NONE);

@@ -59,9 +59,9 @@ public final class RtMaterialOverrides {
         Integer model = null;
         if (root.has("model")) {
             model = switch (root.get("model").getAsString()) {
-                case "opaque" -> RtTerrainMaterials.MODEL_OPAQUE;
-                case "volume_dielectric" -> RtTerrainMaterials.MODEL_WATER;
-                case "thin_dielectric" -> RtTerrainMaterials.MODEL_GLASS;
+                case "opaque" -> RtMaterialRegistry.MODEL_OPAQUE;
+                case "volume_dielectric" -> RtMaterialRegistry.MODEL_WATER;
+                case "thin_dielectric" -> RtMaterialRegistry.MODEL_GLASS;
                 default -> throw new IllegalArgumentException("Unknown material model");
             };
         }
@@ -143,7 +143,7 @@ public final class RtMaterialOverrides {
             float nextEmissionStrength = base.emissionStrength();
             RtMaterialDesc.EmissionSummary summary = base.emissionSummary();
             if (emissionStrength != null) {
-                features |= RtTerrainMaterials.FEATURE_OVERRIDE_EMISSION;
+                features |= RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION;
                 nextEmissionStrength = emissionStrength;
                 nextEmissionSource = emissionStrength > 0.0f
                         ? RtMaterialDesc.EmissionSource.OVERRIDE : RtMaterialDesc.EmissionSource.NONE;
@@ -155,12 +155,12 @@ public final class RtMaterialOverrides {
         }
 
         private static float defaultIor(int model) {
-            return model == RtTerrainMaterials.MODEL_WATER ? 1.333f
-                    : model == RtTerrainMaterials.MODEL_GLASS ? 1.52f : 1.0f;
+            return model == RtMaterialRegistry.MODEL_WATER ? 1.333f
+                    : model == RtMaterialRegistry.MODEL_GLASS ? 1.52f : 1.0f;
         }
 
         private static float defaultTransmission(int model) {
-            return model == RtTerrainMaterials.MODEL_WATER || model == RtTerrainMaterials.MODEL_GLASS
+            return model == RtMaterialRegistry.MODEL_WATER || model == RtMaterialRegistry.MODEL_GLASS
                     ? 1.0f : 0.0f;
         }
     }

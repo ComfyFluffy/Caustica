@@ -23,6 +23,7 @@ import net.minecraft.client.renderer.block.ModelBlockRenderer;
 import net.minecraft.client.renderer.block.MovingBlockRenderState;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.client.renderer.entity.state.EntityRenderState;
@@ -48,7 +49,7 @@ import org.joml.Matrix4fc;
 import org.joml.Quaternionf;
 
 import dev.comfyfluffy.caustica.rt.material.RtMaterials;
-import dev.comfyfluffy.caustica.rt.material.RtTerrainMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -127,7 +128,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // Block-entity models (chests/signs/beds) texture from an atlas SPRITE: use that atlas + remap
         // the ModelPart 0..1 UVs into the sprite's region. Mobs use a full texture (sprite == null).
         try {
-            capture.currentMaterialId = RtTerrainMaterials.INSTANCE.entityFallbackId(stochasticAlpha);
+            capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
             if (sprite != null) {
                 capture.setUvRemap(sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1());
                 if (TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
@@ -140,8 +141,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                     // records this atlas's UV rectangle; it never mutates an existing material ID.
                     capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation());
                     capture.currentMaterialId = RtEntityTextures.entityPbr()
-                            ? RtTerrainMaterials.INSTANCE.resolveEntitySprite(sprite, stochasticAlpha)
-                            : RtTerrainMaterials.INSTANCE.entityFallbackId(stochasticAlpha);
+                            ? RtMaterialRegistry.INSTANCE.resolveEntitySprite(sprite, stochasticAlpha)
+                            : RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
                 }
             } else {
                 // Mobs use full per-type textures. Their authored _s/_n maps were decoded into canonical
@@ -271,22 +272,33 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         capture.currentTexSlot = sprite != null
                 ? RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation())
                 : 0;
-        setSpriteMaterial(sprite, false);
+        // Baked item quads retain the block model's material layer. Mirror terrain's classification so
+        // dropped and held translucent block items (glass, ice, etc.) use the thin-dielectric variant
+        // instead of the opaque DEFAULT variant. No BlockState reaches submitItem, so the layer is the
+        // authoritative semantic available here; glass-model roughness/IOR are profile-independent.
+        boolean transmissive = q.materialInfo().layer() == ChunkSectionLayer.TRANSLUCENT;
+        setSpriteMaterial(sprite, transmissive ? RtMaterials.Profile.GLASS : RtMaterials.Profile.DEFAULT,
+                transmissive, false);
         capture.currentOrder = 0; // baked-quad paths never stack decal layers
         capture.addBakedQuad(pose, q, tintColor(q.materialInfo().tintIndex(), tintLayers));
     }
 
     /** Resolve block-atlas geometry through the same immutable material snapshot as terrain. */
     private void setSpriteMaterial(TextureAtlasSprite sprite, boolean stochasticAlpha) {
+        setSpriteMaterial(sprite, RtMaterials.Profile.DEFAULT, false, stochasticAlpha);
+    }
+
+    private void setSpriteMaterial(TextureAtlasSprite sprite, RtMaterials.Profile profile,
+                                   boolean transmissive, boolean stochasticAlpha) {
         if (sprite != null && TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
-            int materialId = RtTerrainMaterials.INSTANCE.requireSnapshot()
-                    .resolve(sprite, RtMaterials.Profile.DEFAULT, false, false);
+            int materialId = RtMaterialRegistry.INSTANCE.requireSnapshot()
+                    .resolve(sprite, profile, transmissive, false);
             capture.currentMaterialId = stochasticAlpha
-                    ? RtTerrainMaterials.INSTANCE.withStochasticAlpha(materialId) : materialId;
+                    ? RtMaterialRegistry.INSTANCE.withStochasticAlpha(materialId) : materialId;
         } else if (sprite != null && RtEntityTextures.entityPbr()) {
-            capture.currentMaterialId = RtTerrainMaterials.INSTANCE.resolveEntitySprite(sprite, stochasticAlpha);
+            capture.currentMaterialId = RtMaterialRegistry.INSTANCE.resolveEntitySprite(sprite, stochasticAlpha);
         } else {
-            capture.currentMaterialId = RtTerrainMaterials.INSTANCE.entityFallbackId(stochasticAlpha);
+            capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
         }
     }
 
@@ -404,7 +416,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             RenderType renderType = renderable.renderType(displayMode);
             boolean stochasticAlpha = isTranslucent(renderType);
             capture.currentTexSlot = RtEntityTextures.INSTANCE.slotFor(renderType);
-            capture.currentMaterialId = RtTerrainMaterials.INSTANCE.entityFallbackId(stochasticAlpha);
+            capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
             capture.currentOrder = 0;
             capture.clearUvRemap(); // glyph U/V are already atlas-space
             renderable.render(pose, textVertexConsumer, lightCoords, false);

@@ -16,7 +16,7 @@ public final class RtMaterials {
 
     public enum Profile {
         // The first four are the sprite-classifiable profiles ({@link #profile} can only return these);
-        // RtTerrainMaterials' variant index depends on their ordinals (checked at its class load).
+        // RtMaterialRegistry's variant index depends on their ordinals (checked at its class load).
         // WATER/LAVA exist only for the dedicated fluid singleton headers.
         DEFAULT(0.9f, 0.0f),
         METAL(0.3f, 1.0f),

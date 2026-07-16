@@ -32,8 +32,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * workers read an immutable {@link Snapshot}; entity atlas headers may append into pre-reserved table slots
  * because their stitched UV rectangles only become available during capture. Published records never mutate.
  */
-public final class RtTerrainMaterials {
-    public static final RtTerrainMaterials INSTANCE = new RtTerrainMaterials();
+public final class RtMaterialRegistry {
+    public static final RtMaterialRegistry INSTANCE = new RtMaterialRegistry();
 
     // Canonical MaterialHeader model/feature bits, mirrored by world_common.slang's MATERIAL_* constants.
     // RtBlockMaterials.Entry.features uses the same bit values (FEATURE_OVERRIDE_EMISSION there means the
@@ -91,7 +91,7 @@ public final class RtTerrainMaterials {
         }
     }
 
-    private RtTerrainMaterials() {
+    private RtMaterialRegistry() {
     }
 
     /** Build and atomically publish the block and entity registry for the current resource epoch. */

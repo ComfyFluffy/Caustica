@@ -53,7 +53,7 @@ import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.material.RtEmissionSemantics;
 import dev.comfyfluffy.caustica.rt.material.RtMaterialOverrides;
-import dev.comfyfluffy.caustica.rt.material.RtTerrainMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
@@ -566,7 +566,7 @@ public final class RtComposite {
         RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity);
         worldPipeline.setEntityAlbedoTexture(0, atlasView, sampler);
         RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler);
-        RtTerrainMaterials.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, materialOverrides);
+        RtMaterialRegistry.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, materialOverrides);
         materialBindingsReady = true;
         // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
         // handle is stable across frames; the shader only samples it inside the sun/moon discs (sky
@@ -625,7 +625,7 @@ public final class RtComposite {
                 worldPipeline = null;
                 bindlessTextureCapacity = 0;
             }
-            RtTerrainMaterials.INSTANCE.destroy();
+            RtMaterialRegistry.INSTANCE.destroy();
         }
     }
 
@@ -888,7 +888,7 @@ public final class RtComposite {
             // don't pay for a second global-memory dereference through pcAddr.worldPushAddr first.
             ByteBuffer pushAddr = stack.malloc(PushAddrData.BYTE_SIZE);
             new PushAddrData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
-                    RtTerrainMaterials.INSTANCE.tableAddress(),
+                    RtMaterialRegistry.INSTANCE.tableAddress(),
                     (int) frameCounter).write(pushAddr);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.trace")) {
@@ -1216,7 +1216,7 @@ public final class RtComposite {
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
         materialEpochTraceGate = false;
-        RtTerrainMaterials.INSTANCE.destroy();
+        RtMaterialRegistry.INSTANCE.destroy();
         if (pushRing != null) {
             for (RtBuffer b : pushRing) {
                 if (b != null) {

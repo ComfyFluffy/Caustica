@@ -6,7 +6,7 @@ import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.RenderSetupAccessor;
 import dev.comfyfluffy.caustica.mixin.RenderTypeAccessor;
-import dev.comfyfluffy.caustica.rt.material.RtTerrainMaterials;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
@@ -96,8 +96,8 @@ public final class RtEntityTextures {
 
     /** Canonical material ID for a full entity texture, or the neutral runtime-texture fallback. */
     public int materialIdFor(RenderType renderType, boolean stochasticAlpha) {
-        if (!entityPbr()) return RtTerrainMaterials.INSTANCE.entityFallbackId(stochasticAlpha);
-        return RtTerrainMaterials.INSTANCE.resolveEntityTexture(textureLocation(renderType), stochasticAlpha);
+        if (!entityPbr()) return RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
+        return RtMaterialRegistry.INSTANCE.resolveEntityTexture(textureLocation(renderType), stochasticAlpha);
     }
 
     /**
