@@ -144,6 +144,22 @@ struct Surface {
     float ao;
 };
 
+// Canonical material page bundles ride the shared bindless arrays at reserved tail slots; the array
+// names describe the ENTITY use of each binding (albedo/_n/_s), not the page contents. Name the page
+// lookups by their bundle so material code never has to remember that mapping:
+//   surface0 (rough/metal/emission/SSS) lives in the _s binding,
+//   normalAo (normal XY/AO/height)      lives in the _n binding,
+//   surface1 (F0 rgb/override mask)     lives in the albedo binding.
+float4 samplePageSurface0(uint page, float2 uv, float lod) {
+    return entitySpecTex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
+}
+float4 samplePageSurface1(uint page, float2 uv, float lod) {
+    return entityTex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
+}
+float4 samplePageNormalAo(uint page, float2 uv, float lod) {
+    return entityNormalTex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
+}
+
 // The sole terrain/entity material evaluation path. LabPBR categorical bytes have already been
 // decoded on the CPU; every sample below is a continuously filterable physical channel with semantic mips.
 Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float3 albedo,
@@ -167,9 +183,11 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
     uint page = header.texturePage;
     if ((header.features & (MATERIAL_FEATURE_SPEC | MATERIAL_FEATURE_HEURISTIC_EMISSION
             | MATERIAL_FEATURE_OVERRIDE_EMISSION)) != 0u) {
-        float4 surface0 = entitySpecTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
+        float4 surface0 = samplePageSurface0(page, pageUv, materialLod);
+        // surface1 feeds both the LabPBR F0 (rgb) and the override emission mask (a) — fetch it once.
+        float4 surface1 = (header.features & (MATERIAL_FEATURE_SPEC | MATERIAL_FEATURE_OVERRIDE_EMISSION)) != 0u
+                ? samplePageSurface1(page, pageUv, materialLod) : float4(0.0, 0.0, 0.0, 0.0);
         if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) {
-            float4 surface1 = entityTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
             surface.roughness = surface0.r;
             surface.metalness = surface0.g;
             surface.emission = surface0.b;
@@ -184,12 +202,11 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
             float strength = float((header.features >> MATERIAL_EMISSION_STRENGTH_SHIFT)
                     & MATERIAL_EMISSION_STRENGTH_MASK)
                     * (MATERIAL_MAX_OVERRIDE_EMISSION_STRENGTH / float(MATERIAL_EMISSION_STRENGTH_MASK));
-            float overrideMask = entityTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod).a;
-            surface.emission = overrideMask * strength;
+            surface.emission = surface1.a * strength;
         }
     }
     if ((header.features & MATERIAL_FEATURE_NORMAL) != 0u) {
-        float4 normalAo = entityNormalTex[NonUniformResourceIndex(page)].SampleLevel(pageUv, materialLod);
+        float4 normalAo = samplePageNormalAo(page, pageUv, materialLod);
         surface.normal = perturbNormal(geometricNormal, p0, p1, p2, uv0, uv1, uv2,
                 vdir, normalAo, surface.ao);
     }

@@ -25,6 +25,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Resource-epoch material registry shared by terrain, entities, block entities and item geometry. Terrain
@@ -34,6 +35,9 @@ import java.util.Set;
 public final class RtTerrainMaterials {
     public static final RtTerrainMaterials INSTANCE = new RtTerrainMaterials();
 
+    // Canonical MaterialHeader model/feature bits, mirrored by world_common.slang's MATERIAL_* constants.
+    // RtBlockMaterials.Entry.features uses the same bit values (FEATURE_OVERRIDE_EMISSION there means the
+    // override mask was baked into surface1.a), so entry features flow into headers with a plain mask.
     public static final int MODEL_OPAQUE = 0;
     public static final int MODEL_WATER = 1;
     public static final int MODEL_GLASS = 3;
@@ -50,6 +54,20 @@ public final class RtTerrainMaterials {
     private static final int EMISSION_VARIANTS = 2; // state-gated emission disabled/enabled
     private static final int VARIANT_OPAQUE = 0;
     private static final int VARIANT_GLASS = 1;
+    // Profiles a sprite variant can actually be resolved with: RtMaterials.profile() never returns
+    // WATER/LAVA (fluids use the dedicated singleton headers), so compiling those variants per sprite
+    // would only bloat the table. The variant index math assumes these are the first enum ordinals.
+    private static final RtMaterials.Profile[] SPRITE_PROFILES = {
+            RtMaterials.Profile.DEFAULT, RtMaterials.Profile.METAL,
+            RtMaterials.Profile.GLASS, RtMaterials.Profile.SMOOTH};
+
+    static {
+        for (int i = 0; i < SPRITE_PROFILES.length; i++) {
+            if (SPRITE_PROFILES[i].ordinal() != i) {
+                throw new IllegalStateException("Sprite profile ordinals must be contiguous from 0");
+            }
+        }
+    }
 
     private volatile Snapshot snapshot;
     private RtBuffer table;
@@ -84,14 +102,19 @@ public final class RtTerrainMaterials {
         entityResources.sort(Comparator.comparing(Identifier::toString));
         RtBlockMaterials.Entry fallbackEntry = blockMaterials.entry(null);
 
-        int profileVariants = RtMaterials.Profile.values().length * MODEL_VARIANTS * EMISSION_VARIANTS;
+        // One pass per sprite computes both the raw average (translucent shadow filtering) and the
+        // premultiplied-linear uniform emission summary; sprites are independent, so scan in parallel.
+        Map<TextureAtlasSprite, SpriteStats> spriteStats = new ConcurrentHashMap<>();
+        sprites.parallelStream().forEach(sprite -> spriteStats.put(sprite, computeSpriteStats(sprite)));
+
+        int profileVariants = SPRITE_PROFILES.length * MODEL_VARIANTS * EMISSION_VARIANTS;
         List<MaterialHeaderData> headers = new ArrayList<>(3 + profileVariants
                 + sprites.size() * profileVariants);
         List<RtMaterialDesc> descriptions = new ArrayList<>(headers.size());
         add(headers, descriptions, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.DEFAULT,
                 false, true, RtMaterialDesc.EmissionSummary.NONE), transparentWhiteAverage(), fallbackEntry);
         int[] fallbackVariants = new int[profileVariants];
-        for (RtMaterials.Profile profile : RtMaterials.Profile.values()) {
+        for (RtMaterials.Profile profile : SPRITE_PROFILES) {
             for (boolean glass : new boolean[]{false, true}) {
                 for (boolean emitting : new boolean[]{false, true}) {
                     int variant = index(profile, glass, emitting);
@@ -123,44 +146,52 @@ public final class RtTerrainMaterials {
         }
         for (TextureAtlasSprite sprite : sprites) {
             RtBlockMaterials.Entry entry = entriesBySprite.get(sprite);
-            int baseFeatures = ((entry.features() & RtBlockMaterials.HAS_SPEC) != 0 ? FEATURE_SPEC : 0)
-                    | ((entry.features() & RtBlockMaterials.HAS_NORMAL) != 0 ? FEATURE_NORMAL : 0)
-                    | ((entry.features() & RtBlockMaterials.HAS_HEURISTIC_EMISSION) != 0
-                    ? FEATURE_HEURISTIC_EMISSION : 0);
-            float[] average = averageColor(sprite);
-            RtMaterialDesc.EmissionSummary uniformSummary = uniformEmissionSummary(sprite);
+            int baseFeatures = entry.features()
+                    & (FEATURE_SPEC | FEATURE_NORMAL | FEATURE_HEURISTIC_EMISSION);
+            SpriteStats stats = spriteStats.getOrDefault(sprite, SpriteStats.NEUTRAL);
+
+            // The first sprite-wide (block == null) rule owns this sprite for every state, so its variants
+            // are compiled straight into the primary map and the base variants are never emitted. Only
+            // block-conditional rules stay in the per-quad runtime scan.
+            MutableCompiledOverride spriteWide = null;
+            for (MutableCompiledOverride compiled : compiledOverrides) {
+                if (compiled.rule.block() == null && compiled.rule.matchesSprite(sprite)) {
+                    spriteWide = compiled;
+                    compiled.matchedSprite = true;
+                    break;
+                }
+            }
             int[] variants = new int[profileVariants];
-            for (RtMaterials.Profile profile : RtMaterials.Profile.values()) {
+            for (RtMaterials.Profile profile : SPRITE_PROFILES) {
                 for (boolean glass : new boolean[]{false, true}) {
                     for (boolean emitting : new boolean[]{false, true}) {
                         int features = emitting ? baseFeatures : baseFeatures & ~FEATURE_HEURISTIC_EMISSION;
-                        RtMaterialDesc.EmissionSummary emissionSummary = (features & FEATURE_SPEC) != 0
-                                || (features & FEATURE_HEURISTIC_EMISSION) != 0
-                                ? entry.emissionSummary()
-                                : (emitting ? uniformSummary : RtMaterialDesc.EmissionSummary.NONE);
+                        RtMaterialDesc desc = compileDesc(glass ? MODEL_GLASS : MODEL_OPAQUE, features,
+                                profile, emitting, false,
+                                variantSummary(features, emitting, entry, stats.uniformSummary()));
+                        if (spriteWide != null) {
+                            desc = spriteWide.rule.apply(desc, entry.overrideEmissionSummary());
+                        }
                         variants[index(profile, glass, emitting)] = headers.size();
-                        add(headers, descriptions, compileDesc(glass ? MODEL_GLASS : MODEL_OPAQUE,
-                                features, profile, emitting, false, emissionSummary), average, entry);
+                        add(headers, descriptions, desc, stats.average(), entry);
                     }
                 }
             }
             ids.put(sprite, variants);
 
             for (MutableCompiledOverride compiled : compiledOverrides) {
-                if (!compiled.rule.matchesSprite(sprite)) continue;
+                if (compiled.rule.block() == null || !compiled.rule.matchesSprite(sprite)) continue;
                 int[] overrideVariants = new int[profileVariants];
-                for (RtMaterials.Profile profile : RtMaterials.Profile.values()) {
+                for (RtMaterials.Profile profile : SPRITE_PROFILES) {
                     for (boolean glass : new boolean[]{false, true}) {
                         for (boolean emitting : new boolean[]{false, true}) {
                             int features = emitting ? baseFeatures : baseFeatures & ~FEATURE_HEURISTIC_EMISSION;
-                            RtMaterialDesc.EmissionSummary summary = (features & (FEATURE_SPEC
-                                    | FEATURE_HEURISTIC_EMISSION)) != 0 ? entry.emissionSummary()
-                                    : (emitting ? uniformSummary : RtMaterialDesc.EmissionSummary.NONE);
                             RtMaterialDesc base = compileDesc(glass ? MODEL_GLASS : MODEL_OPAQUE,
-                                    features, profile, emitting, false, summary);
+                                    features, profile, emitting, false,
+                                    variantSummary(features, emitting, entry, stats.uniformSummary()));
                             RtMaterialDesc desc = compiled.rule.apply(base, entry.overrideEmissionSummary());
                             overrideVariants[index(profile, glass, emitting)] = headers.size();
-                            add(headers, descriptions, desc, average, entry);
+                            add(headers, descriptions, desc, stats.average(), entry);
                         }
                     }
                 }
@@ -173,8 +204,7 @@ public final class RtTerrainMaterials {
         Set<RtMaterialOverrides.Rule> entityMatchedOverrides = new HashSet<>();
         for (Identifier name : entityResources) {
             RtBlockMaterials.Entry entry = entriesByResource.get(name);
-            int features = ((entry.features() & RtBlockMaterials.HAS_SPEC) != 0 ? FEATURE_SPEC : 0)
-                    | ((entry.features() & RtBlockMaterials.HAS_NORMAL) != 0 ? FEATURE_NORMAL : 0);
+            int features = entry.features() & (FEATURE_SPEC | FEATURE_NORMAL);
             RtMaterialDesc desc = compileEntityDesc(features, false, entry.emissionSummary());
             for (RtMaterialOverrides.Rule rule : overrides.rules()) {
                 if (!rule.matchesEntity(name)) continue;
@@ -218,8 +248,12 @@ public final class RtTerrainMaterials {
         List<CompiledOverride> frozenOverrides = compiledOverrides.stream()
                 .filter(value -> !value.ids.isEmpty())
                 .map(MutableCompiledOverride::freeze).toList();
+        long matchedOverrideRules = 0;
         for (MutableCompiledOverride compiled : compiledOverrides) {
-            if (compiled.ids.isEmpty() && !entityMatchedOverrides.contains(compiled.rule)) {
+            if (!compiled.ids.isEmpty() || compiled.matchedSprite
+                    || entityMatchedOverrides.contains(compiled.rule)) {
+                matchedOverrideRules++;
+            } else {
                 CausticaMod.LOGGER.warn("RT material override {} matched no compiled texture ({})",
                         compiled.rule.source(), compiled.rule.sprite());
             }
@@ -249,7 +283,7 @@ public final class RtTerrainMaterials {
                 .mapToDouble(desc -> desc.emissionSummary().coverage()).average().orElse(0.0);
         CausticaMod.LOGGER.info("RT materials: epoch={}, records={}, capacity={}, blockSprites={}, entityResources={}, overrideRules={}, matchedOverrides={}, emissive={}, labPbrEmission={}, heuristicMasks={}, uniformEmission={}, overrideEmission={}, avgEmissionCoverage={}, tableKiB={}",
                 epoch, headers.size(), recordCapacity, sprites.size(), entityResources.size(), overrides.rules().size(),
-                frozenOverrides.size() + entityMatchedOverrides.size(), emissive,
+                matchedOverrideRules, emissive,
                 authoredEmission, inferred, uniformEmission, overrideEmission,
                 String.format(java.util.Locale.ROOT, "%.3f", averageCoverage), byteSize / 1024);
     }
@@ -283,7 +317,8 @@ public final class RtTerrainMaterials {
     /** Resolve a full entity texture resource to its pack-compiled material ID. */
     public int resolveEntityTexture(Identifier textureLocation) {
         if (textureLocation == null) return entityFallbackId;
-        return entityTextureIds.getOrDefault(logicalTextureName(textureLocation), entityFallbackId);
+        return entityTextureIds.getOrDefault(RtBlockMaterials.logicalTextureName(textureLocation),
+                entityFallbackId);
     }
 
     /**
@@ -302,8 +337,9 @@ public final class RtTerrainMaterials {
         }
         int id = nextDynamicId++;
         MaterialHeaderData header = header(template.desc(), transparentWhiteAverage(), template.entry(),
-                sprite.getU0(), sprite.getV0(), inverseExtent(sprite.getU1() - sprite.getU0()),
-                inverseExtent(sprite.getV1() - sprite.getV0()));
+                sprite.getU0(), sprite.getV0(),
+                RtBlockMaterials.inverseExtent(sprite.getU1() - sprite.getU0()),
+                RtBlockMaterials.inverseExtent(sprite.getV1() - sprite.getV0()));
         long offset = Math.multiplyExact((long) id, MaterialHeaderData.BYTE_SIZE);
         ByteBuffer target = MemoryUtil.memByteBuffer(table.mapped + offset, MaterialHeaderData.BYTE_SIZE)
                 .order(ByteOrder.nativeOrder());
@@ -329,8 +365,18 @@ public final class RtTerrainMaterials {
     }
 
     private static int index(RtMaterials.Profile profile, boolean glass, boolean emitting) {
-        return (profile.ordinal() * MODEL_VARIANTS + (glass ? VARIANT_GLASS : VARIANT_OPAQUE))
+        // WATER/LAVA cannot classify a sprite; map them defensively to DEFAULT instead of overrunning.
+        int p = profile.ordinal() < SPRITE_PROFILES.length ? profile.ordinal() : 0;
+        return (p * MODEL_VARIANTS + (glass ? VARIANT_GLASS : VARIANT_OPAQUE))
                 * EMISSION_VARIANTS + (emitting ? 1 : 0);
+    }
+
+    /** LabPBR/heuristic masks own the summary; otherwise an emitting state falls back to whole-sprite. */
+    private static RtMaterialDesc.EmissionSummary variantSummary(int features, boolean emitting,
+                                                                 RtBlockMaterials.Entry entry,
+                                                                 RtMaterialDesc.EmissionSummary uniformSummary) {
+        if ((features & (FEATURE_SPEC | FEATURE_HEURISTIC_EMISSION)) != 0) return entry.emissionSummary();
+        return emitting ? uniformSummary : RtMaterialDesc.EmissionSummary.NONE;
     }
 
     private static RtMaterialDesc compileDesc(int model, int features, RtMaterials.Profile profile,
@@ -405,53 +451,56 @@ public final class RtTerrainMaterials {
         return new RtMaterialDesc.EmissionSummary(1.0f, 1.0f, 1.0f, 1.0f, 1.0f);
     }
 
-    private static RtMaterialDesc.EmissionSummary uniformEmissionSummary(TextureAtlasSprite sprite) {
+    /**
+     * Per-sprite compile inputs gathered in a single pixel pass: the raw average RGBA (matching the
+     * previous translucent shadow-filter input) and the premultiplied-linear uniform emission summary
+     * used when a state emits light but no per-texel mask was compiled.
+     */
+    private record SpriteStats(float[] average, RtMaterialDesc.EmissionSummary uniformSummary) {
+        static final SpriteStats NEUTRAL = new SpriteStats(transparentWhiteAverage(),
+                RtMaterialDesc.EmissionSummary.NONE);
+    }
+
+    private static SpriteStats computeSpriteStats(TextureAtlasSprite sprite) {
         var contents = sprite.contents();
         int width = contents.width();
         int height = contents.height();
         NativeImage image = ((SpriteContentsAccessor) contents).caustica$originalImage();
-        if (image == null || width <= 0 || height <= 0) return RtMaterialDesc.EmissionSummary.NONE;
-        double r = 0.0, g = 0.0, b = 0.0, luminance = 0.0;
+        if (image == null || width <= 0 || height <= 0) return SpriteStats.NEUTRAL;
+        long sr = 0L, sg = 0L, sb = 0L, sa = 0L;
+        double lr = 0.0, lg = 0.0, lb = 0.0;
         int covered = 0;
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                int pixel = image.getPixel(x, y);
-                float alpha = ARGB.alpha(pixel) / 255.0f;
-                float lr = srgbToLinear(ARGB.red(pixel) / 255.0f) * alpha;
-                float lg = srgbToLinear(ARGB.green(pixel) / 255.0f) * alpha;
-                float lb = srgbToLinear(ARGB.blue(pixel) / 255.0f) * alpha;
-                r += lr;
-                g += lg;
-                b += lb;
-                luminance += 0.2126f * lr + 0.7152f * lg + 0.0722f * lb;
-                if (alpha > 1.0f / 255.0f) covered++;
+                int pixel = image.getPixel(x, y); // frame 0 always occupies the image's top-left tile
+                int a = ARGB.alpha(pixel);
+                sr += ARGB.red(pixel);
+                sg += ARGB.green(pixel);
+                sb += ARGB.blue(pixel);
+                sa += a;
+                float alpha = a / 255.0f;
+                lr += RtMaterialTextureData.srgbToLinear(ARGB.red(pixel)) * alpha;
+                lg += RtMaterialTextureData.srgbToLinear(ARGB.green(pixel)) * alpha;
+                lb += RtMaterialTextureData.srgbToLinear(ARGB.blue(pixel)) * alpha;
+                if (a > 1) covered++;
             }
         }
         float inv = 1.0f / (width * (float) height);
-        if (luminance <= 0.0) return RtMaterialDesc.EmissionSummary.NONE;
-        return new RtMaterialDesc.EmissionSummary((float) r * inv, (float) g * inv, (float) b * inv,
-                (float) luminance * inv, covered * inv);
-    }
-
-    private static float srgbToLinear(float value) {
-        return value <= 0.04045f ? value / 12.92f
-                : (float) Math.pow((value + 0.055f) / 1.055f, 2.4f);
-    }
-
-    private static Identifier logicalTextureName(Identifier textureLocation) {
-        String path = textureLocation.getPath();
-        if (path.startsWith("textures/")) path = path.substring("textures/".length());
-        if (path.endsWith(".png")) path = path.substring(0, path.length() - 4);
-        return Identifier.fromNamespaceAndPath(textureLocation.getNamespace(), path);
-    }
-
-    private static float inverseExtent(float extent) {
-        return Math.abs(extent) > 1.0e-12f ? 1.0f / extent : 0.0f;
+        float scale = inv / 255.0f;
+        float[] average = {sr * scale, sg * scale, sb * scale, sa * scale};
+        double luminance = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+        RtMaterialDesc.EmissionSummary uniform = luminance <= 0.0
+                ? RtMaterialDesc.EmissionSummary.NONE
+                : new RtMaterialDesc.EmissionSummary((float) (lr * inv), (float) (lg * inv),
+                        (float) (lb * inv), (float) (luminance * inv), covered * inv);
+        return new SpriteStats(average, uniform);
     }
 
     private static final class MutableCompiledOverride {
         final RtMaterialOverrides.Rule rule;
         final IdentityHashMap<TextureAtlasSprite, int[]> ids = new IdentityHashMap<>();
+        // Sprite-wide rules compile into the primary ids map instead of `ids`; this marks them matched.
+        boolean matchedSprite;
 
         MutableCompiledOverride(RtMaterialOverrides.Rule rule) {
             this.rule = rule;
@@ -463,27 +512,6 @@ public final class RtTerrainMaterials {
     }
 
     private record CompiledOverride(RtMaterialOverrides.Rule rule, Map<TextureAtlasSprite, int[]> ids) {
-    }
-
-    /** Average raw PNG RGB/A over the first sprite frame, matching the previous shadow-filter input. */
-    private static float[] averageColor(TextureAtlasSprite sprite) {
-        var contents = sprite.contents();
-        int width = contents.width();
-        int height = contents.height();
-        NativeImage image = ((SpriteContentsAccessor) contents).caustica$originalImage();
-        if (image == null || width <= 0 || height <= 0) return transparentWhiteAverage();
-        long sr = 0L, sg = 0L, sb = 0L, sa = 0L;
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int pixel = image.getPixel(x, y);
-                sr += ARGB.red(pixel);
-                sg += ARGB.green(pixel);
-                sb += ARGB.blue(pixel);
-                sa += ARGB.alpha(pixel);
-            }
-        }
-        float scale = 1.0f / (width * (float) height * 255.0f);
-        return new float[]{sr * scale, sg * scale, sb * scale, sa * scale};
     }
 
     /** Read-only lookup captured once by a terrain task. */
@@ -532,6 +560,7 @@ public final class RtTerrainMaterials {
             RtMaterials.Profile profile = RtMaterials.profile(state);
             boolean emitting = state != null && state.getLightEmission() > 0;
             int variant = index(profile, glass, emitting);
+            // Only block-conditional rules remain here; sprite-wide overrides were compiled into `ids`.
             for (CompiledOverride override : overrides) {
                 if (!override.rule.matches(sprite, state)) continue;
                 int[] variants = override.ids.get(sprite);
@@ -541,6 +570,7 @@ public final class RtTerrainMaterials {
             return variants != null ? variants[variant] : fallbackVariants[variant];
         }
 
+        /** Stateless resolve (entity/block-atlas geometry). Sprite-wide overrides are already folded in. */
         public int resolve(TextureAtlasSprite sprite, RtMaterials.Profile profile, boolean glass, boolean emitting) {
             int[] variants = ids.get(sprite);
             int variant = index(profile, glass, emitting);

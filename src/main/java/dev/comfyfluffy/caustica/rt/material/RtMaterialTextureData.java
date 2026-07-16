@@ -7,6 +7,22 @@ import java.util.List;
 final class RtMaterialTextureData {
     static final int CHANNELS = 4;
 
+    // sRGB byte -> linear float. Every decode/summary input is 8-bit, so the exact transfer function
+    // collapses to one 256-entry table instead of a Math.pow per texel on the reload path.
+    private static final float[] SRGB_TO_LINEAR = new float[256];
+
+    static {
+        for (int i = 0; i < 256; i++) {
+            float value = i / 255.0f;
+            SRGB_TO_LINEAR[i] = value <= 0.04045f ? value / 12.92f
+                    : (float) Math.pow((value + 0.055f) / 1.055f, 2.4f);
+        }
+    }
+
+    static float srgbToLinear(int value8) {
+        return SRGB_TO_LINEAR[value8 & 0xFF];
+    }
+
     private RtMaterialTextureData() {
     }
 
