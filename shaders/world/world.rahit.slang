@@ -14,8 +14,8 @@ import world_common;
 
 [[vk::push_constant]] PushAddr pcAddr;
 
-[[vk::binding(2, 0)]] Sampler2D blockAtlas;
-[[vk::binding(0, 1)]] Sampler2D entityTex[];
+[[vk::binding(2, 0)]] Sampler2D blockAlbedoAtlas;
+[[vk::binding(0, 1)]] Sampler2D entityAlbedoTex[];
 
 static const float ALPHA_CUTOFF = 0.5;        // terrain (matches the cutout block models)
 static const float ENTITY_ALPHA_CUTOFF = 0.1; // entities: only discard near-fully-transparent texels
@@ -62,7 +62,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
         float2 uv = bary.x * uvs[i0] + bary.y * uvs[i1] + bary.z * uvs[i2];
         Prim epr = ConstPtr<Prim>(g.primAddr)[pid];
         int texSlot = int(epr.tint.w + 0.5);
-        float ealpha = entityTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0).a;
+        float ealpha = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0).a;
         // normal.w flags an alpha-blended (translucent) surface — slime / sulfur-cube shells, ghosts, …
         // (set by RtEntityCapture; 0 for opaque/cutout mobs + particles, which keep the binary cutout).
         if (epr.normal.w > 0.5) {
@@ -122,7 +122,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     // bucket's triangle base to index the section's packed corner-UV array (3 UVs per triangle).
     ConstPtr<float2> uvs = ConstPtr<float2>(sec.uvAddr);
     float2 uv = bary.x * uvs[3u * tri + 0u] + bary.y * uvs[3u * tri + 1u] + bary.z * uvs[3u * tri + 2u];
-    if (blockAtlas.SampleLevel(uv, 0.0).a < ALPHA_CUTOFF) {
+    if (blockAlbedoAtlas.SampleLevel(uv, 0.0).a < ALPHA_CUTOFF) {
         IgnoreHit();
     }
 }

@@ -52,7 +52,7 @@ public final class RtBlockMaterials {
     }
 
     /** Immutable per-sprite page mapping consumed by the material registry. */
-    public record Entry(int features, int textureSlot, int maxLod,
+    public record Entry(int features, int pageIndex, int maxLod,
                         float materialU, float materialV, float materialDu, float materialDv,
                         float albedoU, float albedoV, float albedoInvDu, float albedoInvDv,
                         RtMaterialDesc.EmissionSummary emissionSummary,
@@ -60,7 +60,7 @@ public final class RtBlockMaterials {
     }
 
     private record Page(RtMaterialPageTexture surface0, RtMaterialPageTexture normalAo,
-                        RtMaterialPageTexture surface1, int textureSlot) {
+                        RtMaterialPageTexture surface1, int index) {
         void destroy() {
             surface0.destroy();
             normalAo.destroy();
@@ -139,7 +139,7 @@ public final class RtBlockMaterials {
     }
 
     /** Compile, pack, mip, upload, and publish block-atlas plus authored entity material pages. */
-    public void prepareAll(RtContext ctx, int descriptorCapacity, RtEmissionSemantics emissionSemantics,
+    public void prepareAll(RtContext ctx, int materialPageCapacity, RtEmissionSemantics emissionSemantics,
                            RtMaterialOverrides overrides) {
         List<TextureAtlasSprite> sprites = blockSprites();
         List<Candidate> authored = new ArrayList<>();
@@ -231,9 +231,9 @@ public final class RtBlockMaterials {
                 layouts.add(page);
             }
         }
-        if (layouts.size() >= descriptorCapacity) {
+        if (layouts.size() > materialPageCapacity) {
             throw new IllegalStateException("RT material pages require " + layouts.size()
-                    + " bindless slots but capacity is " + descriptorCapacity);
+                    + " descriptor slots but capacity is " + materialPageCapacity);
         }
 
         int mipCount = Integer.numberOfTrailingZeros(pageSize) + 1;
@@ -264,12 +264,11 @@ public final class RtBlockMaterials {
                             "material normalAo page " + pageIndex),
                     new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface1,
                             "material surface1 page " + pageIndex),
-                    descriptorCapacity - 1 - pageIndex));
+                    pageIndex));
         }
 
-        int fallbackSlot = pages.get(0).textureSlot;
         float fallbackUv = GUTTER / (float) pageSize;
-        fallback = new Entry(0, fallbackSlot, 0, fallbackUv, fallbackUv,
+        fallback = new Entry(0, 0, 0, fallbackUv, fallbackUv,
                 1.0f / pageSize, 1.0f / pageSize, 0, 0, 1, 1,
                 RtMaterialDesc.EmissionSummary.NONE, RtMaterialDesc.EmissionSummary.NONE);
         for (TextureAtlasSprite sprite : sprites) {
@@ -278,8 +277,7 @@ public final class RtBlockMaterials {
         for (Candidate candidate : authored) {
             if (candidate.page < 0) continue;
             int maxLod = maxLodFor(candidate.width, candidate.height);
-            int slot = pages.get(candidate.page).textureSlot;
-            Entry entry = new Entry(candidate.features, slot, maxLod,
+            Entry entry = new Entry(candidate.features, candidate.page, maxLod,
                     candidate.x / (float) pageSize, candidate.y / (float) pageSize,
                     candidate.width / (float) pageSize, candidate.height / (float) pageSize,
                     candidate.blockSprite() ? candidate.sprite.getU0() : 0.0f,
@@ -305,14 +303,9 @@ public final class RtBlockMaterials {
 
     public void bindPages(RtPipeline pipeline, long sampler) {
         for (Page page : pages) {
-            pipeline.setBindlessTexture(0, page.textureSlot, page.surface1.view(), sampler);
-            pipeline.setBindlessTexture(1, page.textureSlot, page.normalAo.view(), sampler);
-            pipeline.setBindlessTexture(2, page.textureSlot, page.surface0.view(), sampler);
+            pipeline.setMaterialPage(page.index(), page.surface0().view(), page.normalAo().view(),
+                    page.surface1().view(), sampler);
         }
-    }
-
-    public int pageCount() {
-        return pages.size();
     }
 
     public Entry entry(TextureAtlasSprite sprite) {
@@ -332,7 +325,7 @@ public final class RtBlockMaterials {
     }
 
     private Entry fallbackFor(TextureAtlasSprite sprite) {
-        return new Entry(0, fallback.textureSlot, 0,
+        return new Entry(0, fallback.pageIndex(), 0,
                 fallback.materialU, fallback.materialV, fallback.materialDu, fallback.materialDv,
                 sprite.getU0(), sprite.getV0(), inverseExtent(sprite.getU1() - sprite.getU0()),
                 inverseExtent(sprite.getV1() - sprite.getV0()), RtMaterialDesc.EmissionSummary.NONE,

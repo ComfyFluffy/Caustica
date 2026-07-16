@@ -21,7 +21,7 @@ public struct PushAddr {
 };
 
 // Block-breaking overlay entry: xyz = breaking block position (rebased, same space as gl_WorldRay*),
-// w = bindless entityTex slot of the destroy-stage texture.
+// w = bindless entityAlbedoTex slot of the destroy-stage texture.
 public struct BreakEntry {
     public int4 posSlot;
 };
@@ -101,7 +101,7 @@ public struct TerrainPrim {
 };
 
 // Compiled material record (80 B). Source-format data has already been decoded into canonical pages;
-// texturePage indexes the shared bindless bundle arrays. materialUv maps sprite-local UV into the packed
+// texturePage indexes the dedicated canonical page arrays. materialUv maps sprite-local UV into the packed
 // page, while albedoUv maps the vanilla atlas rectangle back to sprite-local UV.
 public struct MaterialHeader {
     public uint model;

@@ -31,7 +31,7 @@ public final class RtEntityCapture implements VertexConsumer {
 
     // Bindless texture slot for the geometry currently being submitted (set by the collector per
     // submitModel, so body + feature layers get their own texture). Stored per-prim in tint.w;
-    // the hit shader samples entityTex[texSlot].
+    // the hit shader samples entityAlbedoTex[texSlot].
     int currentTexSlot;
     // Canonical MaterialHeader ID for this submission. Entity, block-entity and block-atlas geometry all
     // use the same table; albedo remains a separate bindless slot in tint.w.

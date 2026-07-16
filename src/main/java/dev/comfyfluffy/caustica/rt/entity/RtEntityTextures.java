@@ -69,7 +69,6 @@ public final class RtEntityTextures {
     // Descriptor array capacity of the currently alive world pipeline. A higher config value applies after
     // reset/recreate; a lower value stops allocating new slots immediately without invalidating old ones.
     private int capacity = maxTextures();
-    private int reservedTailSlots;
     private int nextSlot = 1;
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
@@ -158,7 +157,7 @@ public final class RtEntityTextures {
             return;
         }
         for (Pending p : pending) {
-            pipeline.setBindlessTexture(0, p.slot(), p.view(), sampler);
+            pipeline.setEntityAlbedoTexture(p.slot(), p.view(), sampler);
         }
         pending.clear();
     }
@@ -170,13 +169,7 @@ public final class RtEntityTextures {
 
     /** Drop the registry for a pipeline whose bindless descriptor arrays have this capacity. */
     public void reset(int descriptorCapacity) {
-        reset(descriptorCapacity, 0);
-    }
-
-    /** Reset while reserving the highest slots for canonical block-material page bundles. */
-    public void reset(int descriptorCapacity, int reservedTailSlots) {
         capacity = Math.max(1, descriptorCapacity);
-        this.reservedTailSlots = Math.max(0, Math.min(capacity - 1, reservedTailSlots));
         viewCache.clear();
         locationCache.clear();
         viewSlotCache.clear();
@@ -187,7 +180,7 @@ public final class RtEntityTextures {
     }
 
     private int slotLimit() {
-        return Math.min(capacity - reservedTailSlots, maxTextures());
+        return Math.min(capacity, maxTextures());
     }
 
     /** Recover the resource Identifier of {@code renderType}'s primary texture (Sampler0), or null. The

@@ -432,7 +432,7 @@ public final class RtTerrainMaterials {
                     * (EMISSION_STRENGTH_MASK / MAX_OVERRIDE_EMISSION_STRENGTH));
             packedFeatures |= strength << EMISSION_STRENGTH_SHIFT;
         }
-        return new MaterialHeaderData(desc.model(), packedFeatures, entry.textureSlot(), 0,
+        return new MaterialHeaderData(desc.model(), packedFeatures, entry.pageIndex(), 0,
                 new Float4(entry.materialU(), entry.materialV(), entry.materialDu(), entry.materialDv()),
                 new Float4(albedoU, albedoV, albedoInvDu, albedoInvDv),
                 new Float4(desc.roughness(), desc.metalness(), desc.ior(), desc.transmission()),

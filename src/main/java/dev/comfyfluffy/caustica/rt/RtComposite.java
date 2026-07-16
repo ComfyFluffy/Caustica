@@ -165,11 +165,11 @@ public final class RtComposite {
     // Set at the HEAD of Minecraft.reloadResourcePacks() (mixin): a resource reload recreates the block
     // atlas + entity textures. We tear down the world pipeline there (drops all descriptor references) and
     // rebuild it once the NEW atlas is in place — detected by the atlas view handle changing away from
-    // boundAtlasHandle to a fresh non-zero value (MC's deferred free keeps the old handle live for a few
+    // boundBlockAlbedoAtlasHandle to a fresh non-zero value (MC's deferred free keeps the old handle live for a few
     // frames, so "handle != 0" alone isn't enough to tell old from new).
     private volatile boolean reloadRebindRequested;
     // The block-atlas view handle currently bound into the world pipeline (set by bindWorldTextures).
-    private long boundAtlasHandle;
+    private long boundBlockAlbedoAtlasHandle;
     private int bindlessTextureCapacity;
     // True after the LabPBR atlases have been resolved/bound for the currently alive world pipeline.
     private boolean materialBindingsReady;
@@ -338,8 +338,8 @@ public final class RtComposite {
             return true;
         }
         if (reloadRebindRequested) {
-            long atlas = blockAtlasView();
-            return atlas == 0L || atlas == boundAtlasHandle;
+            long atlas = blockAlbedoAtlasView();
+            return atlas == 0L || atlas == boundBlockAlbedoAtlasHandle;
         }
         return false;
     }
@@ -450,8 +450,8 @@ public final class RtComposite {
             // leaving the handle 0 transiently). Skip RT — vanilla renders — until the handle becomes a
             // fresh, non-zero value different from what we last bound; only then rebuild against it.
             if (reloadRebindRequested) {
-                long atlas = blockAtlasView();
-                if (atlas == 0L || atlas == boundAtlasHandle) {
+                long atlas = blockAlbedoAtlasView();
+                if (atlas == 0L || atlas == boundBlockAlbedoAtlasHandle) {
                     return false;
                 }
             }
@@ -494,7 +494,7 @@ public final class RtComposite {
         if (failed || worldPipeline != null || reloadRebindRequested) {
             return;
         }
-        if (Minecraft.getInstance().level == null || blockAtlasView() == 0L) {
+        if (Minecraft.getInstance().level == null || blockAlbedoAtlasView() == 0L) {
             return;
         }
         try {
@@ -554,17 +554,17 @@ public final class RtComposite {
      */
     private void bindWorldTextures(RtContext ctx) {
         long sampler = atlasSampler(ctx);
-        long atlasView = blockAtlasView();
-        boundAtlasHandle = atlasView; // remember what we bound so a reload can detect the new atlas
-        worldPipeline.setAtlasSampler(atlasView, sampler);
+        long atlasView = blockAlbedoAtlasView();
+        boundBlockAlbedoAtlasHandle = atlasView; // remember what we bound so a reload can detect the new atlas
+        worldPipeline.setBlockAlbedoAtlas(atlasView, sampler);
         // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
         // resolved samples something defined rather than an unbound (partially-bound) descriptor.
         RtBlockMaterials.INSTANCE.reset();
         RtMaterialOverrides materialOverrides = RtMaterialOverrides.load();
         RtEmissionSemantics emissionSemantics = RtEmissionSemantics.analyze();
         RtBlockMaterials.INSTANCE.prepareAll(ctx, bindlessTextureCapacity, emissionSemantics, materialOverrides);
-        RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity, RtBlockMaterials.INSTANCE.pageCount());
-        worldPipeline.setBindlessTexture(0, 0, atlasView, sampler); // binding 0 (albedo), slot 0 fallback
+        RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity);
+        worldPipeline.setEntityAlbedoTexture(0, atlasView, sampler);
         RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler);
         RtTerrainMaterials.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, materialOverrides);
         materialBindingsReady = true;
@@ -1255,7 +1255,7 @@ public final class RtComposite {
         return atlasSampler;
     }
 
-    private static long blockAtlasView() {
+    private static long blockAlbedoAtlasView() {
         GpuTextureView view = Minecraft.getInstance().getTextureManager()
                 .getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
         return vkImageView(view);

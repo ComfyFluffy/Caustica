@@ -10,12 +10,12 @@ import world_common;
 
 [[vk::push_constant]] PushAddr pcAddr;
 
-[[vk::binding(2, 0)]]  Sampler2D blockAtlas;
-// Shared bindless bundle arrays. Entity slots contain albedo/raw LabPBR maps. Reserved high slots contain
-// canonical material surface1/normalAo/surface0 pages, selected by MaterialHeader.texturePage.
-[[vk::binding(0, 1)]] Sampler2D entityTex[];
-[[vk::binding(1, 1)]] Sampler2D entityNormalTex[];
-[[vk::binding(2, 1)]] Sampler2D entitySpecTex[];
+[[vk::binding(2, 0)]] Sampler2D blockAlbedoAtlas;
+// Independent bindless arrays: per-draw entity albedo slots and compact canonical material-page bundles.
+[[vk::binding(0, 1)]] Sampler2D entityAlbedoTex[];
+[[vk::binding(1, 1)]] Sampler2D materialSurface0Tex[];
+[[vk::binding(2, 1)]] Sampler2D materialNormalAoTex[];
+[[vk::binding(3, 1)]] Sampler2D materialSurface1Tex[];
 
 static const uint MATERIAL_OPAQUE = 0u;
 static const uint MATERIAL_WATER = 1u;
@@ -35,34 +35,6 @@ uint materialEmissionSource(MaterialHeader header, float emission) {
     if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) return EMISSION_SOURCE_LAB_PBR;
     if ((header.features & MATERIAL_FEATURE_HEURISTIC_EMISSION) != 0u) return EMISSION_SOURCE_HEURISTIC;
     return EMISSION_SOURCE_UNIFORM;
-}
-
-// LabPBR predefined metals (green channel 230..237): complex refractive indices N (eta) and K (kappa)
-// per RGB. F0 = ((n-1)^2 + k^2) / ((n+1)^2 + k^2). Values per the LabPBR 1.3 standard.
-static const float3 METAL_N[8] = {
-    float3(2.9114, 2.9497, 2.5845),   // 230 iron
-    float3(0.18299, 0.42108, 1.3734), // 231 gold
-    float3(1.3456, 0.96521, 0.61722), // 232 aluminum
-    float3(3.1071, 3.1812, 2.3230),   // 233 chrome
-    float3(0.27105, 0.67693, 1.3164), // 234 copper
-    float3(1.9100, 1.8300, 1.4400),   // 235 lead
-    float3(2.3757, 2.0847, 1.8453),   // 236 platinum
-    float3(0.15943, 0.14512, 0.13547) // 237 silver
-};
-static const float3 METAL_K[8] = {
-    float3(3.0893, 2.9318, 2.7670),
-    float3(3.4242, 2.3459, 1.7704),
-    float3(7.4746, 6.3995, 5.3031),
-    float3(3.3314, 3.3291, 3.1350),
-    float3(3.6092, 2.6248, 2.2921),
-    float3(3.5100, 3.4000, 3.1800),
-    float3(4.2655, 3.7153, 3.1365),
-    float3(3.9291, 3.1900, 2.3808)
-};
-float3 metalF0(int idx) {
-    float3 n = METAL_N[idx];
-    float3 k = METAL_K[idx];
-    return ((n - 1.0) * (n - 1.0) + k * k) / ((n + 1.0) * (n + 1.0) + k * k);
 }
 
 // Strength of the LabPBR _n ambient-occlusion (blue) applied to albedo. Kept mild because the path
@@ -144,20 +116,15 @@ struct Surface {
     float ao;
 };
 
-// Canonical material page bundles ride the shared bindless arrays at reserved tail slots; the array
-// names describe the ENTITY use of each binding (albedo/_n/_s), not the page contents. Name the page
-// lookups by their bundle so material code never has to remember that mapping:
-//   surface0 (rough/metal/emission/SSS) lives in the _s binding,
-//   normalAo (normal XY/AO/height)      lives in the _n binding,
-//   surface1 (F0 rgb/override mask)     lives in the albedo binding.
+// Canonical material pages use a compact page index shared by their three dedicated arrays.
 float4 samplePageSurface0(uint page, float2 uv, float lod) {
-    return entitySpecTex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
+    return materialSurface0Tex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
 }
 float4 samplePageSurface1(uint page, float2 uv, float lod) {
-    return entityTex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
+    return materialSurface1Tex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
 }
 float4 samplePageNormalAo(uint page, float2 uv, float lod) {
-    return entityNormalTex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
+    return materialNormalAoTex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
 }
 
 // The sole terrain/entity material evaluation path. LabPBR categorical bytes have already been
@@ -235,8 +202,8 @@ float3 applyBreaking(float3 albedo, uint rayCone, float3 rayOrigin, float3 rayDi
             float2 decalUv = (an.x >= an.y && an.x >= an.z) ? local.zy
                            : (an.y >= an.z) ? local.xz
                            : local.xy;
-            float decalLod = rayConeUnitUvLod(rayCone, texSizePx(entityTex[NonUniformResourceIndex(ps.w)]));
-            float3 crack = srgbToLinear(entityTex[NonUniformResourceIndex(ps.w)].SampleLevel(decalUv, decalLod).rgb);
+            float decalLod = rayConeUnitUvLod(rayCone, texSizePx(entityAlbedoTex[NonUniformResourceIndex(ps.w)]));
+            float3 crack = srgbToLinear(entityAlbedoTex[NonUniformResourceIndex(ps.w)].SampleLevel(decalUv, decalLod).rgb);
             return clamp(crack * albedo, 0.0, 1.0);
         }
     }
@@ -267,13 +234,13 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 pp0 = mul(o2w, HitTriangleVertexPosition(0));
         float3 pp1 = mul(o2w, HitTriangleVertexPosition(1));
         float3 pp2 = mul(o2w, HitTriangleVertexPosition(2));
-        float particleLod = rayConeTextureLod(rayCone, texSizePx(entityTex[NonUniformResourceIndex(pslot)]),
+        float particleLod = rayConeTextureLod(rayCone, texSizePx(entityAlbedoTex[NonUniformResourceIndex(pslot)]),
                 pp0, pp1, pp2, uvb[p0], uvb[p1], uvb[p2]);
         float3 pn = normalize(pr.normal.xyz);
         if (dot(pn, WorldRayDirection()) > 0.0) {
             pn = -pn;
         }
-        payload.albedo = srgbToLinear(entityTex[NonUniformResourceIndex(pslot)].SampleLevel(puv, particleLod).rgb) * pr.tint.rgb;
+        payload.albedo = srgbToLinear(entityAlbedoTex[NonUniformResourceIndex(pslot)].SampleLevel(puv, particleLod).rgb) * pr.tint.rgb;
         payload.normal = pn;
         payload.hitT = RayTCurrent();
         // Per-particle motion vector: interpolate the captured per-vertex displacement (uniform across
@@ -320,9 +287,9 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 ep0 = mul(entityO2w, HitTriangleVertexPosition(0));
         float3 ep1 = mul(entityO2w, HitTriangleVertexPosition(1));
         float3 ep2 = mul(entityO2w, HitTriangleVertexPosition(2));
-        float entityLod = rayConeTextureLod(rayCone, texSizePx(entityTex[NonUniformResourceIndex(texSlot)]),
+        float entityLod = rayConeTextureLod(rayCone, texSizePx(entityAlbedoTex[NonUniformResourceIndex(texSlot)]),
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2]);
-        float3 albedo = srgbToLinear(entityTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod).rgb) * pr.tint.rgb;
+        float3 albedo = srgbToLinear(entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod).rgb) * pr.tint.rgb;
         uint materialId = uint(pr.mat.z + 0.5);
         MaterialHeader header = ConstPtr<MaterialHeader>(pcAddr.materialTableAddr)[materialId];
         Surface surface = evaluateMaterial(header, euvCoord, entityLod, albedo, n,
@@ -379,7 +346,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     float3 tp0 = HitTriangleVertexPosition(0);
     float3 tp1 = HitTriangleVertexPosition(1);
     float3 tp2 = HitTriangleVertexPosition(2);
-    float blockLod = rayConeTextureLod(rayCone, texSizePx(blockAtlas), tp0, tp1, tp2, uv0, uv1, uv2);
+    float blockLod = rayConeTextureLod(rayCone, texSizePx(blockAlbedoAtlas), tp0, tp1, tp2, uv0, uv1, uv2);
 
     // Orient the GEOMETRIC normal toward the viewer FIRST (double-sided geometry), so the normal-map TBN
     // is built in the correct hemisphere. Doing this before the map — rather than flipping the perturbed
@@ -394,7 +361,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // (material 3). albedo carries the transmission tint = texel rgb mixed toward white by (1 − opacity),
     // so a more opaque texel tints transmitted light more strongly.
     if (materialHeader.model == MATERIAL_GLASS) {
-        float4 gtex = blockAtlas.SampleLevel(uv, blockLod);
+        float4 gtex = blockAlbedoAtlas.SampleLevel(uv, blockLod);
         float3 gtexRgb = srgbToLinear(gtex.rgb);
         float3 glassAlbedo = lerp(float3(1.0, 1.0, 1.0), gtexRgb * tint, gtex.a);
         Surface glassSurface = evaluateMaterial(materialHeader, uv, blockLod, glassAlbedo, n,
@@ -402,7 +369,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
                 materialHeader.params.x, materialHeader.params.y, 0.0, false);
         n = glassSurface.normal;
         // Translucent blocks (glass, ice, …) are breakable too — apply the same overlay here, reusing
-        // gtex (already sampled above) rather than re-fetching blockAtlas.
+        // gtex (already sampled above) rather than re-fetching blockAlbedoAtlas.
         payload.albedo = applyBreaking(glassAlbedo * glassSurface.ao,
                 rayCone, WorldRayOrigin(), WorldRayDirection(), RayTCurrent(), n);
         payload.normal = n;
@@ -418,7 +385,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // shades the surface as a clear dielectric and only needs the tint to derive the per-channel
     // Beer–Lambert absorption. Opaque terrain uses textured albedo.
     payload.albedo = materialHeader.model == MATERIAL_WATER
-            ? tint : srgbToLinear(blockAtlas.SampleLevel(uv, blockLod).rgb) * tint;
+            ? tint : srgbToLinear(blockAlbedoAtlas.SampleLevel(uv, blockLod).rgb) * tint;
     payload.hitT = RayTCurrent();
     payload.motionPrev = float3(0.0, 0.0, 0.0); // static terrain: camera-only motion vector
     uint material = materialHeader.model == MATERIAL_WATER ? MATERIAL_WATER : MATERIAL_OPAQUE;
