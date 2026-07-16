@@ -25,6 +25,18 @@ the compiled `MaterialHeader` table and canonical semantic-mip pages. Entity alb
 physical channels are pack-compiled. Atlas sprites append only a previously unused header containing their
 stitched UV rectangle; runtime-only textures such as downloaded player skins use the neutral entity material.
 
+Known divergences from this document in the current implementation:
+
+- The heuristic emission mask is a fixed dark floor (0.1) plus a luminance³ curve, not the
+  percentile-relative threshold with saturation confidence described below. Gating on block-state
+  semantics is implemented as specified; only the per-texel mask shape is simpler.
+- Sprite variants are pre-enumerated as the reachable-profile × glass × emitting cross product rather
+  than combinations observed in baked models. WATER/LAVA profiles are excluded (fluids use dedicated
+  singleton headers), but per-sprite variants that no block state ever selects still exist.
+- `MaterialHeader.params.zw` (IOR, transmission) and the JSON `transmission` block are compiled and
+  stored but not yet consumed by shading — raygen still hard-codes water/glass transport (milestone M4).
+  The loader warns when an override sets them.
+
 ## Problems in the current path
 
 The existing implementation works, but its data ownership is inverted:
