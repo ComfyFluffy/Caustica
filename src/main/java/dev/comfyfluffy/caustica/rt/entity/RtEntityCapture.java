@@ -15,7 +15,7 @@ import org.joml.Vector3fc;
  * {@code model.renderToBuffer(pose, this, …)}.
  *
  * <p>Accumulators use the same layout as terrain's {@code SectionMesh} (positions, indices, atlas UV,
- * per-prim {@code {normal.xyz, flags}, {tint.rgb, albedoSlot}, {reserved, reserved, materialId, reserved}}) so entities
+ * per-prim {@code {normal.xyz, reserved}, {tint.rgb, albedoSlot}, {materialId, flags, aux0, aux1}}) so entities
  * share the terrain upload + BLAS path verbatim.
  */
 public final class RtEntityCapture implements VertexConsumer {
@@ -36,12 +36,6 @@ public final class RtEntityCapture implements VertexConsumer {
     // Canonical MaterialHeader ID for this submission. Entity, block-entity and block-atlas geometry all
     // use the same table; albedo remains a separate bindless slot in tint.w.
     int currentMaterialId;
-    // Whether the current submission is an alpha-blended (translucent) render type — slime / sulfur-cube
-    // shells, ghosts, … Stored per-prim in the otherwise-unused entity emission lane (normal.w); world.rahit
-    // reads it and does stochastic transparency for those surfaces instead of a binary cutout, so the inner
-    // content (slime core, the sulfur cube's contained block) shows through the shell. Set by the collector
-    // per submission (model bodies only — block/item/particle paths force it false).
-    boolean currentTranslucent;
     // Decal-stacking rank for the current submission (0 = no offset). Set by the collector from
     // SubmitNodeCollector#order(int) — see emitQuad's coincident-layer push.
     int currentOrder;
@@ -74,7 +68,6 @@ public final class RtEntityCapture implements VertexConsumer {
         n = 0;
         currentTexSlot = 0;
         currentMaterialId = 0;
-        currentTranslucent = false;
         currentOrder = 0;
         uvRemap = false;
     }
@@ -124,7 +117,6 @@ public final class RtEntityCapture implements VertexConsumer {
     void copySubmissionStateTo(RtEntityCapture target) {
         target.currentTexSlot = currentTexSlot;
         target.currentMaterialId = currentMaterialId;
-        target.currentTranslucent = currentTranslucent;
         target.currentOrder = currentOrder;
         target.uvRemap = uvRemap;
         target.uvU0 = uvU0;
@@ -309,17 +301,15 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(nx);
             prim.add(ny);
             prim.add(nz);
-            // normal.w: entities don't carry block-light emission, so this lane flags an alpha-blended
-            // (translucent) surface → world.rahit does stochastic transparency instead of a binary cutout.
-            prim.add(currentTranslucent ? 1f : 0f);
+            prim.add(0f); // normal.w reserved; alpha semantics live in MaterialHeader.features
             prim.add(tr);
             prim.add(tg);
             prim.add(tb);
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot
-            prim.add(0f); // reserved: physical parameters live in MaterialHeader
-            prim.add(0f); // reserved
-            prim.add((float) currentMaterialId);
-            prim.add(0f); // reserved
+            prim.add(Float.intBitsToFloat(currentMaterialId));
+            prim.add(0f); // flags
+            prim.add(0f); // aux0
+            prim.add(0f); // aux1
         }
     }
 

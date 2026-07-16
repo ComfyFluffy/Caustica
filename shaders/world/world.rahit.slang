@@ -52,7 +52,8 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     float2 attribs = attr.barycentrics;
     float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
 
-    if ((InstanceID() & (ENTITY_BIT | PARTICLE_BIT)) != 0u) {
+    uint instanceKind = InstanceID() & (ENTITY_BIT | PARTICLE_BIT);
+    if (instanceKind != 0u) {
         EntityGeom g = ConstPtr<EntityGeom>(pcAddr.entityTableAddr)[InstanceID() & IDX_MASK];
         ConstPtr<uint> indices = ConstPtr<uint>(g.idxAddr);
         ConstPtr<float2> uvs = ConstPtr<float2>(g.uvAddr);
@@ -62,19 +63,38 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
         float2 uv = bary.x * uvs[i0] + bary.y * uvs[i1] + bary.z * uvs[i2];
         Prim epr = ConstPtr<Prim>(g.primAddr)[pid];
         int texSlot = int(epr.tint.w + 0.5);
-        float ealpha = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0).a;
-        // normal.w flags an alpha-blended (translucent) surface — slime / sulfur-cube shells, ghosts, …
-        // (set by RtEntityCapture; 0 for opaque/cutout mobs + particles, which keep the binary cutout).
-        if (epr.normal.w > 0.5) {
+        float4 texel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0);
+        bool stochasticAlpha = false;
+        MaterialHeader materialHeader;
+        if (instanceKind == ENTITY_BIT) {
+            materialHeader = ConstPtr<MaterialHeader>(pcAddr.materialTableAddr)[epr.materialId];
+            stochasticAlpha = (materialHeader.features & MATERIAL_FEATURE_STOCHASTIC_ALPHA) != 0u;
+        }
+        if (stochasticAlpha) {
             uint salt = pid * 1664525u
                     ^ (InstanceID() & IDX_MASK) * 1013904223u
                     ^ asuint(RayTCurrent());
-            if (alphaDitherThreshold(salt) >= clamp(ealpha, 0.0, 1.0)) {
+            if (alphaDitherThreshold(salt) >= clamp(texel.a, 0.0, 1.0)) {
                 IgnoreHit();
             }
-            return;
+        } else if (texel.a < ENTITY_ALPHA_CUTOFF) {
+            IgnoreHit();
         }
-        if (ealpha < ENTITY_ALPHA_CUTOFF) {
+
+        // Radiance rays accept the surface and continue to closest-hit. Shadow rays use the same material
+        // model here so entity dielectrics transmit instead of becoming opaque shadow blockers.
+        bool shadowRay = (RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0u;
+        if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_GLASS) {
+            float3 tint = lerp(float3(1.0, 1.0, 1.0),
+                    srgbToLinear(texel.rgb) * epr.tint.rgb, texel.a);
+            shadowVis.rgb *= tint * clamp(materialHeader.params.w, 0.0, 1.0);
+            IgnoreHit();
+        }
+        if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_WATER) {
+            float3 tint = srgbToLinear(texel.rgb) * epr.tint.rgb;
+            shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), tint, WATER_SHADOW_TINT)
+                    * clamp(materialHeader.params.w, 0.0, 1.0);
+            shadowVis.a = shadowVis.a < 0.0 ? RayTCurrent() : min(shadowVis.a, RayTCurrent());
             IgnoreHit();
         }
         return;

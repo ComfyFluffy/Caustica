@@ -45,6 +45,7 @@ public final class RtTerrainMaterials {
     public static final int FEATURE_NORMAL = 2;
     public static final int FEATURE_HEURISTIC_EMISSION = 4;
     public static final int FEATURE_OVERRIDE_EMISSION = 8;
+    public static final int FEATURE_STOCHASTIC_ALPHA = 16;
     private static final int EMISSION_STRENGTH_SHIFT = 8;
     private static final int EMISSION_STRENGTH_MASK = 255;
     private static final float MAX_OVERRIDE_EMISSION_STRENGTH = 4.0f;
@@ -75,6 +76,7 @@ public final class RtTerrainMaterials {
     private Map<Identifier, Integer> entityTextureIds = Map.of();
     private Map<Identifier, EntityTemplate> entityTemplates = Map.of();
     private final Map<EntitySpriteKey, Integer> entitySpriteIds = new HashMap<>();
+    private final Map<Integer, Integer> stochasticAlphaIds = new HashMap<>();
     private int entityFallbackId;
     private int nextDynamicId;
     private int tableCapacity;
@@ -220,8 +222,9 @@ public final class RtTerrainMaterials {
 
         // Full entity textures have fixed [0,1] UVs and receive IDs above. Atlas sprites need a second,
         // append-only header with the actual stitched atlas rectangle, which is only known when the sprite
-        // first appears in capture. Reserve one dynamic slot per authored entity resource.
-        int dynamicReserve = Math.max(64, Math.multiplyExact(entityResources.size(), 2));
+        // first appears in capture. Reserve room for atlas and alpha-mode variants.
+        int dynamicReserve = Math.max(64, Math.addExact(sprites.size(),
+                Math.multiplyExact(entityResources.size(), 3)));
         int recordCapacity = Math.addExact(headers.size(), dynamicReserve);
         long byteSize = Math.multiplyExact((long) recordCapacity, MaterialHeaderData.BYTE_SIZE);
         if (byteSize > Integer.MAX_VALUE) {
@@ -263,6 +266,7 @@ public final class RtTerrainMaterials {
         entityTextureIds = Collections.unmodifiableMap(nextEntityTextureIds);
         entityTemplates = Collections.unmodifiableMap(nextEntityTemplates);
         entitySpriteIds.clear();
+        stochasticAlphaIds.clear();
         entityFallbackId = nextEntityFallbackId;
         nextDynamicId = headers.size();
         tableCapacity = recordCapacity;
@@ -314,24 +318,55 @@ public final class RtTerrainMaterials {
         return entityFallbackId;
     }
 
+    public int entityFallbackId(boolean stochasticAlpha) {
+        return stochasticAlpha ? withStochasticAlpha(entityFallbackId) : entityFallbackId;
+    }
+
+    /** Return an append-only material-instance variant with stochastic coverage enabled. */
+    public synchronized int withStochasticAlpha(int materialId) {
+        if (table == null || materialId < 0 || materialId >= nextDynamicId) {
+            throw new IllegalStateException("RT material is not available for alpha specialization: " + materialId);
+        }
+        long sourceOffset = Math.multiplyExact((long) materialId, MaterialHeaderData.BYTE_SIZE);
+        ByteBuffer source = MemoryUtil.memByteBuffer(table.mapped + sourceOffset, MaterialHeaderData.BYTE_SIZE)
+                .order(ByteOrder.nativeOrder());
+        if ((source.getInt(4) & FEATURE_STOCHASTIC_ALPHA) != 0) return materialId;
+        Integer current = stochasticAlphaIds.get(materialId);
+        if (current != null) return current;
+        if (nextDynamicId >= tableCapacity) {
+            throw new IllegalStateException("RT material header reserve exhausted");
+        }
+        int id = nextDynamicId++;
+        long targetOffset = Math.multiplyExact((long) id, MaterialHeaderData.BYTE_SIZE);
+        MemoryUtil.memCopy(table.mapped + sourceOffset, table.mapped + targetOffset,
+                MaterialHeaderData.BYTE_SIZE);
+        ByteBuffer target = MemoryUtil.memByteBuffer(table.mapped + targetOffset, MaterialHeaderData.BYTE_SIZE)
+                .order(ByteOrder.nativeOrder());
+        target.putInt(4, target.getInt(4) | FEATURE_STOCHASTIC_ALPHA);
+        table.flush(targetOffset, MaterialHeaderData.BYTE_SIZE);
+        stochasticAlphaIds.put(materialId, id);
+        return id;
+    }
+
     /** Resolve a full entity texture resource to its pack-compiled material ID. */
-    public int resolveEntityTexture(Identifier textureLocation) {
-        if (textureLocation == null) return entityFallbackId;
-        return entityTextureIds.getOrDefault(RtBlockMaterials.logicalTextureName(textureLocation),
-                entityFallbackId);
+    public int resolveEntityTexture(Identifier textureLocation, boolean stochasticAlpha) {
+        int id = textureLocation != null
+                ? entityTextureIds.getOrDefault(RtBlockMaterials.logicalTextureName(textureLocation), entityFallbackId)
+                : entityFallbackId;
+        return stochasticAlpha ? withStochasticAlpha(id) : id;
     }
 
     /**
      * Resolve a block-entity atlas sprite. Canonical texels were compiled at pack load; only this header's
      * atlas-to-local UV transform is appended now. Existing IDs and page contents are never modified.
      */
-    public synchronized int resolveEntitySprite(TextureAtlasSprite sprite) {
-        if (sprite == null) return entityFallbackId;
+    public synchronized int resolveEntitySprite(TextureAtlasSprite sprite, boolean stochasticAlpha) {
+        if (sprite == null) return entityFallbackId(stochasticAlpha);
         EntitySpriteKey key = EntitySpriteKey.of(sprite);
         Integer current = entitySpriteIds.get(key);
-        if (current != null) return current;
+        if (current != null) return stochasticAlpha ? withStochasticAlpha(current) : current;
         EntityTemplate template = entityTemplates.get(key.name());
-        if (template == null) return entityFallbackId;
+        if (template == null) return entityFallbackId(stochasticAlpha);
         if (nextDynamicId >= tableCapacity || table == null) {
             throw new IllegalStateException("RT entity material header reserve exhausted");
         }
@@ -346,7 +381,7 @@ public final class RtTerrainMaterials {
         header.write(target);
         table.flush(offset, MaterialHeaderData.BYTE_SIZE);
         entitySpriteIds.put(key, id);
-        return id;
+        return stochasticAlpha ? withStochasticAlpha(id) : id;
     }
 
     /** Caller must ensure no in-flight trace references the current table. */
@@ -355,6 +390,7 @@ public final class RtTerrainMaterials {
         entityTextureIds = Map.of();
         entityTemplates = Map.of();
         entitySpriteIds.clear();
+        stochasticAlphaIds.clear();
         entityFallbackId = 0;
         nextDynamicId = 0;
         tableCapacity = 0;

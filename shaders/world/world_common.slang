@@ -65,6 +65,7 @@ public struct Payload {
     public uint   flags;       // bits 0..1 material, bit 2 celestial, bit 3 water-entering, bits 4..6 emission source.
     public uint   roughMetal;  // packHalf2x16(roughness, metalness)
     public uint   emissionSss; // packHalf2x16(emission, sss)
+    public uint   iorTransmission; // packHalf2x16(IOR, transmission factor)
     public uint   rayCone;     // packHalf2x16(width, spread)
 };
 
@@ -82,11 +83,20 @@ public static const uint EMISSION_SOURCE_HEURISTIC = 2u;
 public static const uint EMISSION_SOURCE_LAB_PBR = 3u;
 public static const uint EMISSION_SOURCE_OVERRIDE = 4u;
 
-// Entity per-triangle record (48 B). Entity migration follows the terrain material-ID path separately.
+public static const uint PAYLOAD_MATERIAL_MASK = 3u;
+public static const uint MATERIAL_OPAQUE = 0u;
+public static const uint MATERIAL_WATER = 1u;
+public static const uint MATERIAL_PARTICLE = 2u;
+public static const uint MATERIAL_GLASS = 3u;
+
+// Entity per-triangle record (48 B). The final lane mirrors TerrainPrim's integer material metadata.
 public struct Prim {
     public float4 normal;
     public float4 tint;
-    public float4 mat;
+    public uint materialId;
+    public uint flags;
+    public uint aux0;
+    public uint aux1;
 };
 
 // Terrain per-triangle record (48 B). The final 16-byte lane contains integer geometry-local metadata;
@@ -118,6 +128,7 @@ public static const uint MATERIAL_FEATURE_SPEC = 1u;
 public static const uint MATERIAL_FEATURE_NORMAL = 2u;
 public static const uint MATERIAL_FEATURE_HEURISTIC_EMISSION = 4u;
 public static const uint MATERIAL_FEATURE_OVERRIDE_EMISSION = 8u;
+public static const uint MATERIAL_FEATURE_STOCHASTIC_ALPHA = 16u;
 public static const uint MATERIAL_EMISSION_STRENGTH_SHIFT = 8u;
 public static const uint MATERIAL_EMISSION_STRENGTH_MASK = 255u;
 public static const float MATERIAL_MAX_OVERRIDE_EMISSION_STRENGTH = 4.0;

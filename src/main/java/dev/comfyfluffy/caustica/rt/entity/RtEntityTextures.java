@@ -95,9 +95,9 @@ public final class RtEntityTextures {
     }
 
     /** Canonical material ID for a full entity texture, or the neutral runtime-texture fallback. */
-    public int materialIdFor(RenderType renderType) {
-        if (!entityPbr()) return RtTerrainMaterials.INSTANCE.entityFallbackId();
-        return RtTerrainMaterials.INSTANCE.resolveEntityTexture(textureLocation(renderType));
+    public int materialIdFor(RenderType renderType, boolean stochasticAlpha) {
+        if (!entityPbr()) return RtTerrainMaterials.INSTANCE.entityFallbackId(stochasticAlpha);
+        return RtTerrainMaterials.INSTANCE.resolveEntityTexture(textureLocation(renderType), stochasticAlpha);
     }
 
     /**

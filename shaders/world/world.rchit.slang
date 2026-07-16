@@ -17,16 +17,12 @@ import world_common;
 [[vk::binding(2, 1)]] Sampler2D materialNormalAoTex[];
 [[vk::binding(3, 1)]] Sampler2D materialSurface1Tex[];
 
-static const uint MATERIAL_OPAQUE = 0u;
-static const uint MATERIAL_WATER = 1u;
-static const uint MATERIAL_PARTICLE = 2u;
-static const uint MATERIAL_GLASS = 3u;
-
 void payloadSetPacked(inout Payload payload, uint material, float roughness, float metalness,
-        float emission, float sss, uint emissionSource) {
+        float emission, float sss, float ior, float transmission, uint emissionSource) {
     payload.flags = material | (emissionSource << PAYLOAD_EMISSION_SOURCE_SHIFT);
     payload.roughMetal = packHalf2(float2(roughness, metalness));
     payload.emissionSss = packHalf2(float2(emission, sss));
+    payload.iorTransmission = packHalf2(float2(ior, transmission));
 }
 
 uint materialEmissionSource(MaterialHeader header, float emission) {
@@ -253,7 +249,8 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             payload.motionPrev = g.rigidDisp.xyz;
         }
         payload.f0 = float3(0.0, 0.0, 0.0);
-        payloadSetPacked(payload, MATERIAL_PARTICLE, 1.0, 0.0, 0.0, 0.0, EMISSION_SOURCE_NONE);
+        payloadSetPacked(payload, MATERIAL_PARTICLE, 1.0, 0.0, 0.0, 0.0,
+                1.0, 0.0, EMISSION_SOURCE_NONE);
         return;
     }
     // Dynamic entities: instances with this custom-index flag bit carry real captured ModelPart
@@ -271,6 +268,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         // hemisphere — same fix as terrain).
         float3 vdir = -WorldRayDirection();
         float3 n = normalize(mul(entityO2w, pr.normal.xyz));
+        bool entering = dot(WorldRayDirection(), n) < 0.0;
         if (dot(n, vdir) < 0.0) {
             n = -n;
         }
@@ -289,12 +287,15 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 ep2 = mul(entityO2w, HitTriangleVertexPosition(2));
         float entityLod = rayConeTextureLod(rayCone, texSizePx(entityAlbedoTex[NonUniformResourceIndex(texSlot)]),
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2]);
-        float3 albedo = srgbToLinear(entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod).rgb) * pr.tint.rgb;
-        uint materialId = uint(pr.mat.z + 0.5);
-        MaterialHeader header = ConstPtr<MaterialHeader>(pcAddr.materialTableAddr)[materialId];
+        float4 entityTexel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod);
+        MaterialHeader header = ConstPtr<MaterialHeader>(pcAddr.materialTableAddr)[pr.materialId];
+        uint material = header.model;
+        float3 baseAlbedo = srgbToLinear(entityTexel.rgb) * pr.tint.rgb;
+        float3 albedo = material == MATERIAL_GLASS
+                ? lerp(float3(1.0, 1.0, 1.0), baseAlbedo, entityTexel.a) : baseAlbedo;
         Surface surface = evaluateMaterial(header, euvCoord, entityLod, albedo, n,
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
-                header.params.x, header.params.y, 0.0, true);
+                header.params.x, header.params.y, 0.0, material == MATERIAL_OPAQUE);
         n = surface.normal;
 
         payload.albedo = albedo * surface.ao;
@@ -310,8 +311,14 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             payload.motionPrev = g.rigidDisp.xyz;
         }
         payload.f0 = surface.f0;
-        payloadSetPacked(payload, MATERIAL_OPAQUE, surface.roughness, surface.metalness,
-                surface.emission, surface.sss, materialEmissionSource(header, surface.emission));
+        float emission = material == MATERIAL_OPAQUE ? surface.emission : 0.0;
+        float sss = material == MATERIAL_OPAQUE ? surface.sss : 0.0;
+        payloadSetPacked(payload, material, surface.roughness, surface.metalness,
+                emission, sss, header.params.z, header.params.w,
+                materialEmissionSource(header, emission));
+        if (material == MATERIAL_WATER && entering) {
+            payload.flags |= PAYLOAD_WATER_ENTERING;
+        }
         return;
     }
 
@@ -377,7 +384,8 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         payload.motionPrev = float3(0.0, 0.0, 0.0);
         payload.f0 = glassSurface.f0;
         payloadSetPacked(payload, MATERIAL_GLASS, glassSurface.roughness,
-                glassSurface.metalness, 0.0, 0.0, EMISSION_SOURCE_NONE);
+                glassSurface.metalness, 0.0, 0.0, materialHeader.params.z,
+                materialHeader.params.w, EMISSION_SOURCE_NONE);
         return;
     }
 
@@ -408,7 +416,8 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     payload.normal = n;
     payload.f0 = surface.f0;
     payloadSetPacked(payload, material, surface.roughness, surface.metalness,
-            surface.emission, surface.sss, materialEmissionSource(materialHeader, surface.emission));
+            surface.emission, surface.sss, materialHeader.params.z, materialHeader.params.w,
+            materialEmissionSource(materialHeader, surface.emission));
     if (material == MATERIAL_WATER && entering) {
         payload.flags |= PAYLOAD_WATER_ENTERING;
     }
