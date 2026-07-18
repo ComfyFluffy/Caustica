@@ -271,20 +271,23 @@ public final class RtAccel {
         // VK_GEOMETRY_OPAQUE_BIT. The fixed geometry indices are also SBT material indices: radiance rays
         // use closest-hit-only records for solid/translucent/water and an any-hit record for true cutout;
         // shadow rays use any-hit records for cutout/translucent/water.
-        // terrainSplit == false ⇒ the single-geometry path (entities / refit) keyed on triangleCount.
+        // Both split flags false ⇒ the legacy single-geometry path keyed on triangleCount.
         private final boolean terrainSplit;
         private final int[] terrainTris; // per-bucket triangle counts in TERRAIN_BUCKETS order (null if !terrainSplit)
+        private final boolean entitySplit;
+        private final int[] entityTris; // opaque/any-hit counts (null if !entitySplit)
         private final OpacityMicromap opacityMicromap; // optional, terrain cutout bucket only
 
         private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer externalBacking, long vertexAddr, long indexAddr,
                              int maxVertex, int triangleCount, boolean opaque, String label, boolean updatable, boolean update) {
             this(accel, scratch, externalBacking, vertexAddr, indexAddr, maxVertex, triangleCount, opaque, label,
-                    updatable, update, false, null, null);
+                    updatable, update, false, null, false, null, null);
         }
 
         private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer externalBacking, long vertexAddr, long indexAddr,
                              int maxVertex, int triangleCount, boolean opaque, String label, boolean updatable, boolean update,
-                             boolean terrainSplit, int[] terrainTris, OpacityMicromap opacityMicromap) {
+                             boolean terrainSplit, int[] terrainTris, boolean entitySplit, int[] entityTris,
+                             OpacityMicromap opacityMicromap) {
             this.accel = accel;
             this.scratch = scratch;
             this.externalBacking = externalBacking;
@@ -298,6 +301,8 @@ public final class RtAccel {
             this.update = update;
             this.terrainSplit = terrainSplit;
             this.terrainTris = terrainTris;
+            this.entitySplit = entitySplit;
+            this.entityTris = entityTris;
             this.opacityMicromap = opacityMicromap;
         }
 
@@ -309,7 +314,16 @@ public final class RtAccel {
                 total += t;
             }
             return new PreparedBlas(accel, scratch, externalBacking, vertexAddr, indexAddr, maxVertex,
-                    total, false, label, false, false, true, terrainTris, opacityMicromap);
+                    total, false, label, false, false, true, terrainTris, false, null, opacityMicromap);
+        }
+
+        static PreparedBlas entity(RtAccel accel, RtBuffer scratch, RtBuffer externalBacking, long vertexAddr,
+                                   long indexAddr, int maxVertex, int[] entityTris, String label,
+                                   boolean updatable, boolean update) {
+            int total = 0;
+            for (int t : entityTris) total += t;
+            return new PreparedBlas(accel, scratch, externalBacking, vertexAddr, indexAddr, maxVertex,
+                    total, false, label, updatable, update, false, null, true, entityTris, null);
         }
 
         private void freeTransientBuildResources() {
@@ -326,6 +340,10 @@ public final class RtAccel {
     public static final int BUCKET_TRANSLUCENT = 2;
     public static final int BUCKET_WATER = 3;
     public static final int TERRAIN_BUCKETS = 4;
+    /** Entity BLAS geometries: opaque bypasses any-hit; everything else shares one any-hit geometry. */
+    public static final int ENTITY_BUCKET_OPAQUE = 0;
+    public static final int ENTITY_BUCKET_ANY_HIT = 1;
+    public static final int ENTITY_BUCKETS = 2;
     public static final int SBT_RAY_RADIANCE = 0;
     public static final int SBT_RAY_SHADOW = 1;
     public static final int SBT_TERRAIN_RADIANCE_OFFSET = SBT_RAY_RADIANCE * TERRAIN_BUCKETS;
@@ -548,11 +566,35 @@ public final class RtAccel {
         }
     }
 
+    /** Multi-geometry entity BLAS: packed indices are ordered opaque, then any-hit. */
+    public static PreparedBlas prepareEntityBlas(RtContext ctx, long vertexAddr, int vertexCount,
+                                                 long indexAddr, int[] bucketTris, String label) {
+        requireEntityBuckets(bucketTris);
+        VkDevice vk = ctx.vk();
+        String debugLabel = labelOr(label, "entity BLAS");
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryEntityBlasSizes(vk, stack, vertexAddr,
+                    indexAddr, vertexCount, bucketTris, false);
+            RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(),
+                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false, debugLabel + " backing");
+            RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
+            RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), false, debugLabel);
+            return PreparedBlas.entity(accel, scratch, backing, vertexAddr, indexAddr, vertexCount - 1,
+                    bucketTris.clone(), debugLabel, false, false);
+        }
+    }
+
     /** Prepare a non-updatable persistent BLAS over packed caller-owned geometry. */
     public static PersistentBuild preparePersistentBlasBuild(RtContext ctx, long vertexAddr, int vertexCount,
                                                              long indexAddr, int indexCount, boolean opaque,
                                                              String label) {
         PreparedBlas op = prepareEntityBlas(ctx, vertexAddr, vertexCount, indexAddr, indexCount, opaque, label);
+        return new PersistentBuild(op, op.accel, op.externalBacking, op.scratch);
+    }
+
+    public static PersistentBuild preparePersistentEntityBlasBuild(RtContext ctx, long vertexAddr, int vertexCount,
+                                                                   long indexAddr, int[] bucketTris, String label) {
+        PreparedBlas op = prepareEntityBlas(ctx, vertexAddr, vertexCount, indexAddr, bucketTris, label);
         return new PersistentBuild(op, op.accel, op.externalBacking, op.scratch);
     }
 
@@ -588,6 +630,25 @@ public final class RtAccel {
         }
     }
 
+    public static UpdatableBuild prepareUpdatableEntityBlasBuild(RtContext ctx, long vertexAddr, int vertexCount,
+                                                                 long indexAddr, int[] bucketTris, String label) {
+        requireEntityBuckets(bucketTris);
+        VkDevice vk = ctx.vk();
+        String debugLabel = labelOr(label, "updatable entity BLAS");
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryEntityBlasSizes(vk, stack, vertexAddr,
+                    indexAddr, vertexCount, bucketTris, true);
+            long accelSize = sizes.accelerationStructureSize();
+            RtBuffer backing = ctx.createBuffer(accelSize,
+                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false, debugLabel + " backing");
+            RtBuffer scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), debugLabel + " build scratch");
+            RtAccel accel = createBlasOn(ctx, stack, backing, accelSize, false, debugLabel);
+            PreparedBlas op = PreparedBlas.entity(accel, scratch, backing, vertexAddr, indexAddr,
+                    vertexCount - 1, bucketTris.clone(), debugLabel, true, false);
+            return new UpdatableBuild(op, accel, backing, scratch, sizes.updateScratchSize());
+        }
+    }
+
     /**
      * Prepare an in-place refit (UPDATE) of an existing updatable BLAS with new vertex data of the SAME
      * topology. {@code scratch} (sized {@code updateScratchSize}) and the mesh buffers are caller-owned
@@ -599,6 +660,13 @@ public final class RtAccel {
         String debugLabel = labelOr(label, "BLAS refit");
         return new PreparedBlas(accel, scratch, null, vertexAddr, indexAddr, vertexCount - 1, indexCount / 3,
                 opaque, debugLabel, true, true);
+    }
+
+    public static PreparedBlas refitEntityUpdate(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr,
+                                                 int vertexCount, int[] bucketTris, String label) {
+        requireEntityBuckets(bucketTris);
+        return PreparedBlas.entity(accel, scratch, null, vertexAddr, indexAddr, vertexCount - 1,
+                bucketTris.clone(), labelOr(label, "entity BLAS refit"), true, true);
     }
 
     /** Reclaim a transient entity BLAS: destroy its AS handle, then its backing + scratch buffers. */
@@ -634,6 +702,15 @@ public final class RtAccel {
         vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                 build.get(0), stack.ints(indexCount / 3), sizes);
         return sizes;
+    }
+
+    private static void requireEntityBuckets(int[] bucketTris) {
+        if (bucketTris == null || bucketTris.length != ENTITY_BUCKETS) {
+            throw new IllegalArgumentException("Expected " + ENTITY_BUCKETS + " entity bucket counts");
+        }
+        for (int count : bucketTris) {
+            if (count < 0) throw new IllegalArgumentException("Negative entity triangle count");
+        }
     }
 
     private static int buildFlags(boolean allowUpdate) {
@@ -686,6 +763,50 @@ public final class RtAccel {
                 .maxVertex(vertexCount - 1).indexType(VK10.VK_INDEX_TYPE_UINT32);
         tri.vertexData().deviceAddress(vertexAddr);
         tri.indexData().deviceAddress(indexAddr);
+    }
+
+    /** Fixed entity geometry order; empty buckets remain present so GeometryIndex/SBT routing is stable. */
+    private static VkAccelerationStructureGeometryKHR.Buffer entityGeometries(MemoryStack stack, long vertexAddr,
+                                                                               long indexAddr, int vertexCount) {
+        VkAccelerationStructureGeometryKHR.Buffer geometries =
+                VkAccelerationStructureGeometryKHR.calloc(ENTITY_BUCKETS, stack);
+        for (int bucket = 0; bucket < ENTITY_BUCKETS; bucket++) {
+            fillTriangleGeometry(geometries.get(bucket), vertexAddr, indexAddr, vertexCount,
+                    bucket == ENTITY_BUCKET_OPAQUE);
+        }
+        return geometries;
+    }
+
+    private static VkAccelerationStructureBuildRangeInfoKHR.Buffer entityBuildRanges(MemoryStack stack,
+                                                                                      int[] bucketTris) {
+        VkAccelerationStructureBuildRangeInfoKHR.Buffer ranges =
+                VkAccelerationStructureBuildRangeInfoKHR.calloc(ENTITY_BUCKETS, stack);
+        int triangleBase = 0;
+        for (int bucket = 0; bucket < ENTITY_BUCKETS; bucket++) {
+            int count = bucketTris[bucket];
+            ranges.get(bucket).primitiveCount(count)
+                    .primitiveOffset(triangleBase * 3 * Integer.BYTES)
+                    .firstVertex(0).transformOffset(0);
+            triangleBase += count;
+        }
+        return ranges;
+    }
+
+    private static VkAccelerationStructureBuildSizesInfoKHR queryEntityBlasSizes(VkDevice vk, MemoryStack stack,
+                                                                                  long vertexAddr, long indexAddr,
+                                                                                  int vertexCount, int[] bucketTris,
+                                                                                  boolean allowUpdate) {
+        VkAccelerationStructureGeometryKHR.Buffer geometries = entityGeometries(stack, vertexAddr, indexAddr, vertexCount);
+        VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
+        build.get(0).sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                .flags(buildFlags(allowUpdate)).mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
+                .geometryCount(geometries.capacity()).pGeometries(geometries);
+        java.nio.IntBuffer maxPrims = stack.mallocInt(ENTITY_BUCKETS);
+        maxPrims.put(bucketTris).flip();
+        VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
+        vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                build.get(0), maxPrims, sizes);
+        return sizes;
     }
 
     private static VkMicromapUsageEXT.Buffer micromapUsage(MemoryStack stack, int triangleCount, int subdivisionLevel) {
@@ -780,7 +901,8 @@ public final class RtAccel {
      * A TLAS instance: a 3x4 row-major transform, the device address of its BLAS, the 24-bit
      * {@code instanceCustomIndex} the hit shaders read, the 8-bit visibility {@code mask} (ANDed with the
      * trace cull mask), and the base SBT hit-record offset. Terrain uses offset 0 so geometry index selects
-     * the material bucket; entities use {@link #SBT_ENTITY_OFFSET} so their single geometry keeps any-hit.
+     * the material bucket. Entities use {@link #SBT_ENTITY_OFFSET}; their fixed geometry index then selects
+     * opaque or any-hit; the remaining two records in each four-record entity SBT block stay unused.
      */
     public record Instance(float[] transform3x4, long blasDeviceAddress, int customIndex, int mask, int sbtRecordOffset) {
         public Instance(float[] transform3x4, long blasDeviceAddress, int customIndex) {
@@ -1023,6 +1145,10 @@ public final class RtAccel {
             recordTerrainBlasBuild(ctx, cmd, stack, b);
             return;
         }
+        if (b.entitySplit) {
+            recordEntityBlasBuild(ctx, cmd, stack, b);
+            return;
+        }
         VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, b.vertexAddr, b.indexAddr, b.maxVertex + 1, b.opaque);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
@@ -1040,6 +1166,27 @@ public final class RtAccel {
         range.get(0).primitiveCount(b.triangleCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
         PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
         vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRange);
+    }
+
+    /** Record the fixed opaque/any-hit entity geometries as one BUILD or in-place UPDATE. */
+    private static void recordEntityBlasBuild(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack,
+                                              PreparedBlas b) {
+        VkAccelerationStructureGeometryKHR.Buffer geometries = entityGeometries(stack, b.vertexAddr,
+                b.indexAddr, b.maxVertex + 1);
+        VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
+        build.get(0).sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                .flags(buildFlags(b.updatable))
+                .mode(b.update ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR
+                        : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
+                .geometryCount(geometries.capacity()).pGeometries(geometries)
+                .dstAccelerationStructure(b.accel.handle);
+        if (b.update) {
+            build.get(0).srcAccelerationStructure(b.accel.handle);
+        }
+        build.get(0).scratchData().deviceAddress(scratchAddress(ctx, b.scratch));
+        VkAccelerationStructureBuildRangeInfoKHR.Buffer ranges = entityBuildRanges(stack, b.entityTris);
+        PointerBuffer ppRanges = stack.mallocPointer(1).put(0, ranges.address());
+        vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRanges);
     }
 
     /** Record a terrain section's two-geometry (opaque + alpha) BUILD. Always a fresh BUILD — terrain

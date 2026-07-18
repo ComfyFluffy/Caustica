@@ -5,7 +5,8 @@
 //  * entity (ENTITY_BIT): InstanceID() (low bits) indexes the entity geometry table → interpolate the
 //    entity UV, sample the per-prim bindless entity texture, discard transparent texels (so entity
 //    cutout — hat/jacket overlays, eyes, capes, … — is see-through). Accepted hits fall through to the
-//    closest-hit. Entity geometry is built non-opaque so this runs for it.
+//    closest-hit. Opaque entity geometry bypasses this shader; every alpha/transmissive material shares
+//    one non-opaque geometry and routes here through its SBT record.
 //
 // NOTE on the payload: this module declares the SHADOW payload (float4 shadowVis). Radiance rays carry
 // the big Payload struct but only reach the cutout paths here, which never touch the payload — the
@@ -55,6 +56,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     uint instanceKind = InstanceID() & (ENTITY_BIT | PARTICLE_BIT);
     if (instanceKind != 0u) {
         EntityGeom g = ConstPtr<EntityGeom>(pc.entityTableAddr)[InstanceID() & IDX_MASK];
+        pid += g.triBase[GeometryIndex()];
         ConstPtr<uint> indices = ConstPtr<uint>(g.idxAddr);
         ConstPtr<float2> uvs = ConstPtr<float2>(g.uvAddr);
         uint i0 = indices[3u * pid + 0u];

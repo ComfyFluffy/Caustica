@@ -339,7 +339,8 @@ public final class RtPipeline {
             }
             return bucket != RtAccel.BUCKET_SOLID;
         }
-        return true;
+        int entityBucket = (relativeHitGroup - RtAccel.SBT_ENTITY_OFFSET) % RtAccel.TERRAIN_BUCKETS;
+        return entityBucket == RtAccel.ENTITY_BUCKET_ANY_HIT;
     }
 
     /**

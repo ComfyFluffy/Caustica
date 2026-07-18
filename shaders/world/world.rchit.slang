@@ -217,12 +217,13 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     if ((InstanceID() & PARTICLE_BIT) != 0u) {
         uint idx = InstanceID() & IDX_MASK;
         EntityGeom g = ConstPtr<EntityGeom>(pc.entityTableAddr)[idx];
-        Prim pr = ConstPtr<Prim>(g.primAddr)[PrimitiveIndex()];
+        uint pid = PrimitiveIndex() + g.triBase[GeometryIndex()];
+        Prim pr = ConstPtr<Prim>(g.primAddr)[pid];
         ConstPtr<uint> ib = ConstPtr<uint>(g.idxAddr);
         ConstPtr<float2> uvb = ConstPtr<float2>(g.uvAddr);
-        uint p0 = ib[3u * PrimitiveIndex() + 0u];
-        uint p1 = ib[3u * PrimitiveIndex() + 1u];
-        uint p2 = ib[3u * PrimitiveIndex() + 2u];
+        uint p0 = ib[3u * pid + 0u];
+        uint p1 = ib[3u * pid + 1u];
+        uint p2 = ib[3u * pid + 2u];
         float3 pbary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
         float2 puv = pbary.x * uvb[p0] + pbary.y * uvb[p1] + pbary.z * uvb[p2];
         int pslot = int(pr.tint.w + 0.5);
@@ -258,7 +259,8 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     if ((InstanceID() & ENTITY_BIT) != 0u) {
         uint eidx = InstanceID() & ~ENTITY_BIT;
         EntityGeom g = ConstPtr<EntityGeom>(pc.entityTableAddr)[eidx];
-        Prim pr = ConstPtr<Prim>(g.primAddr)[PrimitiveIndex()];
+        uint pid = PrimitiveIndex() + g.triBase[GeometryIndex()];
+        Prim pr = ConstPtr<Prim>(g.primAddr)[pid];
         // Rigid-reuse instances (still / spinning entities re-referencing a cached BLAS) carry a real
         // rotation in the instance transform; per-frame-built entities are identity. The cached prim
         // normal (and the TBN source positions below) are object-space — rotate them into world space.
@@ -276,9 +278,9 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         // per-type texture; tint.rgb is the model colour multiplier (white for most, tinted for sheep/…).
         ConstPtr<uint> eidxBuf = ConstPtr<uint>(g.idxAddr);
         ConstPtr<float2> euv = ConstPtr<float2>(g.uvAddr);
-        uint e0 = eidxBuf[3u * PrimitiveIndex() + 0u];
-        uint e1 = eidxBuf[3u * PrimitiveIndex() + 1u];
-        uint e2 = eidxBuf[3u * PrimitiveIndex() + 2u];
+        uint e0 = eidxBuf[3u * pid + 0u];
+        uint e1 = eidxBuf[3u * pid + 1u];
+        uint e2 = eidxBuf[3u * pid + 2u];
         float3 ebary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
         float2 euvCoord = ebary.x * euv[e0] + ebary.y * euv[e1] + ebary.z * euv[e2];
         int texSlot = int(pr.tint.w + 0.5);

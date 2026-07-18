@@ -10,6 +10,7 @@ import dev.comfyfluffy.caustica.mixin.ModelPartAccessor;
 import dev.comfyfluffy.caustica.mixin.RenderSetupAccessor;
 import dev.comfyfluffy.caustica.mixin.RenderTypeAccessor;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
+import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import net.fabricmc.fabric.api.client.renderer.v1.Renderer;
 import net.fabricmc.fabric.api.client.renderer.v1.mesh.Mesh;
 import net.fabricmc.fabric.api.client.renderer.v1.mesh.MeshView;
@@ -156,6 +157,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         }
         long materialStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
         boolean stochasticAlpha = isTranslucent(renderType);
+        capture.currentAlphaBucket = alphaBucket(renderType);
         // Resolve this submission's texture to a bindless slot; the capture stamps it on every prim.
         // Block-entity models (chests/signs/beds) texture from an atlas SPRITE: use that atlas + remap
         // the ModelPart 0..1 UVs into the sprite's region. Mobs use a full texture (sprite == null).
@@ -309,6 +311,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // instead of the opaque DEFAULT variant. No BlockState reaches submitItem, so the layer is the
         // authoritative semantic available here; glass-model roughness/IOR are profile-independent.
         boolean transmissive = q.materialInfo().layer() == ChunkSectionLayer.TRANSLUCENT;
+        capture.currentAlphaBucket = alphaBucket(q.materialInfo().layer(), false);
         setSpriteMaterial(sprite, transmissive ? RtMaterials.Profile.GLASS : RtMaterials.Profile.DEFAULT,
                 transmissive, false);
         capture.currentOrder = 0; // baked-quad paths never stack decal layers
@@ -346,6 +349,34 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         RenderPipeline pipeline = ((RenderSetupAccessor) setup).caustica$pipeline();
         ColorTargetState cts = pipeline.getColorTargetState();
         return cts != null && cts.blendFunction().isPresent();
+    }
+
+    /** Classify one vanilla submission for the entity BLAS geometry split. */
+    private static int alphaBucket(RenderType renderType) {
+        if (renderType == null) {
+            return RtAccel.ENTITY_BUCKET_ANY_HIT;
+        }
+        Object setup = ((RenderTypeAccessor) renderType).caustica$state();
+        RenderPipeline pipeline = ((RenderSetupAccessor) setup).caustica$pipeline();
+        ColorTargetState cts = pipeline.getColorTargetState();
+        if (cts != null && cts.blendFunction().isPresent()) {
+            return RtAccel.ENTITY_BUCKET_ANY_HIT;
+        }
+        // Vanilla's cutout pipelines carry the exact ALPHA_CUTOUT shader define. This is more robust
+        // than matching pipeline names and also works for mod-provided RenderPipelines.
+        if (pipeline.getShaderDefines().values().containsKey("ALPHA_CUTOUT")
+                || pipeline.getShaderDefines().flags().contains("ALPHA_CUTOUT")) {
+            return RtAccel.ENTITY_BUCKET_ANY_HIT;
+        }
+        return RtAccel.ENTITY_BUCKET_OPAQUE;
+    }
+
+    private static int alphaBucket(ChunkSectionLayer layer, boolean stochasticAlpha) {
+        if (stochasticAlpha || layer == ChunkSectionLayer.TRANSLUCENT) {
+            return RtAccel.ENTITY_BUCKET_ANY_HIT;
+        }
+        return layer == ChunkSectionLayer.SOLID
+                ? RtAccel.ENTITY_BUCKET_OPAQUE : RtAccel.ENTITY_BUCKET_ANY_HIT;
     }
 
     /** Read the draw topology so custom triangle effects are never mis-grouped as RT quads. */
@@ -447,6 +478,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         public void acceptRenderable(TextRenderable renderable) {
             RenderType renderType = renderable.renderType(displayMode);
             boolean stochasticAlpha = isTranslucent(renderType);
+            capture.currentAlphaBucket = alphaBucket(renderType);
             capture.currentTexSlot = RtEntityTextures.INSTANCE.slotFor(renderType);
             capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
             capture.currentOrder = 0;
@@ -539,6 +571,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         capture.currentOrder = 0;
         capture.currentTexSlot = RtEntityTextures.INSTANCE.whiteSlot();
         capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(false);
+        capture.currentAlphaBucket = RtAccel.ENTITY_BUCKET_OPAQUE;
         Matrix4f pose = poseStack.last().pose();
         // Same derivation as LeashFeatureRenderer.prepare: the ribbon's horizontal half-extent is the
         // curve's ground-plane perpendicular, and the attachment offset shifts the whole curve in the
@@ -748,6 +781,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         boolean transmissive = quad.chunkLayer() == ChunkSectionLayer.TRANSLUCENT;
         boolean stochasticAlpha = itemMesh && !transmissive && quad.itemRenderType() != null
                 && quad.itemRenderType().hasBlending();
+        capture.currentAlphaBucket = alphaBucket(quad.chunkLayer(), stochasticAlpha);
         if (state != null) {
             setBlockSpriteMaterial(sprite, state, transmissive, stochasticAlpha);
         } else {
@@ -833,6 +867,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         capture.currentMaterialId = lines
                 ? RtMaterialRegistry.INSTANCE.entityFallbackId(false)
                 : RtEntityTextures.INSTANCE.materialIdFor(renderType, stochasticAlpha);
+        capture.currentAlphaBucket = lines ? RtAccel.ENTITY_BUCKET_OPAQUE : alphaBucket(renderType);
 
         if (lines) {
             lineVertexConsumer.begin();
