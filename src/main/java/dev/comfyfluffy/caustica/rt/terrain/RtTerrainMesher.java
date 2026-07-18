@@ -103,14 +103,37 @@ final class RtTerrainMesher {
         if (mesh.isEmpty()) {
             return new CpuSection(null, null);
         }
+        // ReSTIR DI light collection — BEFORE packing: it also stamps NEE membership into the prim
+        // records, which packSection then copies out. Only opaque + cutout can emit (glass is shaded
+        // emission-free, water never emits; lava lives in the opaque bucket).
+        float[] lights = EMPTY_LIGHTS;
+        if (CausticaConfig.Rt.Lights.RIS_CANDIDATES.value() > 0) {
+            FloatArrayList collected = new FloatArrayList();
+            float minFill = CausticaConfig.Rt.Lights.MIN_FILL_RATIO.value();
+            collectLights(collected, mesh.opaque, materials, minFill);
+            collectLights(collected, mesh.cutout, materials, minFill);
+            if (!collected.isEmpty()) {
+                lights = collected.toFloatArray();
+            }
+        }
         Geom cutout = mesh.cutoutOrEmpty();
         RtAccel.OpacityMicromapInput ommInput =
                 RtTerrainOmm.buildInput(cutout.triCount(), cutout.cornerUv.elements(),
                         cutout.ommSprites.elements(), cutout.ommSprites.size());
-        return new CpuSection(packSection(mesh), ommInput);
+        return new CpuSection(packSection(mesh, lights), ommInput);
     }
 
-    private static PackedSection packSection(SectionMesh mesh) {
+    private static final float[] EMPTY_LIGHTS = new float[0];
+
+    private static void collectLights(FloatArrayList out, Geom geom,
+                                      RtMaterialRegistry.Snapshot materials, float minFillRatio) {
+        if (geom != null && !geom.idx.isEmpty()) {
+            RtLightCollector.collectBucket(out, geom.verts, geom.prim, geom.cornerUv,
+                    geom.ommSprites.elements(), materials, minFillRatio);
+        }
+    }
+
+    private static PackedSection packSection(SectionMesh mesh, float[] lights) {
         Geom[] buckets = mesh.buckets(); // { solid, cutout, translucent, water }, indexed by RtAccel.BUCKET_*
         int vertFloats = 0, idxCount = 0, uvFloats = 0, primFloats = 0, triCount = 0;
         int[] bucketTris = new int[buckets.length];
@@ -155,7 +178,7 @@ final class RtTerrainMesher {
             vertBase += vertSize / 3;
             triAcc += bucketTris[b];
         }
-        return new PackedSection(positions, indices, uvs, material, bucketTris, triBase);
+        return new PackedSection(positions, indices, uvs, material, bucketTris, triBase, lights);
     }
 
     private static void tessellate(BlockAndTintGetter region, BlockStateModelSet modelSet,
@@ -213,9 +236,10 @@ final class RtTerrainMesher {
     record CpuSection(PackedSection packed, RtAccel.OpacityMicromapInput opacityMicromap) {
     }
 
-    /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays. */
+    /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays.
+     *  {@code lights} = packed section-local ReSTIR light records (possibly empty), CPU-side only. */
     record PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
-                         int[] bucketTris, int[] triBase) {
+                         int[] bucketTris, int[] triBase, float[] lights) {
     }
 
 

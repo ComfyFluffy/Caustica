@@ -52,7 +52,26 @@ public struct WorldPush {
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
+    public uint64_t lightBufAddr;     // ReSTIR DI global light buffer (0 = none published)
+    public uint     lightCount;       // packed Light records in lightBufAddr
+    public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
 };
+
+// ReSTIR DI area light: one emissive terrain quad's footprint bounding RECTANGLE (RtLightCollector).
+// Positions/axes are in rebased world space. le is the rectangle-mean HDR radiance (albedo x mask x
+// EMISSIVE_STRENGTH, tinted). The packed half2 lanes carry the sprite-local UV frame of the rectangle
+// ((s,t) in [-1,1]^2 -> uvCenter + s*uvHalfU + t*uvHalfV) for the S3 exact-Le fetch; matId enables the
+// same. Layout mirrors RtLightCollector.append (20 floats / 80 B).
+public struct Light {
+    public float4 posArea;   // xyz rectangle center, w rectangle area
+    public float4 normalMat; // xyz outward normal, w materialId uint bits
+    public float4 halfU;     // xyz world half-axis U, w packHalf2(uvHalfU)
+    public float4 halfV;     // xyz world half-axis V, w packHalf2(uvHalfV)
+    public float4 le;        // rgb mean radiance, w packHalf2(uvCenter)
+};
+
+// TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).
+public static const uint TERRAIN_PRIM_IN_LIGHT_BUFFER = 1u;
 
 // Radiance-ray payload (location 0). Member order and types are a cross-stage ABI.
 public struct Payload {
@@ -69,6 +88,9 @@ public struct Payload {
 };
 
 public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
+// Set by world.rchit on a terrain hit whose prim carries TERRAIN_PRIM_IN_LIGHT_BUFFER: this emitter is
+// RIS-sampled, so raygen gates its direct-hit emission on diffuse continuation rays (no double count).
+public static const uint PAYLOAD_EMITTER_IN_LIST = 128u;
 // Set by world.rchit on a MATERIAL_WATER hit: true when the incoming ray travels against the prim's
 // outward face normal (entering the water volume), false when it exits (water -> air). Bit 2
 // (PAYLOAD_SHOW_CELESTIAL) is only meaningful on a miss and this bit only on a hit, so they never need

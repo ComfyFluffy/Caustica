@@ -564,6 +564,21 @@ public final class CausticaConfig {
             }
         }
 
+        /** ReSTIR DI block-emitter lights (RESTIR_PLAN.md). {@code ris-candidates = 0} disables everything. */
+        public static final class Lights {
+            public static final IntSetting RIS_CANDIDATES =
+                    intAtLeast("caustica.rt.risCandidates", "lights.ris-candidates", 8, 0);
+            public static final FloatSetting MIN_FILL_RATIO =
+                    finiteFloat("caustica.rt.lightMinFillRatio", "lights.min-fill-ratio", 0.25f);
+            public static final BooleanSetting STATS = bool("caustica.rt.lightStats", "lights.stats", false);
+            public static final BooleanSetting DUMP = bool("caustica.rt.lightDump", "lights.dump", false);
+            public static final IntSetting DUMP_RADIUS =
+                    intAtLeast("caustica.rt.lightDumpRadius", "lights.dump-radius", 12, 1);
+
+            private Lights() {
+            }
+        }
+
         public static final class Omm {
             public static final BooleanSetting ENABLED = bool("caustica.rt.omm", "omm.enabled", true);
             public static final IntSetting SUBDIVISION =

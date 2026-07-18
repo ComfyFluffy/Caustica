@@ -5,6 +5,7 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import com.mojang.blaze3d.vertex.QuadInstance;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.comfyfluffy.caustica.CausticaConfig;
+import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
@@ -48,6 +49,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.vulkan.VK10;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -173,6 +175,12 @@ public final class RtTerrain {
     public int blockX;
     public int blockY;
     public int blockZ;
+    // ReSTIR DI global light buffer: the published sections' collected lights flattened into rebased
+    // world space (RESTIR_PLAN.md S0). Rebuilt only when the published set or the rebase origin changes,
+    // in the same publish step as the instance list — a light must never reference a section that is not
+    // in this frame's TLAS (its shadow ray would find no occluder: a ghost emitter).
+    private RtBuffer lightBuffer;
+    private int lightCount;
     private boolean windowValid;
     private int windowPcx;
     private int windowPcz;
@@ -221,6 +229,16 @@ public final class RtTerrain {
     /** Section table device address: {@code {u64 primAddr, u64 uvAddr, u32 triBase[4]}} per section, indexed by gl_InstanceCustomIndexEXT. */
     public long tableAddress() {
         return table.address();
+    }
+
+    /** ReSTIR DI global light buffer device address, or 0 while no lights are published. */
+    public long lightBufferAddress() {
+        return lightBuffer != null ? lightBuffer.deviceAddress : 0L;
+    }
+
+    /** Number of packed {@link RtLightCollector#FLOATS_PER_LIGHT}-float records in the light buffer. */
+    public int lightCount() {
+        return lightBuffer != null ? lightCount : 0;
     }
 
     /** Per-tick residency update: window sync + dirty drain (plus the streaming fallback, see {@link #frame}). */
@@ -1399,7 +1417,7 @@ public final class RtTerrain {
 
         for (PreparedSection ps : prepared) {
             SectionGeom g = new SectionGeom(ps.key(), ps.uvs(), ps.material(),
-                    ps.blas().accel, ps.triBase(), ps.sx(), ps.sy(), ps.sz());
+                    ps.blas().accel, ps.triBase(), ps.sx(), ps.sy(), ps.sz(), ps.lights());
             if (!desired.contains(ps.key())) {
                 // Left the window while its batched BLAS build was in flight (window sync keeps running
                 // during builds). Never published — retire the fresh, unreferenced geometry.
@@ -1456,6 +1474,7 @@ public final class RtTerrain {
             // Zero resident sections (e.g. every section just evicted on a respawn) is a transient
             // streaming state, not "no world" — keep tracing (sky/entities only) instead of handing the
             // frame back to vanilla; see ensureEmptyTableReady.
+            retireLightBuffer(ctx, lastGraphicsUse);
             ensureEmptyTableReady(ctx);
             return;
         }
@@ -1471,7 +1490,118 @@ public final class RtTerrain {
             blockZ = rbz;
         }
         table.instances = table.instanceList;
+        if (!prepared.isEmpty() || !removed.isEmpty() || rebase) {
+            rebuildLightBuffer(ctx, lastGraphicsUse);
+        }
         ready = true;
+    }
+
+    /** Detach + retire the current light buffer after the last graphics submission using it. */
+    private void retireLightBuffer(RtContext ctx, long lastGraphicsUse) {
+        if (lightBuffer != null) {
+            RtBuffer old = lightBuffer;
+            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
+            lightBuffer = null;
+        }
+        lightCount = 0;
+    }
+
+    /**
+     * Flatten the published sections' section-local light records into one host-visible global buffer in
+     * rebased world space (position lanes get {@code sectionOrigin − rebaseOrigin}; directions, half-axes
+     * and Le copy through). Runs inside the same publish step that made {@code table.instances} current.
+     */
+    private void rebuildLightBuffer(RtContext ctx, long lastGraphicsUse) {
+        int stride = RtLightCollector.FLOATS_PER_LIGHT;
+        int totalFloats = 0;
+        int litSections = 0;
+        for (int i = 0, n = table.instanceList.size(); i < n; i++) {
+            float[] lights = table.slots.get(table.instanceList.get(i).customIndex()).lights;
+            if (lights != null && lights.length > 0) {
+                totalFloats += lights.length;
+                litSections++;
+            }
+        }
+        retireLightBuffer(ctx, lastGraphicsUse);
+        if (totalFloats == 0) {
+            return;
+        }
+        RtBuffer next = ctx.createBuffer((long) totalFloats * Float.BYTES,
+                VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "terrain lights");
+        long cursor = next.mapped;
+        for (int i = 0, n = table.instanceList.size(); i < n; i++) {
+            SectionGeom g = table.slots.get(table.instanceList.get(i).customIndex());
+            float[] lights = g.lights;
+            if (lights == null || lights.length == 0) {
+                continue;
+            }
+            float ox = g.sx - blockX;
+            float oy = g.sy - blockY;
+            float oz = g.sz - blockZ;
+            for (int base = 0; base < lights.length; base += stride) {
+                MemoryUtil.memPutFloat(cursor, lights[base] + ox);
+                MemoryUtil.memPutFloat(cursor + 4, lights[base + 1] + oy);
+                MemoryUtil.memPutFloat(cursor + 8, lights[base + 2] + oz);
+                for (int lane = 3; lane < stride; lane++) {
+                    MemoryUtil.memPutFloat(cursor + 4L * lane, lights[base + lane]);
+                }
+                cursor += 4L * stride;
+            }
+        }
+        next.flush();
+        lightBuffer = next;
+        lightCount = totalFloats / stride;
+        if (CausticaConfig.Rt.Lights.STATS.value()) {
+            CausticaMod.LOGGER.info("RT lights: {} lights across {} sections ({} published), {} KiB",
+                    lightCount, litSections, table.instanceList.size(),
+                    (long) totalFloats * Float.BYTES / 1024);
+        }
+        if (CausticaConfig.Rt.Lights.DUMP.value()) {
+            dumpNearbyLights();
+        }
+    }
+
+    /** Log every published light within {@code lights.dump-radius} blocks of the camera. */
+    private void dumpNearbyLights() {
+        var player = Minecraft.getInstance().player;
+        if (player == null || lightBuffer == null) {
+            return;
+        }
+        int stride = RtLightCollector.FLOATS_PER_LIGHT;
+        double px = player.getX() - blockX;
+        double py = player.getY() - blockY;
+        double pz = player.getZ() - blockZ;
+        double radius = CausticaConfig.Rt.Lights.DUMP_RADIUS.value();
+        double radiusSq = radius * radius;
+        long base = lightBuffer.mapped;
+        int dumped = 0;
+        for (int i = 0; i < lightCount; i++) {
+            long rec = base + (long) i * stride * Float.BYTES;
+            float x = MemoryUtil.memGetFloat(rec);
+            float y = MemoryUtil.memGetFloat(rec + 4);
+            float z = MemoryUtil.memGetFloat(rec + 8);
+            double dx = x - px, dy = y - py, dz = z - pz;
+            if (dx * dx + dy * dy + dz * dz > radiusSq) {
+                continue;
+            }
+            float area = MemoryUtil.memGetFloat(rec + 12);
+            float leR = MemoryUtil.memGetFloat(rec + 64);
+            float leG = MemoryUtil.memGetFloat(rec + 68);
+            float leB = MemoryUtil.memGetFloat(rec + 72);
+            CausticaMod.LOGGER.info(
+                    "RT light[{}] world=({}, {}, {}) size={} area={} Le=({}, {}, {}) lum={}",
+                    i, String.format(java.util.Locale.ROOT, "%.2f", x + blockX),
+                    String.format(java.util.Locale.ROOT, "%.2f", y + blockY),
+                    String.format(java.util.Locale.ROOT, "%.2f", z + blockZ),
+                    String.format(java.util.Locale.ROOT, "%.3f", Math.sqrt(area)),
+                    String.format(java.util.Locale.ROOT, "%.4f", area),
+                    String.format(java.util.Locale.ROOT, "%.3f", leR),
+                    String.format(java.util.Locale.ROOT, "%.3f", leG),
+                    String.format(java.util.Locale.ROOT, "%.3f", leB),
+                    String.format(java.util.Locale.ROOT, "%.3f", 0.2126f * leR + 0.7152f * leG + 0.0722f * leB));
+            dumped++;
+        }
+        CausticaMod.LOGGER.info("RT light dump: {} lights within {} blocks", dumped, (int) radius);
     }
 
     /** Keep a valid zero-instance table through transient empty-residency windows. */
@@ -1547,6 +1677,11 @@ public final class RtTerrain {
         reextract.clear();
         queuedReextract.clear();
         windowValid = false;
+        if (lightBuffer != null) { // device idle at this point (see waitIdle above): destroy directly
+            lightBuffer.destroy();
+            lightBuffer = null;
+        }
+        lightCount = 0;
         if (resident.isEmpty() && table.buffer == null && removed.isEmpty() && prepared.isEmpty()) {
             empty.clear();
             table.instances = null;
@@ -1654,6 +1789,7 @@ public final class RtTerrain {
         if (oldGeneration != null) {
             retireGeneration(ctx, lastGraphicsUse, oldGeneration);
         }
+        retireLightBuffer(ctx, lastGraphicsUse);
         if (!oldGeometry.isEmpty()) {
             ArrayList<SectionGeom> retirement = new ArrayList<>(oldGeometry);
             ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse,

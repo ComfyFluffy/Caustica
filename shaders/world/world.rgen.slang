@@ -67,6 +67,7 @@ uint payloadEmissionSource() {
 // Set by world.rchit only on a MATERIAL_WATER hit (see PAYLOAD_WATER_ENTERING) — whether the ray was
 // travelling into the water volume (vs. out of it) at this hit's face.
 bool payloadWaterEntering() { return (payload.flags & PAYLOAD_WATER_ENTERING) != 0u; }
+bool payloadEmitterInList() { return (payload.flags & PAYLOAD_EMITTER_IN_LIST) != 0u; }
 float payloadRoughness() { return unpackHalf2(payload.roughMetal).x; }
 float payloadMetalness() { return unpackHalf2(payload.roughMetal).y; }
 float payloadEmission() { return unpackHalf2(payload.emissionSss).x; }
@@ -379,6 +380,129 @@ float3 sampleGGXVNDF(float3 n, float3 ve, float rough, inout uint s) {
     return normalize(Ne.x * t + Ne.y * b + Ne.z * n);                 // -> world space
 }
 
+// ===== ReSTIR DI Stage 1: RIS emitter NEE (RESTIR_PLAN.md) ============================================
+// Block emitters (torches, glowstone, lava, ...) get explicit NEE: per diffuse vertex, stream M uniform
+// candidates from the global light buffer through a weighted reservoir keyed by the UNSHADOWED target
+// p-hat = luminance(f * Le * G * area), then spend ONE shadow ray on the survivor. Sun/moon NEE stays
+// separate and additive. Lights are footprint bounding RECTANGLES (RtLightCollector): sampling a point
+// uniformly over the rectangle has pdf 1/area, so `area` rides the contribution like any area light.
+
+// A reservoir in registers. pos/lnrm/le/area describe the chosen emitter sample; W is its unbiased
+// contribution weight, M the effective sample count. wSum/phat are streaming scratch (not persisted).
+struct Reservoir {
+    float3 pos;  // light sample point (rebased world space)
+    float3 lnrm; // emitter outward normal
+    float3 le;   // emitter radiance
+    float area;  // emitter rectangle area (the area-light pdf factor)
+    float M;
+    float W;
+    float wSum;
+    float phat;
+};
+
+Reservoir resEmpty() {
+    Reservoir r;
+    r.pos = float3(0.0, 0.0, 0.0);
+    r.lnrm = float3(0.0, 0.0, 0.0);
+    r.le = float3(0.0, 0.0, 0.0);
+    r.area = 0.0;
+    r.M = 0.0;
+    r.W = 0.0;
+    r.wSum = 0.0;
+    r.phat = 0.0;
+    return r;
+}
+
+// Unshadowed contribution f*Le*G*area of a fixed light sample point at surface (p,n,v); out p-hat = its
+// luminance (the resampling target). Same BRDF split the sun NEE uses.
+float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 p, float3 n, float3 v,
+                         float3 diffAlb, float3 F0, float rough, bool pbr, out float phat) {
+    phat = 0.0;
+    float3 toL = sp - p;
+    float dist2 = dot(toL, toL);
+    if (dist2 < 1.0e-6) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float dist = sqrt(dist2);
+    float3 wi = toL / dist;
+    float ndl = dot(n, wi);
+    if (ndl <= 0.0) {
+        return float3(0.0, 0.0, 0.0); // light below the surface horizon
+    }
+    float cosL = max(0.0, dot(lnrm, -wi));
+    if (cosL <= 0.0) {
+        return float3(0.0, 0.0, 0.0); // receiver behind the emitter face
+    }
+    float G = ndl * cosL / dist2; // area-light geometry term (x area)
+    float3 brdf = diffAlb * INV_PI;
+    if (pbr) {
+        float3 h = normalize(wi + v);
+        float ndh = max(0.0, dot(n, h));
+        float ndv = max(1.0e-4, dot(n, v));
+        float vdh = max(0.0, dot(v, h));
+        float D = ggxD(ndh, rough);
+        float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
+        float3 Fs = fresnelSchlick(vdh, F0);
+        brdf += (D * Gs) * Fs / (4.0 * ndv * ndl);
+    }
+    float3 contrib = brdf * le * (G * area);
+    phat = luminance(contrib);
+    return contrib;
+}
+
+// Initial RIS over M uniform candidates -> one resampled sample, no shadow ray yet. The chosen sample's
+// W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
+Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough, bool pbr,
+                     inout uint seed) {
+    Reservoir r = resEmpty();
+    for (uint c = 0u; c < worldPush.risCandidates; c++) {
+        r.M += 1.0;
+        uint li = min(uint(rndf(seed) * float(worldPush.lightCount)), worldPush.lightCount - 1u);
+        Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
+        // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
+        float s = rndf(seed) * 2.0 - 1.0;
+        float t = rndf(seed) * 2.0 - 1.0;
+        float3 sp = lg.posArea.xyz + s * lg.halfU.xyz + t * lg.halfV.xyz;
+        float phat;
+        evalSampleContrib(sp, lg.normalMat.xyz, lg.le.xyz, lg.posArea.w, p, n, v,
+                diffAlb, F0, rough, pbr, phat);
+        if (phat <= 0.0) {
+            continue;
+        }
+        float w = phat * float(worldPush.lightCount); // source pdf uniform 1/lightCount
+        r.wSum += w;
+        if (rndf(seed) * r.wSum < w) { // weighted reservoir update
+            r.pos = sp;
+            r.lnrm = lg.normalMat.xyz;
+            r.le = lg.le.xyz;
+            r.area = lg.posArea.w;
+            r.phat = phat;
+        }
+    }
+    r.W = r.phat > 0.0 ? (r.wSum / (r.M * r.phat)) : 0.0;
+    return r;
+}
+
+// Shade a finalized reservoir: recompute the survivor's contribution at (p,n,v), cast ONE shadow ray,
+// and return throughput-free radiance contrib*vis*W. `vis` is reported for S2's visibility reuse.
+float3 shadeReservoir(Reservoir s, float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough,
+                      bool pbr, out float3 vis) {
+    vis = float3(0.0, 0.0, 0.0);
+    if (s.W <= 0.0 || s.phat <= 0.0) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float phat;
+    float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, p, n, v, diffAlb, F0, rough, pbr, phat);
+    if (phat <= 0.0) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float3 toL = s.pos - p;
+    float dist = length(toL);
+    // Stop just short of the sample point so the ray doesn't self-occlude on the emitter's own face.
+    vis = visibility(p, toL / dist, dist * 0.999);
+    return contrib * vis * s.W;
+}
+
 // TLAS instance-mask bits (set on the Java side, ANDed against these per-ray cull masks):
 //   bit 0 (0x01) — secondary rays: shadows, GI bounces, reflections.
 //   bit 1 (0x02) — the primary camera ray.
@@ -544,6 +668,9 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
     int maxBounces = int(worldPush.maxBounces);
     int rrStart = maxBounces <= 3 ? 1 : 2;
     bool pbr = (worldPush.flags & 2u) != 0u; // GGX BRDF + material guides, else Lambertian fallback
+    // ReSTIR DI: RIS direct lighting from block emitters is active when lights are published and the
+    // candidate count is non-zero. Off => emitters are gathered only on path hits (legacy behaviour).
+    bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
     // Start submerged if the camera is in water so the first segment gets the right medium orientation
     // and absorption when the eye is underwater.
     bool inWater = (worldPush.flags & 1u) != 0u;
@@ -774,11 +901,15 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
         }
 
         // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly, colored by albedo.
-        // Block lights have no NEE, so emission is gathered by hitting emitters during the walk (counted
-        // at every vertex, no double counting). Small emitters are noisy, but temporal accumulation
-        // converges static views.
+        // ReSTIR DI: the direct-hit emission term is gated only for emitters RIS actually samples
+        // (payload emitter-in-list bit) — and then only off diffuse continuation rays (showCelestial
+        // false), which the previous vertex's RIS already accounted for; the primary ray and
+        // specular/dielectric bounces (showCelestial true) still add it, since no emitter NEE happened
+        // along those. Emitters NOT in the light buffer (sparse/sub-threshold footprints, entities) are
+        // never NEE-sampled, so they always gather — bit-identical to the no-NEE path, no energy lost.
         float emission = payloadEmission();
-        if (emission > 0.0) {
+        bool gateEmitter = risOn && payloadEmitterInList();
+        if (emission > 0.0 && (!gateEmitter || showCelestial)) {
             L += throughput * albedo * emission * EMISSIVE_STRENGTH;
         }
 
@@ -815,6 +946,15 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
                 }
                 L += throughput * brdf * worldPush.lightRadiance.xyz * ndl * vis;
             }
+        }
+
+        // ReSTIR DI: RIS direct lighting from block emitters. Disjoint from the sun NEE above, so the
+        // two sum. S1 = single-frame RIS: M candidates -> one reservoir survivor -> ONE shadow ray.
+        // (S2 adds temporal reservoir reuse at the primary vertex.)
+        if (risOn) {
+            Reservoir r = risInitial(p, n, v, diffAlb, F0, rough, pbr, seed);
+            float3 risVis;
+            L += throughput * shadeReservoir(r, p, n, v, diffAlb, F0, rough, pbr, risVis);
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the

@@ -859,7 +859,12 @@ public final class RtComposite {
                     waterAnchor,
                     mvCurProjView,
                     breaking.length,
-                    breaking
+                    breaking,
+                    // ReSTIR DI: published light buffer + RIS candidate count (0 = emitter NEE off; the
+                    // shader also requires lightCount > 0, so an empty buffer degrades to legacy gather).
+                    terrain.lightBufferAddress(),
+                    terrain.lightCount(),
+                    CausticaConfig.Rt.Lights.RIS_CANDIDATES.value()
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.
