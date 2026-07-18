@@ -185,11 +185,8 @@ public final class RtTerrain {
     private RtBuffer lightBuffer;
     /** Vose alias table for power-weighted O(1) light selection; published/retired with lightBuffer. */
     private RtBuffer lightAliasBuffer;
-    /** Dense section-coordinate lookup and packed per-cell candidate indices for ReGIR. */
-    private RtBuffer regirCellBuffer;
-    private RtBuffer regirCandidateBuffer;
-    private int regirOriginX, regirOriginY, regirOriginZ;
-    private int regirDimX, regirDimY, regirDimZ;
+    /** Coalesced asynchronous section-sized light proposal grid. */
+    private final RtReGIRManager regir = new RtReGIRManager();
     private int lightCount;
     private boolean windowValid;
     private int windowPcx;
@@ -252,35 +249,35 @@ public final class RtTerrain {
     }
 
     public long regirCellBufferAddress() {
-        return regirCellBuffer != null ? regirCellBuffer.deviceAddress : 0L;
+        return regir.published().cellAddress();
     }
 
     public long regirCandidateBufferAddress() {
-        return regirCandidateBuffer != null ? regirCandidateBuffer.deviceAddress : 0L;
+        return regir.published().candidateAddress();
     }
 
     public int regirOriginX() {
-        return regirOriginX;
+        return regir.published().originX();
     }
 
     public int regirOriginY() {
-        return regirOriginY;
+        return regir.published().originY();
     }
 
     public int regirOriginZ() {
-        return regirOriginZ;
+        return regir.published().originZ();
     }
 
     public int regirDimX() {
-        return regirDimX;
+        return regir.published().dimX();
     }
 
     public int regirDimY() {
-        return regirDimY;
+        return regir.published().dimY();
     }
 
     public int regirDimZ() {
-        return regirDimZ;
+        return regir.published().dimZ();
     }
 
     public int regirMaxCandidates() {
@@ -443,6 +440,7 @@ public final class RtTerrain {
         }
         if (reextract.isEmpty() && missing.isEmpty()
                 && completedBuilds.isEmpty()
+                && !regir.hasCompletions()
                 && removed.isEmpty() && prepared.isEmpty()) {
             return;
         }
@@ -463,6 +461,14 @@ public final class RtTerrain {
                 applyBuildChanges(ctx, prepared, removed, shouldRebase(pbx, pby, pbz), pbx, pby, pbz);
                 removed.clear();
                 prepared.clear();
+            }
+        }
+
+        // Publish an asynchronously prepared ReGIR only after this pass's terrain/light publication.
+        // If that changed the light generation, the completed result is discarded below as stale.
+        if (regir.hasCompletions()) {
+            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.regirPublish")) {
+                regir.publishReady(ctx);
             }
         }
 
@@ -1559,18 +1565,7 @@ public final class RtTerrain {
             ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
             lightAliasBuffer = null;
         }
-        if (regirCellBuffer != null) {
-            RtBuffer old = regirCellBuffer;
-            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
-            regirCellBuffer = null;
-        }
-        if (regirCandidateBuffer != null) {
-            RtBuffer old = regirCandidateBuffer;
-            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
-            regirCandidateBuffer = null;
-        }
-        regirOriginX = regirOriginY = regirOriginZ = 0;
-        regirDimX = regirDimY = regirDimZ = 0;
+        regir.invalidate(ctx, lastGraphicsUse);
         lightCount = 0;
     }
 
@@ -1642,22 +1637,14 @@ public final class RtTerrain {
             }
         }
 
+        long generation = regir.generation();
         LightAliasTable aliasTable = buildLightAliasTable(powers);
-        RtReGIR.Data regir = CausticaConfig.Rt.Lights.REGIR_ENABLED.value()
-                ? RtReGIR.build(regirSections, lightX, lightY, lightZ, powers, blockX, blockY, blockZ)
-                : null;
         long lightBytes = (long) totalLights * gpuStride * Float.BYTES;
         long aliasBytes = aliasTable != null ? (long) totalLights * 16L : 0L;
-        long cellBytes = regir != null ? regir.cellBytes() : 0L;
-        long candidateBytes = regir != null ? regir.candidateBytes() : 0L;
         long aliasOffset = lightBytes;
-        long cellOffset = aliasOffset + aliasBytes;
-        long candidateOffset = cellOffset + cellBytes;
-        long uploadBytes = candidateOffset + candidateBytes;
+        long uploadBytes = aliasOffset + aliasBytes;
         RtBuffer next = null;
         RtBuffer nextAlias = null;
-        RtBuffer nextCells = null;
-        RtBuffer nextCandidates = null;
         RtBuffer upload = null;
         try {
             int residentUsage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -1666,25 +1653,9 @@ public final class RtTerrain {
                 nextAlias = ctx.createAsyncBuffer(aliasBytes, residentUsage, false,
                         "terrain light aliases");
             }
-            if (regir != null) {
-                nextCells = ctx.createAsyncBuffer(cellBytes, residentUsage, false,
-                        "terrain ReGIR cells");
-                nextCandidates = ctx.createAsyncBuffer(candidateBytes, residentUsage, false,
-                        "terrain ReGIR candidates");
-            }
             upload = ctx.createUploadBuffer(uploadBytes, "terrain light tables upload");
             MemoryUtil.memFloatBuffer(upload.mapped, packedLights.length).put(packedLights);
             if (aliasTable != null) writeLightAliasTable(upload.mapped + aliasOffset, aliasTable);
-            if (regir != null) {
-                long cursor = upload.mapped + cellOffset;
-                for (int i = 0; i < regir.cellOffsets().length; i++) {
-                    MemoryUtil.memPutInt(cursor, regir.cellOffsets()[i]);
-                    MemoryUtil.memPutInt(cursor + 4, regir.cellCounts()[i]);
-                    cursor += 8;
-                }
-                MemoryUtil.memIntBuffer(upload.mapped + candidateOffset, regir.candidates().length)
-                        .put(regir.candidates());
-            }
             upload.flush();
             if (CausticaConfig.Rt.Lights.DUMP.value()) {
                 dumpNearbyLights(upload.mapped, totalLights);
@@ -1693,47 +1664,32 @@ public final class RtTerrain {
             RtBuffer submittedUpload = upload;
             RtBuffer submittedLights = next;
             RtBuffer submittedAliases = nextAlias;
-            RtBuffer submittedCells = nextCells;
-            RtBuffer submittedCandidates = nextCandidates;
             RtGpuExecutor.Build uploadBuild = ctx.gpuExecutor().submit(
-                    cmd -> recordLightUpload(cmd, submittedUpload, submittedLights, submittedAliases,
-                            submittedCells, submittedCandidates, lightBytes, aliasOffset, cellOffset,
-                            candidateOffset),
+                    cmd -> recordLightUpload(cmd, submittedUpload, submittedLights,
+                            submittedAliases, lightBytes),
                     () -> { },
                     (ignored, failure) -> submittedUpload.destroy());
             ctx.gpuExecutor().markPublished(uploadBuild);
             upload = null; // executor callback owns it after submit
             lightBuffer = next;
             lightAliasBuffer = nextAlias;
-            regirCellBuffer = nextCells;
-            regirCandidateBuffer = nextCandidates;
-            if (regir != null) {
-                regirOriginX = regir.originX();
-                regirOriginY = regir.originY();
-                regirOriginZ = regir.originZ();
-                regirDimX = regir.dimX();
-                regirDimY = regir.dimY();
-                regirDimZ = regir.dimZ();
-            }
             lightCount = totalLights;
             next = null;
             nextAlias = null;
-            nextCells = null;
-            nextCandidates = null;
         } finally {
             if (upload != null) upload.destroy();
-            if (nextCandidates != null) nextCandidates.destroy();
-            if (nextCells != null) nextCells.destroy();
             if (nextAlias != null) nextAlias.destroy();
             if (next != null) next.destroy();
         }
         if (CausticaConfig.Rt.Lights.STATS.value()) {
-            long bytes = lightBytes + aliasBytes + cellBytes + candidateBytes;
             CausticaMod.LOGGER.info("RT lights: {} lights across {} sections ({} published), "
-                            + "{} ReGIR cells / {} candidates, {} KiB total",
+                            + "{} KiB hot+alias; ReGIR generation {} queued asynchronously",
                     lightCount, litSections, table.instanceList.size(),
-                    regir != null ? regir.populatedCells() : 0,
-                    regir != null ? regir.candidates().length : 0, bytes / 1024);
+                    (lightBytes + aliasBytes) / 1024, generation);
+        }
+        if (CausticaConfig.Rt.Lights.REGIR_ENABLED.value()) {
+            regir.request(new RtReGIRManager.Input(regirSections,
+                    lightX, lightY, lightZ, powers, blockX, blockY, blockZ));
         }
     }
 
@@ -1790,19 +1746,13 @@ public final class RtTerrain {
         }
     }
 
-    /** Copy all proposal tables; the executor's ALL_COMMANDS timeline signal publishes the writes. */
+    /** Copy the global proposal tables; the executor's ALL_COMMANDS signal publishes the writes. */
     private static void recordLightUpload(VkCommandBuffer cmd, RtBuffer upload, RtBuffer lights,
-                                          RtBuffer aliases, RtBuffer cells, RtBuffer candidates,
-                                          long lightBytes, long aliasOffset, long cellOffset,
-                                          long candidateOffset) {
+                                          RtBuffer aliases, long lightBytes) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCopy.Buffer region = VkBufferCopy.calloc(1, stack);
             copyLightTable(cmd, upload, lights, 0L, lightBytes, region);
-            if (aliases != null) copyLightTable(cmd, upload, aliases, aliasOffset, aliases.size, region);
-            if (cells != null) copyLightTable(cmd, upload, cells, cellOffset, cells.size, region);
-            if (candidates != null) {
-                copyLightTable(cmd, upload, candidates, candidateOffset, candidates.size, region);
-            }
+            if (aliases != null) copyLightTable(cmd, upload, aliases, lightBytes, aliases.size, region);
         }
     }
 
@@ -1881,6 +1831,7 @@ public final class RtTerrain {
         // its failure path has already terminally failed every accepted queued build.
         ctx.gpuExecutor().throwIfFailed();
         awaitActiveTasks();
+        regir.awaitIdle();
         Throwable failure = null;
         SectionResult result;
         while ((result = completedBuilds.poll()) != null) {
@@ -1908,6 +1859,7 @@ public final class RtTerrain {
         // Device teardown is the one path that must prove every worker and GPU callback has relinquished
         // its resources before the executor, allocator, and VkDevice disappear.
         terrainEpoch++;
+        regir.cancelPending();
         drainTasksForClear(ctx);
         cancelAllDirtyGroups();
         ctx.waitIdle();
@@ -1938,16 +1890,7 @@ public final class RtTerrain {
             lightAliasBuffer.destroy();
             lightAliasBuffer = null;
         }
-        if (regirCellBuffer != null) {
-            regirCellBuffer.destroy();
-            regirCellBuffer = null;
-        }
-        if (regirCandidateBuffer != null) {
-            regirCandidateBuffer.destroy();
-            regirCandidateBuffer = null;
-        }
-        regirOriginX = regirOriginY = regirOriginZ = 0;
-        regirDimX = regirDimY = regirDimZ = 0;
+        regir.destroyAfterDeviceIdle();
         lightCount = 0;
         if (resident.isEmpty() && table.buffer == null && removed.isEmpty() && prepared.isEmpty()) {
             empty.clear();

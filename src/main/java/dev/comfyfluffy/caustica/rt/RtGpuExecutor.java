@@ -55,6 +55,8 @@ public final class RtGpuExecutor {
     private final AtomicLong nextGraphicsValue = new AtomicLong();
     private final AtomicLong latestGraphicsUseValue = new AtomicLong();
     private final ArrayList<DestroyJob> destroyJobs = new ArrayList<>();
+    private final Object submissionLock = new Object();
+    private long submittedBuildValue;
     private final Thread thread;
     private long commandPool;
     private volatile boolean closed;
@@ -96,7 +98,7 @@ public final class RtGpuExecutor {
         return build;
     }
 
-    /** Mark a completed build visible to terrain publication; the next graphics terrain use waits on it. */
+    /** Mark a build visible to terrain publication; the next graphics terrain use waits on it. */
     public void markPublished(Build build) {
         pendingPublishWaitValue.accumulateAndGet(build.value, Math::max);
     }
@@ -106,6 +108,10 @@ public final class RtGpuExecutor {
         checkExecutorFailure();
         long waitValue = pendingPublishWaitValue.get();
         if (waitValue != 0L) {
+            // vkQueuePresentKHR requires every transitive signal dependency of its binary wait to have
+            // already been submitted. A Build is assigned its timeline value when queued on this Java
+            // executor, so do not expose that future value to the graphics/present chain prematurely.
+            awaitBuildSubmission(waitValue);
             encoder.waitSemaphore(buildTimeline, waitValue, TERRAIN_READ_STAGES);
         }
         return nextGraphicsValue.incrementAndGet();
@@ -314,6 +320,9 @@ public final class RtGpuExecutor {
         } else if (executorFailure != failure) {
             executorFailure.addSuppressed(failure);
         }
+        synchronized (submissionLock) {
+            submissionLock.notifyAll();
+        }
     }
 
     private boolean processDestroyJobsSafely() {
@@ -388,6 +397,10 @@ public final class RtGpuExecutor {
                         computeQueue.vkQueue(), submit, 0L), "vkQueueSubmit2KHR(RT GPU executor)");
             }
             submitted = true;
+            synchronized (submissionLock) {
+                submittedBuildValue = Math.max(submittedBuildValue, signalValue);
+                submissionLock.notifyAll();
+            }
             VulkanDiagnostics.setInFlight("async-compute",
                     "submitted builds=" + firstValue + ".." + signalValue + " batch=" + batch.size());
             waitTimeline(buildTimeline, signalValue);
@@ -449,6 +462,20 @@ public final class RtGpuExecutor {
                     .pValues(stack.longs(value));
             RtContext.check(VK12.vkWaitSemaphores(ctx.vk(), wi, Long.MAX_VALUE), "vkWaitSemaphores(RT GPU executor)");
         }
+    }
+
+    private void awaitBuildSubmission(long value) {
+        synchronized (submissionLock) {
+            while (submittedBuildValue < value && executorFailure == null) {
+                try {
+                    submissionLock.wait();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted waiting for RT GPU build submission " + value, e);
+                }
+            }
+        }
+        checkExecutorFailure();
     }
 
     public static final class Build {
