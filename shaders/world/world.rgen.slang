@@ -450,31 +450,51 @@ float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 p
     return contrib;
 }
 
-// Initial RIS over M uniform candidates -> one resampled sample, no shadow ray yet. The chosen sample's
-// W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
+// Select one light from the emitted-power distribution in O(1). Both random decisions are per-pixel;
+// sharing either the alias column or a small column pool across screen tiles produces structured noise
+// until a proper, separately presampled RTXDI RIS buffer exists.
+void selectLight(inout uint proposalSeed, out uint lightIndex, out float invSourcePdf) {
+    uint column = min(uint(rndf(proposalSeed) * float(worldPush.lightCount)),
+            worldPush.lightCount - 1u);
+    if (worldPush.lightAliasAddr != 0) {
+        LightAlias a = ConstPtr<LightAlias>(worldPush.lightAliasAddr)[column];
+        bool self = rndf(proposalSeed) < a.accept;
+        lightIndex = self ? column : a.aliasIndex;
+        invSourcePdf = self ? a.selfInvPdf : a.aliasInvPdf;
+    } else {
+        lightIndex = column;
+        invSourcePdf = float(worldPush.lightCount);
+    }
+}
+
+// Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
+// sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
 Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough, bool pbr,
-                     inout uint seed) {
+                     inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
     for (uint c = 0u; c < worldPush.risCandidates; c++) {
         r.M += 1.0;
-        uint li = min(uint(rndf(seed) * float(worldPush.lightCount)), worldPush.lightCount - 1u);
+        uint li;
+        float invSourcePdf;
+        selectLight(proposalSeed, li, invSourcePdf);
         Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
         float t = rndf(seed) * 2.0 - 1.0;
-        float3 sp = lg.posArea.xyz + s * lg.halfU.xyz + t * lg.halfV.xyz;
+        float3 sp = lg.posArea.xyz + s * lg.halfULeG.xyz + t * lg.halfVLeB.xyz;
+        float3 le = float3(lg.normalLeR.w, lg.halfULeG.w, lg.halfVLeB.w);
         float phat;
-        evalSampleContrib(sp, lg.normalMat.xyz, lg.le.xyz, lg.posArea.w, p, n, v,
+        evalSampleContrib(sp, lg.normalLeR.xyz, le, lg.posArea.w, p, n, v,
                 diffAlb, F0, rough, pbr, phat);
         if (phat <= 0.0) {
             continue;
         }
-        float w = phat * float(worldPush.lightCount); // source pdf uniform 1/lightCount
+        float w = phat * invSourcePdf;
         r.wSum += w;
         if (rndf(seed) * r.wSum < w) { // weighted reservoir update
             r.pos = sp;
-            r.lnrm = lg.normalMat.xyz;
-            r.le = lg.le.xyz;
+            r.lnrm = lg.normalLeR.xyz;
+            r.le = le;
             r.area = lg.posArea.w;
             r.phat = phat;
         }
@@ -660,7 +680,8 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
 }
 
 // One Monte Carlo path from (ro, rd). Returns accumulated radiance along the path.
-float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed) {
+float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint sampleIndex,
+                 inout uint seed) {
     float3 L = float3(0.0, 0.0, 0.0);
     float3 throughput = float3(1.0, 1.0, 1.0);
     float rayConeWidth = 0.0;
@@ -671,6 +692,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
     // ReSTIR DI: RIS direct lighting from block emitters is active when lights are published and the
     // candidate count is non-zero. Off => emitters are gathered only on path hits (legacy behaviour).
     bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
+    // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
+    // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
+    uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u
+            ^ worldPush.frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
+    proposalSeed = pcg(proposalSeed);
     // Start submerged if the camera is in water so the first segment gets the right medium orientation
     // and absorption when the eye is underwater.
     bool inWater = (worldPush.flags & 1u) != 0u;
@@ -952,7 +978,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
         // two sum. S1 = single-frame RIS: M candidates -> one reservoir survivor -> ONE shadow ray.
         // (S2 adds temporal reservoir reuse at the primary vertex.)
         if (risOn) {
-            Reservoir r = risInitial(p, n, v, diffAlb, F0, rough, pbr, seed);
+            Reservoir r = risInitial(p, n, v, diffAlb, F0, rough, pbr, seed, proposalSeed);
             float3 risVis;
             L += throughput * shadeReservoir(r, p, n, v, diffAlb, F0, rough, pbr, risVis);
         }
@@ -1052,7 +1078,7 @@ void main() {
     float3 frameRadiance = float3(0.0, 0.0, 0.0);
     for (uint s = 0u; s < spp; s++) {
         seed = pcg(seed); // decorrelate per-sample paths (shared camera ray, no AA jitter yet)
-        frameRadiance += tracePath(origin, dir, rayConeSpread, seed);
+        frameRadiance += tracePath(origin, dir, rayConeSpread, uint2(pix), s, seed);
     }
     frameRadiance /= float(spp);
 

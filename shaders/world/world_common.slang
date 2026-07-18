@@ -53,21 +53,28 @@ public struct WorldPush {
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
     public uint64_t lightBufAddr;     // ReSTIR DI global light buffer (0 = none published)
+    public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
     public uint     lightCount;       // packed Light records in lightBufAddr
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
 };
 
-// ReSTIR DI area light: one emissive terrain quad's footprint bounding RECTANGLE (RtLightCollector).
-// Positions/axes are in rebased world space. le is the rectangle-mean HDR radiance (albedo x mask x
-// EMISSIVE_STRENGTH, tinted). The packed half2 lanes carry the sprite-local UV frame of the rectangle
-// ((s,t) in [-1,1]^2 -> uvCenter + s*uvHalfU + t*uvHalfV) for the S3 exact-Le fetch; matId enables the
-// same. Layout mirrors RtLightCollector.append (20 floats / 80 B).
+// ReSTIR DI hot area-light record. The CPU collector retains a richer 80 B section-local record, but
+// publish compacts the fields touched by every RIS candidate into four vec4s (64 B). Cold material
+// and UV metadata will live in a separate survivor-only buffer when exact-texel Le is implemented.
 public struct Light {
     public float4 posArea;   // xyz rectangle center, w rectangle area
-    public float4 normalMat; // xyz outward normal, w materialId uint bits
-    public float4 halfU;     // xyz world half-axis U, w packHalf2(uvHalfU)
-    public float4 halfV;     // xyz world half-axis V, w packHalf2(uvHalfV)
-    public float4 le;        // rgb mean radiance, w packHalf2(uvCenter)
+    public float4 normalLeR; // xyz outward normal, w mean radiance R
+    public float4 halfULeG;  // xyz world half-axis U, w mean radiance G
+    public float4 halfVLeB;  // xyz world half-axis V, w mean radiance B
+};
+
+// Vose alias-table column. One random column load yields both the chosen light index and the reciprocal
+// source PDF needed by RIS, avoiding a second scattered probability-buffer read.
+public struct LightAlias {
+    public uint  aliasIndex;
+    public float accept;
+    public float selfInvPdf;
+    public float aliasInvPdf;
 };
 
 // TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).

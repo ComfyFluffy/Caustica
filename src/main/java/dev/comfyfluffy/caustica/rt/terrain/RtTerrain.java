@@ -47,9 +47,12 @@ import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
+import org.lwjgl.system.MemoryStack;
 import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VkBufferCopy;
+import org.lwjgl.vulkan.VkCommandBuffer;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -180,6 +183,8 @@ public final class RtTerrain {
     // in the same publish step as the instance list — a light must never reference a section that is not
     // in this frame's TLAS (its shadow ray would find no occluder: a ghost emitter).
     private RtBuffer lightBuffer;
+    /** Vose alias table for power-weighted O(1) light selection; published/retired with lightBuffer. */
+    private RtBuffer lightAliasBuffer;
     private int lightCount;
     private boolean windowValid;
     private int windowPcx;
@@ -236,7 +241,12 @@ public final class RtTerrain {
         return lightBuffer != null ? lightBuffer.deviceAddress : 0L;
     }
 
-    /** Number of packed {@link RtLightCollector#FLOATS_PER_LIGHT}-float records in the light buffer. */
+    /** Power-weighted light alias table device address, or 0 for the shader's uniform fallback. */
+    public long lightAliasBufferAddress() {
+        return lightAliasBuffer != null ? lightAliasBuffer.deviceAddress : 0L;
+    }
+
+    /** Number of compact 64-byte records in the published light buffer. */
     public int lightCount() {
         return lightBuffer != null ? lightCount : 0;
     }
@@ -1496,87 +1506,214 @@ public final class RtTerrain {
         ready = true;
     }
 
-    /** Detach + retire the current light buffer after the last graphics submission using it. */
+    /** Detach + retire the current light and alias buffers after their last graphics submission. */
     private void retireLightBuffer(RtContext ctx, long lastGraphicsUse) {
         if (lightBuffer != null) {
             RtBuffer old = lightBuffer;
             ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
             lightBuffer = null;
         }
+        if (lightAliasBuffer != null) {
+            RtBuffer old = lightAliasBuffer;
+            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
+            lightAliasBuffer = null;
+        }
         lightCount = 0;
     }
 
     /**
-     * Flatten the published sections' section-local light records into one host-visible global buffer in
+     * Flatten the published sections' section-local light records into one device-local global buffer in
      * rebased world space (position lanes get {@code sectionOrigin − rebaseOrigin}; directions, half-axes
-     * and Le copy through). Runs inside the same publish step that made {@code table.instances} current.
+     * and Le copy through), compact it to the shader's 64 B hot layout, and build a Vose alias table
+     * weighted by emitted power ({@code area*luminance(Le)}). Runs in the same publish step that made
+     * {@code table.instances} current.
      */
     private void rebuildLightBuffer(RtContext ctx, long lastGraphicsUse) {
-        int stride = RtLightCollector.FLOATS_PER_LIGHT;
-        int totalFloats = 0;
+        int sourceStride = RtLightCollector.FLOATS_PER_LIGHT;
+        final int gpuStride = 16;
+        int totalLights = 0;
         int litSections = 0;
         for (int i = 0, n = table.instanceList.size(); i < n; i++) {
             float[] lights = table.slots.get(table.instanceList.get(i).customIndex()).lights;
             if (lights != null && lights.length > 0) {
-                totalFloats += lights.length;
+                totalLights += lights.length / sourceStride;
                 litSections++;
             }
         }
         retireLightBuffer(ctx, lastGraphicsUse);
-        if (totalFloats == 0) {
+        if (totalLights == 0) {
             return;
         }
-        RtBuffer next = ctx.createBuffer((long) totalFloats * Float.BYTES,
-                VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "terrain lights");
-        long cursor = next.mapped;
-        for (int i = 0, n = table.instanceList.size(); i < n; i++) {
-            SectionGeom g = table.slots.get(table.instanceList.get(i).customIndex());
-            float[] lights = g.lights;
-            if (lights == null || lights.length == 0) {
-                continue;
-            }
-            float ox = g.sx - blockX;
-            float oy = g.sy - blockY;
-            float oz = g.sz - blockZ;
-            for (int base = 0; base < lights.length; base += stride) {
-                MemoryUtil.memPutFloat(cursor, lights[base] + ox);
-                MemoryUtil.memPutFloat(cursor + 4, lights[base + 1] + oy);
-                MemoryUtil.memPutFloat(cursor + 8, lights[base + 2] + oz);
-                for (int lane = 3; lane < stride; lane++) {
-                    MemoryUtil.memPutFloat(cursor + 4L * lane, lights[base + lane]);
+        double[] powers = new double[totalLights];
+        long lightBytes = (long) totalLights * gpuStride * Float.BYTES;
+        RtBuffer next = null;
+        RtBuffer nextAlias = null;
+        RtBuffer upload = null;
+        try {
+            int residentUsage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            next = ctx.createAsyncBuffer(lightBytes, residentUsage, false, "terrain lights");
+            // Build the compact records in sequential staging memory. Random shader reads then hit the
+            // device-local destination instead of a mapped allocation selected for CPU access.
+            upload = ctx.createUploadBuffer(lightBytes + (long) totalLights * 16L,
+                    "terrain light tables upload");
+            long cursor = upload.mapped;
+            int lightIndex = 0;
+            for (int i = 0, n = table.instanceList.size(); i < n; i++) {
+                SectionGeom g = table.slots.get(table.instanceList.get(i).customIndex());
+                float[] lights = g.lights;
+                if (lights == null || lights.length == 0) {
+                    continue;
                 }
-                cursor += 4L * stride;
+                float ox = g.sx - blockX;
+                float oy = g.sy - blockY;
+                float oz = g.sz - blockZ;
+                for (int base = 0; base < lights.length; base += sourceStride) {
+                    float leR = lights[base + 16];
+                    float leG = lights[base + 17];
+                    float leB = lights[base + 18];
+                    MemoryUtil.memPutFloat(cursor, lights[base] + ox);
+                    MemoryUtil.memPutFloat(cursor + 4, lights[base + 1] + oy);
+                    MemoryUtil.memPutFloat(cursor + 8, lights[base + 2] + oz);
+                    MemoryUtil.memPutFloat(cursor + 12, lights[base + 3]);       // area
+                    MemoryUtil.memPutFloat(cursor + 16, lights[base + 4]);       // normal.xyz
+                    MemoryUtil.memPutFloat(cursor + 20, lights[base + 5]);
+                    MemoryUtil.memPutFloat(cursor + 24, lights[base + 6]);
+                    MemoryUtil.memPutFloat(cursor + 28, leR);
+                    MemoryUtil.memPutFloat(cursor + 32, lights[base + 8]);       // halfU.xyz
+                    MemoryUtil.memPutFloat(cursor + 36, lights[base + 9]);
+                    MemoryUtil.memPutFloat(cursor + 40, lights[base + 10]);
+                    MemoryUtil.memPutFloat(cursor + 44, leG);
+                    MemoryUtil.memPutFloat(cursor + 48, lights[base + 12]);      // halfV.xyz
+                    MemoryUtil.memPutFloat(cursor + 52, lights[base + 13]);
+                    MemoryUtil.memPutFloat(cursor + 56, lights[base + 14]);
+                    MemoryUtil.memPutFloat(cursor + 60, leB);
+                    double luminance = 0.2126 * leR + 0.7152 * leG + 0.0722 * leB;
+                    powers[lightIndex++] = Math.max(0.0, lights[base + 3] * luminance);
+                    cursor += (long) gpuStride * Float.BYTES;
+                }
             }
+
+            LightAliasTable aliasTable = buildLightAliasTable(powers);
+            long aliasBytes = aliasTable != null ? (long) totalLights * 16L : 0L;
+            if (aliasTable != null) {
+                nextAlias = ctx.createAsyncBuffer(aliasBytes, residentUsage, false,
+                        "terrain light aliases");
+                writeLightAliasTable(upload.mapped + lightBytes, aliasTable);
+            }
+            upload.flush(0L, lightBytes + aliasBytes);
+            if (CausticaConfig.Rt.Lights.DUMP.value()) {
+                dumpNearbyLights(upload.mapped, totalLights);
+            }
+
+            RtBuffer submittedUpload = upload;
+            RtBuffer submittedLights = next;
+            RtBuffer submittedAliases = nextAlias;
+            RtGpuExecutor.Build uploadBuild = ctx.gpuExecutor().submit(
+                    cmd -> recordLightUpload(cmd, submittedUpload, submittedLights, submittedAliases, lightBytes),
+                    () -> { },
+                    (ignored, failure) -> submittedUpload.destroy());
+            ctx.gpuExecutor().markPublished(uploadBuild);
+            upload = null; // executor callback owns it after submit
+            lightBuffer = next;
+            lightAliasBuffer = nextAlias;
+            lightCount = totalLights;
+            next = null;
+            nextAlias = null;
+        } finally {
+            if (upload != null) upload.destroy();
+            if (nextAlias != null) nextAlias.destroy();
+            if (next != null) next.destroy();
         }
-        next.flush();
-        lightBuffer = next;
-        lightCount = totalFloats / stride;
         if (CausticaConfig.Rt.Lights.STATS.value()) {
-            CausticaMod.LOGGER.info("RT lights: {} lights across {} sections ({} published), {} KiB",
+            long bytes = (long) totalLights * (gpuStride * Float.BYTES + 4 * Integer.BYTES);
+            CausticaMod.LOGGER.info("RT lights: {} lights across {} sections ({} published), {} KiB hot+alias",
                     lightCount, litSections, table.instanceList.size(),
-                    (long) totalFloats * Float.BYTES / 1024);
+                    bytes / 1024);
         }
-        if (CausticaConfig.Rt.Lights.DUMP.value()) {
-            dumpNearbyLights();
+    }
+
+    /** Build one Vose alias column per light: alias, acceptance, and both possible inverse PDFs. */
+    private static LightAliasTable buildLightAliasTable(double[] powers) {
+        int count = powers.length;
+        double total = 0.0;
+        for (double power : powers) total += power;
+        if (!(total > 0.0)) return null;
+
+        double[] scaled = new double[count];
+        float[] invPdf = new float[count];
+        float[] accept = new float[count];
+        int[] alias = new int[count];
+        int[] small = new int[count];
+        int[] large = new int[count];
+        int smallCount = 0, largeCount = 0;
+        for (int i = 0; i < count; i++) {
+            scaled[i] = powers[i] * count / total;
+            invPdf[i] = powers[i] > 0.0 ? (float) (total / powers[i]) : 0.0f;
+            if (scaled[i] < 1.0) small[smallCount++] = i;
+            else large[largeCount++] = i;
+        }
+        while (smallCount > 0 && largeCount > 0) {
+            int s = small[--smallCount];
+            int l = large[--largeCount];
+            accept[s] = (float) scaled[s];
+            alias[s] = l;
+            scaled[l] = scaled[l] + scaled[s] - 1.0;
+            if (scaled[l] < 1.0) small[smallCount++] = l;
+            else large[largeCount++] = l;
+        }
+        while (largeCount > 0) {
+            int i = large[--largeCount];
+            accept[i] = 1.0f;
+            alias[i] = i;
+        }
+        while (smallCount > 0) {
+            int i = small[--smallCount];
+            accept[i] = 1.0f;
+            alias[i] = i;
+        }
+
+        return new LightAliasTable(alias, accept, invPdf);
+    }
+
+    private static void writeLightAliasTable(long cursor, LightAliasTable table) {
+        for (int i = 0; i < table.alias.length; i++) {
+            MemoryUtil.memPutInt(cursor, table.alias[i]);
+            MemoryUtil.memPutFloat(cursor + 4, table.accept[i]);
+            MemoryUtil.memPutFloat(cursor + 8, table.invPdf[i]);
+            MemoryUtil.memPutFloat(cursor + 12, table.invPdf[table.alias[i]]);
+            cursor += 16;
+        }
+    }
+
+    /** Copy both proposal tables; the executor's ALL_COMMANDS timeline signal publishes the writes. */
+    private static void recordLightUpload(VkCommandBuffer cmd, RtBuffer upload, RtBuffer lights,
+                                          RtBuffer aliases, long lightBytes) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkBufferCopy.Buffer region = VkBufferCopy.calloc(1, stack);
+            region.get(0).srcOffset(0L).dstOffset(0L).size(lightBytes);
+            VK10.vkCmdCopyBuffer(cmd, upload.handle, lights.handle, region);
+            if (aliases != null) {
+                region.get(0).srcOffset(lightBytes).dstOffset(0L).size(aliases.size);
+                VK10.vkCmdCopyBuffer(cmd, upload.handle, aliases.handle, region);
+            }
         }
     }
 
     /** Log every published light within {@code lights.dump-radius} blocks of the camera. */
-    private void dumpNearbyLights() {
+    private void dumpNearbyLights(long packedBase, int packedCount) {
         var player = Minecraft.getInstance().player;
-        if (player == null || lightBuffer == null) {
+        if (player == null) {
             return;
         }
-        int stride = RtLightCollector.FLOATS_PER_LIGHT;
+        int stride = 16;
         double px = player.getX() - blockX;
         double py = player.getY() - blockY;
         double pz = player.getZ() - blockZ;
         double radius = CausticaConfig.Rt.Lights.DUMP_RADIUS.value();
         double radiusSq = radius * radius;
-        long base = lightBuffer.mapped;
         int dumped = 0;
-        for (int i = 0; i < lightCount; i++) {
-            long rec = base + (long) i * stride * Float.BYTES;
+        for (int i = 0; i < packedCount; i++) {
+            long rec = packedBase + (long) i * stride * Float.BYTES;
             float x = MemoryUtil.memGetFloat(rec);
             float y = MemoryUtil.memGetFloat(rec + 4);
             float z = MemoryUtil.memGetFloat(rec + 8);
@@ -1585,9 +1722,9 @@ public final class RtTerrain {
                 continue;
             }
             float area = MemoryUtil.memGetFloat(rec + 12);
-            float leR = MemoryUtil.memGetFloat(rec + 64);
-            float leG = MemoryUtil.memGetFloat(rec + 68);
-            float leB = MemoryUtil.memGetFloat(rec + 72);
+            float leR = MemoryUtil.memGetFloat(rec + 28);
+            float leG = MemoryUtil.memGetFloat(rec + 44);
+            float leB = MemoryUtil.memGetFloat(rec + 60);
             CausticaMod.LOGGER.info(
                     "RT light[{}] world=({}, {}, {}) size={} area={} Le=({}, {}, {}) lum={}",
                     i, String.format(java.util.Locale.ROOT, "%.2f", x + blockX),
@@ -1602,6 +1739,9 @@ public final class RtTerrain {
             dumped++;
         }
         CausticaMod.LOGGER.info("RT light dump: {} lights within {} blocks", dumped, (int) radius);
+    }
+
+    private record LightAliasTable(int[] alias, float[] accept, float[] invPdf) {
     }
 
     /** Keep a valid zero-instance table through transient empty-residency windows. */
@@ -1680,6 +1820,10 @@ public final class RtTerrain {
         if (lightBuffer != null) { // device idle at this point (see waitIdle above): destroy directly
             lightBuffer.destroy();
             lightBuffer = null;
+        }
+        if (lightAliasBuffer != null) {
+            lightAliasBuffer.destroy();
+            lightAliasBuffer = null;
         }
         lightCount = 0;
         if (resident.isEmpty() && table.buffer == null && removed.isEmpty() && prepared.isEmpty()) {
