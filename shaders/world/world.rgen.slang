@@ -450,10 +450,8 @@ float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 p
     return contrib;
 }
 
-// Select one light from the emitted-power distribution in O(1). Both random decisions are per-pixel;
-// sharing either the alias column or a small column pool across screen tiles produces structured noise
-// until a proper, separately presampled RTXDI RIS buffer exists.
-void selectLight(inout uint proposalSeed, out uint lightIndex, out float invSourcePdf) {
+// Select one light from the emitted-power distribution in O(1).
+void selectGlobalLight(inout uint proposalSeed, out uint lightIndex, out float invSourcePdf) {
     uint column = min(uint(rndf(proposalSeed) * float(worldPush.lightCount)),
             worldPush.lightCount - 1u);
     if (worldPush.lightAliasAddr != 0) {
@@ -467,16 +465,92 @@ void selectLight(inout uint proposalSeed, out uint lightIndex, out float invSour
     }
 }
 
+float globalLightPdf(uint lightIndex) {
+    if (worldPush.lightAliasAddr != 0) {
+        float invPdf = ConstPtr<LightAlias>(worldPush.lightAliasAddr)[lightIndex].selfInvPdf;
+        return invPdf > 0.0 ? 1.0 / invPdf : 0.0;
+    }
+    return 1.0 / float(worldPush.lightCount);
+}
+
+bool findReGIRCell(float3 p, out ReGIRCell cell) {
+    cell.candidateOffset = 0u;
+    cell.candidateCount = 0u;
+    if (worldPush.regirCellAddr == 0 || worldPush.regirCandidateAddr == 0) return false;
+    int3 coord = int3(floor((p - worldPush.regirOrigin.xyz) / worldPush.regirOrigin.w));
+    if (coord.x < 0 || coord.y < 0 || coord.z < 0
+            || coord.x >= worldPush.regirGrid.x
+            || coord.y >= worldPush.regirGrid.y
+            || coord.z >= worldPush.regirGrid.z) return false;
+    uint linear = (uint(coord.z) * uint(worldPush.regirGrid.y) + uint(coord.y))
+            * uint(worldPush.regirGrid.x) + uint(coord.x);
+    cell = ConstPtr<ReGIRCell>(worldPush.regirCellAddr)[linear];
+    return cell.candidateCount > 0u;
+}
+
+bool reGIRCellContains(ReGIRCell cell, uint lightIndex) {
+    ConstPtr<uint> candidates = ConstPtr<uint>(worldPush.regirCandidateAddr);
+    uint lo = 0u;
+    uint hi = cell.candidateCount;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        uint candidate = candidates[cell.candidateOffset + mid];
+        if (candidate < lightIndex) lo = mid + 1u;
+        else hi = mid;
+    }
+    return lo < cell.candidateCount
+            && candidates[cell.candidateOffset + lo] == lightIndex;
+}
+
+// Sample the exact mixture q = alpha*qCell + (1-alpha)*qGlobal. qGlobal has full support, so cell
+// truncation only changes variance; lights outside the cell (including distant large emitters) remain
+// unbiased. The sorted cell list makes the global branch's qCell lookup logarithmic.
+void selectReGIRLight(ReGIRCell cell, bool hasCell, inout uint proposalSeed,
+                      out uint lightIndex, out float invSourcePdf) {
+    static const float LOCAL_PROBABILITY = 0.75;
+    if (!hasCell) {
+        selectGlobalLight(proposalSeed, lightIndex, invSourcePdf);
+        return;
+    }
+
+    float localPdf;
+    float globalPdf;
+    if (rndf(proposalSeed) < LOCAL_PROBABILITY) {
+        uint slot = min(uint(rndf(proposalSeed) * float(cell.candidateCount)),
+                cell.candidateCount - 1u);
+        lightIndex = ConstPtr<uint>(worldPush.regirCandidateAddr)[cell.candidateOffset + slot];
+        localPdf = 1.0 / float(cell.candidateCount);
+        globalPdf = globalLightPdf(lightIndex);
+    } else {
+        float invGlobalPdf;
+        selectGlobalLight(proposalSeed, lightIndex, invGlobalPdf);
+        globalPdf = 1.0 / invGlobalPdf;
+        localPdf = reGIRCellContains(cell, lightIndex)
+                ? 1.0 / float(cell.candidateCount) : 0.0;
+    }
+    float sourcePdf = LOCAL_PROBABILITY * localPdf + (1.0 - LOCAL_PROBABILITY) * globalPdf;
+    invSourcePdf = 1.0 / max(sourcePdf, 1.0e-20);
+}
+
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
 // sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
 Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough, bool pbr,
                      inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
+    ReGIRCell regirCell;
+    float3 regirLookup = p;
+    if (worldPush.regirCellAddr != 0) {
+        // Stochastically blend across hard section boundaries. Every cell proposal retains full global
+        // support, so conditioning on this independently jittered lookup remains unbiased.
+        regirLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
+                * worldPush.regirOrigin.w;
+    }
+    bool hasRegirCell = findReGIRCell(regirLookup, regirCell);
     for (uint c = 0u; c < worldPush.risCandidates; c++) {
         r.M += 1.0;
         uint li;
         float invSourcePdf;
-        selectLight(proposalSeed, li, invSourcePdf);
+        selectReGIRLight(regirCell, hasRegirCell, proposalSeed, li, invSourcePdf);
         Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;

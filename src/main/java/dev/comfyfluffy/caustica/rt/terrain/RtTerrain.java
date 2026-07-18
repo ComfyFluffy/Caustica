@@ -185,6 +185,11 @@ public final class RtTerrain {
     private RtBuffer lightBuffer;
     /** Vose alias table for power-weighted O(1) light selection; published/retired with lightBuffer. */
     private RtBuffer lightAliasBuffer;
+    /** Dense section-coordinate lookup and packed per-cell candidate indices for ReGIR. */
+    private RtBuffer regirCellBuffer;
+    private RtBuffer regirCandidateBuffer;
+    private int regirOriginX, regirOriginY, regirOriginZ;
+    private int regirDimX, regirDimY, regirDimZ;
     private int lightCount;
     private boolean windowValid;
     private int windowPcx;
@@ -244,6 +249,42 @@ public final class RtTerrain {
     /** Power-weighted light alias table device address, or 0 for the shader's uniform fallback. */
     public long lightAliasBufferAddress() {
         return lightAliasBuffer != null ? lightAliasBuffer.deviceAddress : 0L;
+    }
+
+    public long regirCellBufferAddress() {
+        return regirCellBuffer != null ? regirCellBuffer.deviceAddress : 0L;
+    }
+
+    public long regirCandidateBufferAddress() {
+        return regirCandidateBuffer != null ? regirCandidateBuffer.deviceAddress : 0L;
+    }
+
+    public int regirOriginX() {
+        return regirOriginX;
+    }
+
+    public int regirOriginY() {
+        return regirOriginY;
+    }
+
+    public int regirOriginZ() {
+        return regirOriginZ;
+    }
+
+    public int regirDimX() {
+        return regirDimX;
+    }
+
+    public int regirDimY() {
+        return regirDimY;
+    }
+
+    public int regirDimZ() {
+        return regirDimZ;
+    }
+
+    public int regirMaxCandidates() {
+        return RtReGIR.MAX_CANDIDATES;
     }
 
     /** Number of compact 64-byte records in the published light buffer. */
@@ -1518,6 +1559,18 @@ public final class RtTerrain {
             ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
             lightAliasBuffer = null;
         }
+        if (regirCellBuffer != null) {
+            RtBuffer old = regirCellBuffer;
+            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
+            regirCellBuffer = null;
+        }
+        if (regirCandidateBuffer != null) {
+            RtBuffer old = regirCandidateBuffer;
+            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
+            regirCandidateBuffer = null;
+        }
+        regirOriginX = regirOriginY = regirOriginZ = 0;
+        regirDimX = regirDimY = regirDimZ = 0;
         lightCount = 0;
     }
 
@@ -1533,10 +1586,15 @@ public final class RtTerrain {
         final int gpuStride = 16;
         int totalLights = 0;
         int litSections = 0;
+        ArrayList<RtReGIR.SectionLights> regirSections = new ArrayList<>(table.instanceList.size());
         for (int i = 0, n = table.instanceList.size(); i < n; i++) {
-            float[] lights = table.slots.get(table.instanceList.get(i).customIndex()).lights;
+            SectionGeom g = table.slots.get(table.instanceList.get(i).customIndex());
+            float[] lights = g.lights;
+            int sectionLights = lights != null ? lights.length / sourceStride : 0;
+            regirSections.add(new RtReGIR.SectionLights(g.sx >> 4, g.sy >> 4, g.sz >> 4,
+                    totalLights, sectionLights));
             if (lights != null && lights.length > 0) {
-                totalLights += lights.length / sourceStride;
+                totalLights += sectionLights;
                 litSections++;
             }
         }
@@ -1544,63 +1602,90 @@ public final class RtTerrain {
         if (totalLights == 0) {
             return;
         }
+        float[] packedLights = new float[Math.multiplyExact(totalLights, gpuStride)];
+        float[] lightX = new float[totalLights];
+        float[] lightY = new float[totalLights];
+        float[] lightZ = new float[totalLights];
         double[] powers = new double[totalLights];
+        int lightIndex = 0;
+        for (int i = 0, n = table.instanceList.size(); i < n; i++) {
+            SectionGeom g = table.slots.get(table.instanceList.get(i).customIndex());
+            float[] lights = g.lights;
+            if (lights == null || lights.length == 0) continue;
+            float ox = g.sx - blockX;
+            float oy = g.sy - blockY;
+            float oz = g.sz - blockZ;
+            for (int base = 0; base < lights.length; base += sourceStride) {
+                float leR = lights[base + 16];
+                float leG = lights[base + 17];
+                float leB = lights[base + 18];
+                int dst = lightIndex * gpuStride;
+                packedLights[dst] = lightX[lightIndex] = lights[base] + ox;
+                packedLights[dst + 1] = lightY[lightIndex] = lights[base + 1] + oy;
+                packedLights[dst + 2] = lightZ[lightIndex] = lights[base + 2] + oz;
+                packedLights[dst + 3] = lights[base + 3];
+                packedLights[dst + 4] = lights[base + 4];
+                packedLights[dst + 5] = lights[base + 5];
+                packedLights[dst + 6] = lights[base + 6];
+                packedLights[dst + 7] = leR;
+                packedLights[dst + 8] = lights[base + 8];
+                packedLights[dst + 9] = lights[base + 9];
+                packedLights[dst + 10] = lights[base + 10];
+                packedLights[dst + 11] = leG;
+                packedLights[dst + 12] = lights[base + 12];
+                packedLights[dst + 13] = lights[base + 13];
+                packedLights[dst + 14] = lights[base + 14];
+                packedLights[dst + 15] = leB;
+                double luminance = 0.2126 * leR + 0.7152 * leG + 0.0722 * leB;
+                powers[lightIndex] = Math.max(0.0, lights[base + 3] * luminance);
+                lightIndex++;
+            }
+        }
+
+        LightAliasTable aliasTable = buildLightAliasTable(powers);
+        RtReGIR.Data regir = CausticaConfig.Rt.Lights.REGIR_ENABLED.value()
+                ? RtReGIR.build(regirSections, lightX, lightY, lightZ, powers, blockX, blockY, blockZ)
+                : null;
         long lightBytes = (long) totalLights * gpuStride * Float.BYTES;
+        long aliasBytes = aliasTable != null ? (long) totalLights * 16L : 0L;
+        long cellBytes = regir != null ? regir.cellBytes() : 0L;
+        long candidateBytes = regir != null ? regir.candidateBytes() : 0L;
+        long aliasOffset = lightBytes;
+        long cellOffset = aliasOffset + aliasBytes;
+        long candidateOffset = cellOffset + cellBytes;
+        long uploadBytes = candidateOffset + candidateBytes;
         RtBuffer next = null;
         RtBuffer nextAlias = null;
+        RtBuffer nextCells = null;
+        RtBuffer nextCandidates = null;
         RtBuffer upload = null;
         try {
             int residentUsage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             next = ctx.createAsyncBuffer(lightBytes, residentUsage, false, "terrain lights");
-            // Build the compact records in sequential staging memory. Random shader reads then hit the
-            // device-local destination instead of a mapped allocation selected for CPU access.
-            upload = ctx.createUploadBuffer(lightBytes + (long) totalLights * 16L,
-                    "terrain light tables upload");
-            long cursor = upload.mapped;
-            int lightIndex = 0;
-            for (int i = 0, n = table.instanceList.size(); i < n; i++) {
-                SectionGeom g = table.slots.get(table.instanceList.get(i).customIndex());
-                float[] lights = g.lights;
-                if (lights == null || lights.length == 0) {
-                    continue;
-                }
-                float ox = g.sx - blockX;
-                float oy = g.sy - blockY;
-                float oz = g.sz - blockZ;
-                for (int base = 0; base < lights.length; base += sourceStride) {
-                    float leR = lights[base + 16];
-                    float leG = lights[base + 17];
-                    float leB = lights[base + 18];
-                    MemoryUtil.memPutFloat(cursor, lights[base] + ox);
-                    MemoryUtil.memPutFloat(cursor + 4, lights[base + 1] + oy);
-                    MemoryUtil.memPutFloat(cursor + 8, lights[base + 2] + oz);
-                    MemoryUtil.memPutFloat(cursor + 12, lights[base + 3]);       // area
-                    MemoryUtil.memPutFloat(cursor + 16, lights[base + 4]);       // normal.xyz
-                    MemoryUtil.memPutFloat(cursor + 20, lights[base + 5]);
-                    MemoryUtil.memPutFloat(cursor + 24, lights[base + 6]);
-                    MemoryUtil.memPutFloat(cursor + 28, leR);
-                    MemoryUtil.memPutFloat(cursor + 32, lights[base + 8]);       // halfU.xyz
-                    MemoryUtil.memPutFloat(cursor + 36, lights[base + 9]);
-                    MemoryUtil.memPutFloat(cursor + 40, lights[base + 10]);
-                    MemoryUtil.memPutFloat(cursor + 44, leG);
-                    MemoryUtil.memPutFloat(cursor + 48, lights[base + 12]);      // halfV.xyz
-                    MemoryUtil.memPutFloat(cursor + 52, lights[base + 13]);
-                    MemoryUtil.memPutFloat(cursor + 56, lights[base + 14]);
-                    MemoryUtil.memPutFloat(cursor + 60, leB);
-                    double luminance = 0.2126 * leR + 0.7152 * leG + 0.0722 * leB;
-                    powers[lightIndex++] = Math.max(0.0, lights[base + 3] * luminance);
-                    cursor += (long) gpuStride * Float.BYTES;
-                }
-            }
-
-            LightAliasTable aliasTable = buildLightAliasTable(powers);
-            long aliasBytes = aliasTable != null ? (long) totalLights * 16L : 0L;
             if (aliasTable != null) {
                 nextAlias = ctx.createAsyncBuffer(aliasBytes, residentUsage, false,
                         "terrain light aliases");
-                writeLightAliasTable(upload.mapped + lightBytes, aliasTable);
             }
-            upload.flush(0L, lightBytes + aliasBytes);
+            if (regir != null) {
+                nextCells = ctx.createAsyncBuffer(cellBytes, residentUsage, false,
+                        "terrain ReGIR cells");
+                nextCandidates = ctx.createAsyncBuffer(candidateBytes, residentUsage, false,
+                        "terrain ReGIR candidates");
+            }
+            upload = ctx.createUploadBuffer(uploadBytes, "terrain light tables upload");
+            MemoryUtil.memFloatBuffer(upload.mapped, packedLights.length).put(packedLights);
+            if (aliasTable != null) writeLightAliasTable(upload.mapped + aliasOffset, aliasTable);
+            if (regir != null) {
+                long cursor = upload.mapped + cellOffset;
+                for (int i = 0; i < regir.cellOffsets().length; i++) {
+                    MemoryUtil.memPutInt(cursor, regir.cellOffsets()[i]);
+                    MemoryUtil.memPutInt(cursor + 4, regir.cellCounts()[i]);
+                    cursor += 8;
+                }
+                MemoryUtil.memIntBuffer(upload.mapped + candidateOffset, regir.candidates().length)
+                        .put(regir.candidates());
+            }
+            upload.flush();
             if (CausticaConfig.Rt.Lights.DUMP.value()) {
                 dumpNearbyLights(upload.mapped, totalLights);
             }
@@ -1608,27 +1693,47 @@ public final class RtTerrain {
             RtBuffer submittedUpload = upload;
             RtBuffer submittedLights = next;
             RtBuffer submittedAliases = nextAlias;
+            RtBuffer submittedCells = nextCells;
+            RtBuffer submittedCandidates = nextCandidates;
             RtGpuExecutor.Build uploadBuild = ctx.gpuExecutor().submit(
-                    cmd -> recordLightUpload(cmd, submittedUpload, submittedLights, submittedAliases, lightBytes),
+                    cmd -> recordLightUpload(cmd, submittedUpload, submittedLights, submittedAliases,
+                            submittedCells, submittedCandidates, lightBytes, aliasOffset, cellOffset,
+                            candidateOffset),
                     () -> { },
                     (ignored, failure) -> submittedUpload.destroy());
             ctx.gpuExecutor().markPublished(uploadBuild);
             upload = null; // executor callback owns it after submit
             lightBuffer = next;
             lightAliasBuffer = nextAlias;
+            regirCellBuffer = nextCells;
+            regirCandidateBuffer = nextCandidates;
+            if (regir != null) {
+                regirOriginX = regir.originX();
+                regirOriginY = regir.originY();
+                regirOriginZ = regir.originZ();
+                regirDimX = regir.dimX();
+                regirDimY = regir.dimY();
+                regirDimZ = regir.dimZ();
+            }
             lightCount = totalLights;
             next = null;
             nextAlias = null;
+            nextCells = null;
+            nextCandidates = null;
         } finally {
             if (upload != null) upload.destroy();
+            if (nextCandidates != null) nextCandidates.destroy();
+            if (nextCells != null) nextCells.destroy();
             if (nextAlias != null) nextAlias.destroy();
             if (next != null) next.destroy();
         }
         if (CausticaConfig.Rt.Lights.STATS.value()) {
-            long bytes = (long) totalLights * (gpuStride * Float.BYTES + 4 * Integer.BYTES);
-            CausticaMod.LOGGER.info("RT lights: {} lights across {} sections ({} published), {} KiB hot+alias",
+            long bytes = lightBytes + aliasBytes + cellBytes + candidateBytes;
+            CausticaMod.LOGGER.info("RT lights: {} lights across {} sections ({} published), "
+                            + "{} ReGIR cells / {} candidates, {} KiB total",
                     lightCount, litSections, table.instanceList.size(),
-                    bytes / 1024);
+                    regir != null ? regir.populatedCells() : 0,
+                    regir != null ? regir.candidates().length : 0, bytes / 1024);
         }
     }
 
@@ -1685,18 +1790,26 @@ public final class RtTerrain {
         }
     }
 
-    /** Copy both proposal tables; the executor's ALL_COMMANDS timeline signal publishes the writes. */
+    /** Copy all proposal tables; the executor's ALL_COMMANDS timeline signal publishes the writes. */
     private static void recordLightUpload(VkCommandBuffer cmd, RtBuffer upload, RtBuffer lights,
-                                          RtBuffer aliases, long lightBytes) {
+                                          RtBuffer aliases, RtBuffer cells, RtBuffer candidates,
+                                          long lightBytes, long aliasOffset, long cellOffset,
+                                          long candidateOffset) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCopy.Buffer region = VkBufferCopy.calloc(1, stack);
-            region.get(0).srcOffset(0L).dstOffset(0L).size(lightBytes);
-            VK10.vkCmdCopyBuffer(cmd, upload.handle, lights.handle, region);
-            if (aliases != null) {
-                region.get(0).srcOffset(lightBytes).dstOffset(0L).size(aliases.size);
-                VK10.vkCmdCopyBuffer(cmd, upload.handle, aliases.handle, region);
+            copyLightTable(cmd, upload, lights, 0L, lightBytes, region);
+            if (aliases != null) copyLightTable(cmd, upload, aliases, aliasOffset, aliases.size, region);
+            if (cells != null) copyLightTable(cmd, upload, cells, cellOffset, cells.size, region);
+            if (candidates != null) {
+                copyLightTable(cmd, upload, candidates, candidateOffset, candidates.size, region);
             }
         }
+    }
+
+    private static void copyLightTable(VkCommandBuffer cmd, RtBuffer upload, RtBuffer destination,
+                                       long sourceOffset, long bytes, VkBufferCopy.Buffer region) {
+        region.get(0).srcOffset(sourceOffset).dstOffset(0L).size(bytes);
+        VK10.vkCmdCopyBuffer(cmd, upload.handle, destination.handle, region);
     }
 
     /** Log every published light within {@code lights.dump-radius} blocks of the camera. */
@@ -1825,6 +1938,16 @@ public final class RtTerrain {
             lightAliasBuffer.destroy();
             lightAliasBuffer = null;
         }
+        if (regirCellBuffer != null) {
+            regirCellBuffer.destroy();
+            regirCellBuffer = null;
+        }
+        if (regirCandidateBuffer != null) {
+            regirCandidateBuffer.destroy();
+            regirCandidateBuffer = null;
+        }
+        regirOriginX = regirOriginY = regirOriginZ = 0;
+        regirDimX = regirDimY = regirDimZ = 0;
         lightCount = 0;
         if (resident.isEmpty() && table.buffer == null && removed.isEmpty() && prepared.isEmpty()) {
             empty.clear();

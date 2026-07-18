@@ -54,6 +54,10 @@ public struct WorldPush {
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
     public uint64_t lightBufAddr;     // ReSTIR DI global light buffer (0 = none published)
     public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
+    public uint64_t regirCellAddr;    // dense ReGIR cell headers (0 = global proposals only)
+    public uint64_t regirCandidateAddr; // packed, sorted light indices referenced by cell headers
+    public float4   regirOrigin;      // xyz minimum cell origin in rebased blocks, w cell size
+    public int4     regirGrid;        // xyz dense grid dimensions, w max candidates per populated cell
     public uint     lightCount;       // packed Light records in lightBufAddr
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
 };
@@ -75,6 +79,13 @@ public struct LightAlias {
     public float accept;
     public float selfInvPdf;
     public float aliasInvPdf;
+};
+
+// Dense ReGIR grid entry. Empty coordinates have candidateCount=0; populated section cells point into
+// a sorted uint light-index list so global samples can evaluate the exact local/global mixture PDF.
+public struct ReGIRCell {
+    public uint candidateOffset;
+    public uint candidateCount;
 };
 
 // TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).
