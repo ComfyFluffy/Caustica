@@ -47,12 +47,7 @@ import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
-import org.lwjgl.system.MemoryStack;
 import org.joml.Vector3fc;
-import org.lwjgl.system.MemoryUtil;
-import org.lwjgl.vulkan.VK10;
-import org.lwjgl.vulkan.VkBufferCopy;
-import org.lwjgl.vulkan.VkCommandBuffer;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -179,16 +174,8 @@ public final class RtTerrain {
     public int blockX;
     public int blockY;
     public int blockZ;
-    // ReSTIR DI global light buffer: the published sections' collected lights flattened into rebased
-    // world space (RESTIR_PLAN.md S0). Rebuilt only when the published set or the rebase origin changes,
-    // in the same publish step as the instance list — a light must never reference a section that is not
-    // in this frame's TLAS (its shadow ray would find no occluder: a ghost emitter).
-    private RtBuffer lightBuffer;
-    /** Vose alias table for power-weighted O(1) light selection; published/retired with lightBuffer. */
-    private RtBuffer lightAliasBuffer;
-    /** Coalesced asynchronous section-sized light proposal grid. */
+    /** Coalesced asynchronous, atomically published light hierarchy and section-sized proposal grid. */
     private final RtReGIRManager regir = new RtReGIRManager();
-    private int lightCount;
     private boolean windowValid;
     private int windowPcx;
     private int windowPcz;
@@ -241,12 +228,20 @@ public final class RtTerrain {
 
     /** ReSTIR DI global light buffer device address, or 0 while no lights are published. */
     public long lightBufferAddress() {
-        return lightBuffer != null ? lightBuffer.deviceAddress : 0L;
+        return regir.published().lightAddress();
     }
 
     /** Power-weighted light alias table device address, or 0 for the shader's uniform fallback. */
     public long lightAliasBufferAddress() {
-        return lightAliasBuffer != null ? lightAliasBuffer.deviceAddress : 0L;
+        return regir.published().globalAliasAddress();
+    }
+
+    public long lightSectionBufferAddress() {
+        return regir.published().sectionAddress();
+    }
+
+    public long lightLocalAliasBufferAddress() {
+        return regir.published().localAliasAddress();
     }
 
     public long regirCellBufferAddress() {
@@ -258,15 +253,30 @@ public final class RtTerrain {
     }
 
     public int regirOriginX() {
-        return regir.published().originX();
+        RtReGIRManager.PublishedState hierarchy = regir.published();
+        return hierarchy.originX() + hierarchy.rebaseX() - blockX;
     }
 
     public int regirOriginY() {
-        return regir.published().originY();
+        RtReGIRManager.PublishedState hierarchy = regir.published();
+        return hierarchy.originY() + hierarchy.rebaseY() - blockY;
     }
 
     public int regirOriginZ() {
-        return regir.published().originZ();
+        RtReGIRManager.PublishedState hierarchy = regir.published();
+        return hierarchy.originZ() + hierarchy.rebaseZ() - blockZ;
+    }
+
+    public int lightRebaseOffsetX() {
+        return regir.published().rebaseX() - blockX;
+    }
+
+    public int lightRebaseOffsetY() {
+        return regir.published().rebaseY() - blockY;
+    }
+
+    public int lightRebaseOffsetZ() {
+        return regir.published().rebaseZ() - blockZ;
     }
 
     public int regirDimX() {
@@ -283,7 +293,7 @@ public final class RtTerrain {
 
     /** Number of compact 64-byte records in the published light buffer. */
     public int lightCount() {
-        return lightBuffer != null ? lightCount : 0;
+        return regir.published().lightCount();
     }
 
     /** Per-tick residency update: window sync + dirty drain (plus the streaming fallback, see {@link #frame}). */
@@ -461,8 +471,8 @@ public final class RtTerrain {
             }
         }
 
-        // Publish an asynchronously prepared ReGIR only after this pass's terrain/light publication.
-        // If that changed the light generation, the completed result is discarded below as stale.
+        // Publish only a fully uploaded hierarchy. Newer section changes supersede stale worker/upload
+        // results, while the previous complete generation remains active until this atomic swap.
         if (regir.hasCompletions()) {
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.regirPublish")) {
                 regir.publishReady(ctx);
@@ -1535,7 +1545,7 @@ public final class RtTerrain {
             // Zero resident sections (e.g. every section just evicted on a respawn) is a transient
             // streaming state, not "no world" — keep tracing (sky/entities only) instead of handing the
             // frame back to vanilla; see ensureEmptyTableReady.
-            retireLightBuffer(ctx, lastGraphicsUse);
+            requestLightHierarchy();
             ensureEmptyTableReady(ctx);
             return;
         }
@@ -1552,7 +1562,7 @@ public final class RtTerrain {
         }
         table.instances = table.instanceList;
         if (lightsChanged || rebase) {
-            rebuildLightBuffer(ctx, lastGraphicsUse);
+            requestLightHierarchy();
         }
         ready = true;
     }
@@ -1567,255 +1577,16 @@ public final class RtTerrain {
         return Arrays.equals(previous, current);
     }
 
-    /** Detach + retire the current light and alias buffers after their last graphics submission. */
-    private void retireLightBuffer(RtContext ctx, long lastGraphicsUse) {
-        if (lightBuffer != null) {
-            RtBuffer old = lightBuffer;
-            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
-            lightBuffer = null;
-        }
-        if (lightAliasBuffer != null) {
-            RtBuffer old = lightAliasBuffer;
-            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, old::destroy);
-            lightAliasBuffer = null;
-        }
-        regir.invalidate(ctx, lastGraphicsUse);
-        lightCount = 0;
-    }
-
-    /**
-     * Flatten the published sections' section-local light records into one device-local global buffer in
-     * rebased world space (position lanes get {@code sectionOrigin − rebaseOrigin}; directions, half-axes
-     * and Le copy through), compact it to the shader's 64 B hot layout, and build a Vose alias table
-     * weighted by emitted power ({@code area*luminance(Le)}). Runs in the same publish step that made
-     * {@code table.instances} current.
-     */
-    private void rebuildLightBuffer(RtContext ctx, long lastGraphicsUse) {
-        int sourceStride = RtLightCollector.FLOATS_PER_LIGHT;
-        final int gpuStride = 16;
-        int totalLights = 0;
-        int litSections = 0;
-        ArrayList<RtReGIR.SectionLights> regirSections = new ArrayList<>(table.instanceList.size());
+    /** Snapshot immutable section light arrays; all O(light-count) work happens on the hierarchy worker. */
+    private void requestLightHierarchy() {
+        ArrayList<RtLightHierarchy.SectionInput> sections = new ArrayList<>(table.instanceList.size());
         for (int i = 0, n = table.instanceList.size(); i < n; i++) {
-            SectionGeom g = table.slots.get(table.instanceList.get(i).customIndex());
-            float[] lights = g.lights;
-            int sectionLights = lights != null ? lights.length / sourceStride : 0;
-            regirSections.add(new RtReGIR.SectionLights(g.sx >> 4, g.sy >> 4, g.sz >> 4,
-                    totalLights, sectionLights));
-            if (lights != null && lights.length > 0) {
-                totalLights += sectionLights;
-                litSections++;
-            }
+            int sectionSlot = table.instanceList.get(i).customIndex();
+            SectionGeom g = table.slots.get(sectionSlot);
+            sections.add(new RtLightHierarchy.SectionInput(sectionSlot,
+                    g.sx >> 4, g.sy >> 4, g.sz >> 4, g.lights));
         }
-        retireLightBuffer(ctx, lastGraphicsUse);
-        if (totalLights == 0) {
-            return;
-        }
-        float[] packedLights = new float[Math.multiplyExact(totalLights, gpuStride)];
-        double[] powers = new double[totalLights];
-        int lightIndex = 0;
-        for (int i = 0, n = table.instanceList.size(); i < n; i++) {
-            SectionGeom g = table.slots.get(table.instanceList.get(i).customIndex());
-            float[] lights = g.lights;
-            if (lights == null || lights.length == 0) continue;
-            float ox = g.sx - blockX;
-            float oy = g.sy - blockY;
-            float oz = g.sz - blockZ;
-            for (int base = 0; base < lights.length; base += sourceStride) {
-                float leR = lights[base + 16];
-                float leG = lights[base + 17];
-                float leB = lights[base + 18];
-                int dst = lightIndex * gpuStride;
-                packedLights[dst] = lights[base] + ox;
-                packedLights[dst + 1] = lights[base + 1] + oy;
-                packedLights[dst + 2] = lights[base + 2] + oz;
-                packedLights[dst + 3] = lights[base + 3];
-                packedLights[dst + 4] = lights[base + 4];
-                packedLights[dst + 5] = lights[base + 5];
-                packedLights[dst + 6] = lights[base + 6];
-                packedLights[dst + 7] = leR;
-                packedLights[dst + 8] = lights[base + 8];
-                packedLights[dst + 9] = lights[base + 9];
-                packedLights[dst + 10] = lights[base + 10];
-                packedLights[dst + 11] = leG;
-                packedLights[dst + 12] = lights[base + 12];
-                packedLights[dst + 13] = lights[base + 13];
-                packedLights[dst + 14] = lights[base + 14];
-                packedLights[dst + 15] = leB;
-                double luminance = 0.2126 * leR + 0.7152 * leG + 0.0722 * leB;
-                powers[lightIndex] = Math.max(0.0, lights[base + 3] * luminance);
-                lightIndex++;
-            }
-        }
-
-        long generation = regir.generation();
-        LightAliasTable aliasTable = buildLightAliasTable(powers);
-        long lightBytes = (long) totalLights * gpuStride * Float.BYTES;
-        long aliasBytes = aliasTable != null ? (long) totalLights * 16L : 0L;
-        long aliasOffset = lightBytes;
-        long uploadBytes = aliasOffset + aliasBytes;
-        RtBuffer next = null;
-        RtBuffer nextAlias = null;
-        RtBuffer upload = null;
-        try {
-            int residentUsage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            next = ctx.createAsyncBuffer(lightBytes, residentUsage, false, "terrain lights");
-            if (aliasTable != null) {
-                nextAlias = ctx.createAsyncBuffer(aliasBytes, residentUsage, false,
-                        "terrain light aliases");
-            }
-            upload = ctx.createUploadBuffer(uploadBytes, "terrain light tables upload");
-            MemoryUtil.memFloatBuffer(upload.mapped, packedLights.length).put(packedLights);
-            if (aliasTable != null) writeLightAliasTable(upload.mapped + aliasOffset, aliasTable);
-            upload.flush();
-            if (CausticaConfig.Rt.Lights.DUMP.value()) {
-                dumpNearbyLights(upload.mapped, totalLights);
-            }
-
-            RtBuffer submittedUpload = upload;
-            RtBuffer submittedLights = next;
-            RtBuffer submittedAliases = nextAlias;
-            RtGpuExecutor.Build uploadBuild = ctx.gpuExecutor().submit(
-                    cmd -> recordLightUpload(cmd, submittedUpload, submittedLights,
-                            submittedAliases, lightBytes),
-                    () -> { },
-                    (ignored, failure) -> submittedUpload.destroy());
-            ctx.gpuExecutor().markPublished(uploadBuild);
-            upload = null; // executor callback owns it after submit
-            lightBuffer = next;
-            lightAliasBuffer = nextAlias;
-            lightCount = totalLights;
-            next = null;
-            nextAlias = null;
-        } finally {
-            if (upload != null) upload.destroy();
-            if (nextAlias != null) nextAlias.destroy();
-            if (next != null) next.destroy();
-        }
-        if (CausticaConfig.Rt.Lights.STATS.value()) {
-            CausticaMod.LOGGER.info("RT lights: {} lights across {} sections ({} published), "
-                            + "{} KiB hot+alias; ReGIR generation {} queued asynchronously",
-                    lightCount, litSections, table.instanceList.size(),
-                    (lightBytes + aliasBytes) / 1024, generation);
-        }
-        if (CausticaConfig.Rt.Lights.REGIR_ENABLED.value()) {
-            regir.request(new RtReGIRManager.Input(
-                    regirSections, powers, blockX, blockY, blockZ));
-        }
-    }
-
-    /** Build one Vose alias column per light: alias, acceptance, and both possible inverse PDFs. */
-    private static LightAliasTable buildLightAliasTable(double[] powers) {
-        int count = powers.length;
-        double total = 0.0;
-        for (double power : powers) total += power;
-        if (!(total > 0.0)) return null;
-
-        double[] scaled = new double[count];
-        float[] invPdf = new float[count];
-        float[] accept = new float[count];
-        int[] alias = new int[count];
-        int[] small = new int[count];
-        int[] large = new int[count];
-        int smallCount = 0, largeCount = 0;
-        for (int i = 0; i < count; i++) {
-            scaled[i] = powers[i] * count / total;
-            invPdf[i] = powers[i] > 0.0 ? (float) (total / powers[i]) : 0.0f;
-            if (scaled[i] < 1.0) small[smallCount++] = i;
-            else large[largeCount++] = i;
-        }
-        while (smallCount > 0 && largeCount > 0) {
-            int s = small[--smallCount];
-            int l = large[--largeCount];
-            accept[s] = (float) scaled[s];
-            alias[s] = l;
-            scaled[l] = scaled[l] + scaled[s] - 1.0;
-            if (scaled[l] < 1.0) small[smallCount++] = l;
-            else large[largeCount++] = l;
-        }
-        while (largeCount > 0) {
-            int i = large[--largeCount];
-            accept[i] = 1.0f;
-            alias[i] = i;
-        }
-        while (smallCount > 0) {
-            int i = small[--smallCount];
-            accept[i] = 1.0f;
-            alias[i] = i;
-        }
-
-        return new LightAliasTable(alias, accept, invPdf);
-    }
-
-    private static void writeLightAliasTable(long cursor, LightAliasTable table) {
-        for (int i = 0; i < table.alias.length; i++) {
-            MemoryUtil.memPutInt(cursor, table.alias[i]);
-            MemoryUtil.memPutFloat(cursor + 4, table.accept[i]);
-            MemoryUtil.memPutFloat(cursor + 8, table.invPdf[i]);
-            MemoryUtil.memPutFloat(cursor + 12, table.invPdf[table.alias[i]]);
-            cursor += 16;
-        }
-    }
-
-    /** Copy the global proposal tables; the executor's ALL_COMMANDS signal publishes the writes. */
-    private static void recordLightUpload(VkCommandBuffer cmd, RtBuffer upload, RtBuffer lights,
-                                          RtBuffer aliases, long lightBytes) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkBufferCopy.Buffer region = VkBufferCopy.calloc(1, stack);
-            copyLightTable(cmd, upload, lights, 0L, lightBytes, region);
-            if (aliases != null) copyLightTable(cmd, upload, aliases, lightBytes, aliases.size, region);
-        }
-    }
-
-    private static void copyLightTable(VkCommandBuffer cmd, RtBuffer upload, RtBuffer destination,
-                                       long sourceOffset, long bytes, VkBufferCopy.Buffer region) {
-        region.get(0).srcOffset(sourceOffset).dstOffset(0L).size(bytes);
-        VK10.vkCmdCopyBuffer(cmd, upload.handle, destination.handle, region);
-    }
-
-    /** Log every published light within {@code lights.dump-radius} blocks of the camera. */
-    private void dumpNearbyLights(long packedBase, int packedCount) {
-        var player = Minecraft.getInstance().player;
-        if (player == null) {
-            return;
-        }
-        int stride = 16;
-        double px = player.getX() - blockX;
-        double py = player.getY() - blockY;
-        double pz = player.getZ() - blockZ;
-        double radius = CausticaConfig.Rt.Lights.DUMP_RADIUS.value();
-        double radiusSq = radius * radius;
-        int dumped = 0;
-        for (int i = 0; i < packedCount; i++) {
-            long rec = packedBase + (long) i * stride * Float.BYTES;
-            float x = MemoryUtil.memGetFloat(rec);
-            float y = MemoryUtil.memGetFloat(rec + 4);
-            float z = MemoryUtil.memGetFloat(rec + 8);
-            double dx = x - px, dy = y - py, dz = z - pz;
-            if (dx * dx + dy * dy + dz * dz > radiusSq) {
-                continue;
-            }
-            float area = MemoryUtil.memGetFloat(rec + 12);
-            float leR = MemoryUtil.memGetFloat(rec + 28);
-            float leG = MemoryUtil.memGetFloat(rec + 44);
-            float leB = MemoryUtil.memGetFloat(rec + 60);
-            CausticaMod.LOGGER.info(
-                    "RT light[{}] world=({}, {}, {}) size={} area={} Le=({}, {}, {}) lum={}",
-                    i, String.format(java.util.Locale.ROOT, "%.2f", x + blockX),
-                    String.format(java.util.Locale.ROOT, "%.2f", y + blockY),
-                    String.format(java.util.Locale.ROOT, "%.2f", z + blockZ),
-                    String.format(java.util.Locale.ROOT, "%.3f", Math.sqrt(area)),
-                    String.format(java.util.Locale.ROOT, "%.4f", area),
-                    String.format(java.util.Locale.ROOT, "%.3f", leR),
-                    String.format(java.util.Locale.ROOT, "%.3f", leG),
-                    String.format(java.util.Locale.ROOT, "%.3f", leB),
-                    String.format(java.util.Locale.ROOT, "%.3f", 0.2126f * leR + 0.7152f * leG + 0.0722f * leB));
-            dumped++;
-        }
-        CausticaMod.LOGGER.info("RT light dump: {} lights within {} blocks", dumped, (int) radius);
-    }
-
-    private record LightAliasTable(int[] alias, float[] accept, float[] invPdf) {
+        regir.request(new RtReGIRManager.Input(sections, blockX, blockY, blockZ));
     }
 
     /** Keep a valid zero-instance table through transient empty-residency windows. */
@@ -1893,16 +1664,7 @@ public final class RtTerrain {
         reextract.clear();
         queuedReextract.clear();
         windowValid = false;
-        if (lightBuffer != null) { // device idle at this point (see waitIdle above): destroy directly
-            lightBuffer.destroy();
-            lightBuffer = null;
-        }
-        if (lightAliasBuffer != null) {
-            lightAliasBuffer.destroy();
-            lightAliasBuffer = null;
-        }
         regir.destroyAfterDeviceIdle();
-        lightCount = 0;
         if (resident.isEmpty() && table.buffer == null && removed.isEmpty() && prepared.isEmpty()) {
             empty.clear();
             table.instances = null;
@@ -2010,7 +1772,7 @@ public final class RtTerrain {
         if (oldGeneration != null) {
             retireGeneration(ctx, lastGraphicsUse, oldGeneration);
         }
-        retireLightBuffer(ctx, lastGraphicsUse);
+        regir.invalidate(ctx, lastGraphicsUse);
         if (!oldGeometry.isEmpty()) {
             ArrayList<SectionGeom> retirement = new ArrayList<>(oldGeometry);
             ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse,

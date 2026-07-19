@@ -488,6 +488,27 @@ bool findReGIRCell(float3 p, out ReGIRCell cell) {
     return cell.spanCount > 0u;
 }
 
+float sectionLightPdf(LightSection section, uint lightIndex) {
+    if (lightIndex < section.firstLight || lightIndex >= section.firstLight + section.lightCount) {
+        return 0.0;
+    }
+    uint localIndex = lightIndex - section.firstLight;
+    float invPdf = ConstPtr<LightAlias>(worldPush.lightLocalAliasAddr)
+            [section.firstLight + localIndex].selfInvPdf;
+    return invPdf > 0.0 ? 1.0 / invPdf : 0.0;
+}
+
+void selectSectionLight(LightSection section, inout uint proposalSeed,
+                        out uint lightIndex, out float localPdf) {
+    uint column = min(uint(rndf(proposalSeed) * float(section.lightCount)), section.lightCount - 1u);
+    LightAlias alias = ConstPtr<LightAlias>(worldPush.lightLocalAliasAddr)[section.firstLight + column];
+    bool self = rndf(proposalSeed) < alias.accept;
+    uint localIndex = self ? column : alias.aliasIndex;
+    float invPdf = self ? alias.selfInvPdf : alias.aliasInvPdf;
+    lightIndex = section.firstLight + localIndex;
+    localPdf = invPdf > 0.0 ? 1.0 / invPdf : 0.0;
+}
+
 bool reGIRCellPdf(ReGIRCell cell, uint lightIndex, out float localPdf) {
     ConstPtr<ReGIRSpan> spans = ConstPtr<ReGIRSpan>(worldPush.regirSpanAddr);
     uint lo = 0u;
@@ -495,7 +516,8 @@ bool reGIRCellPdf(ReGIRCell cell, uint lightIndex, out float localPdf) {
     while (lo < hi) {
         uint mid = (lo + hi) >> 1u;
         ReGIRSpan span = spans[cell.spanOffset + mid];
-        if (span.firstLight + span.lightCount <= lightIndex) lo = mid + 1u;
+        LightSection section = ConstPtr<LightSection>(worldPush.lightSectionAddr)[span.sectionSlot];
+        if (section.firstLight + section.lightCount <= lightIndex) lo = mid + 1u;
         else hi = mid;
     }
     if (lo >= cell.spanCount) {
@@ -503,12 +525,14 @@ bool reGIRCellPdf(ReGIRCell cell, uint lightIndex, out float localPdf) {
         return false;
     }
     ReGIRSpan span = spans[cell.spanOffset + lo];
-    if (lightIndex < span.firstLight || lightIndex >= span.firstLight + span.lightCount) {
+    LightSection section = ConstPtr<LightSection>(worldPush.lightSectionAddr)[span.sectionSlot];
+    float lightPdf = sectionLightPdf(section, lightIndex);
+    if (lightPdf <= 0.0) {
         localPdf = 0.0;
         return false;
     }
     float previousCdf = lo > 0u ? spans[cell.spanOffset + lo - 1u].cdf : 0.0;
-    localPdf = max(span.cdf - previousCdf, 0.0) / float(span.lightCount);
+    localPdf = max(span.cdf - previousCdf, 0.0) * lightPdf;
     return localPdf > 0.0;
 }
 
@@ -527,13 +551,14 @@ void selectReGIRSpanLight(ReGIRCell cell, inout uint proposalSeed,
     ReGIRSpan span = spans[cell.spanOffset + spanIndex];
     float previousCdf = spanIndex > 0u
             ? spans[cell.spanOffset + spanIndex - 1u].cdf : 0.0;
-    uint withinSpan = min(uint(rndf(proposalSeed) * float(span.lightCount)), span.lightCount - 1u);
-    lightIndex = span.firstLight + withinSpan;
-    localPdf = max(span.cdf - previousCdf, 0.0) / float(span.lightCount);
+    LightSection section = ConstPtr<LightSection>(worldPush.lightSectionAddr)[span.sectionSlot];
+    float lightPdf;
+    selectSectionLight(section, proposalSeed, lightIndex, lightPdf);
+    localPdf = max(span.cdf - previousCdf, 0.0) * lightPdf;
 }
 
 // Sample the exact mixture q = alpha*qCell + (1-alpha)*qGlobal. qCell first selects a nearby section
-// by emitted power and section distance, then a light uniformly within that section. Every light in
+// by emitted power and section distance, then its section-local power alias. Every light in
 // the neighborhood is represented without a fixed cap; qGlobal gives distant lights full support.
 // Sorted spans make both weighted selection and the global branch's qCell lookup logarithmic.
 void selectReGIRLight(ReGIRCell cell, bool hasCell, inout uint proposalSeed,
@@ -582,7 +607,8 @@ Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, fl
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
         float t = rndf(seed) * 2.0 - 1.0;
-        float3 sp = lg.posArea.xyz + s * lg.halfULeG.xyz + t * lg.halfVLeB.xyz;
+        float3 sp = lg.posArea.xyz + worldPush.lightRebaseOffset
+                + s * lg.halfULeG.xyz + t * lg.halfVLeB.xyz;
         float3 le = float3(lg.normalLeR.w, lg.halfULeG.w, lg.halfVLeB.w);
         float phat;
         evalSampleContrib(sp, lg.normalLeR.xyz, le, lg.posArea.w, p, n, v,

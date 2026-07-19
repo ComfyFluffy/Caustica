@@ -22,26 +22,22 @@ final class RtReGIR {
     private RtReGIR() {
     }
 
-    static Data build(List<SectionLights> sections, double[] powers,
-                      int rebaseX, int rebaseY, int rebaseZ) {
-        if (sections.isEmpty() || powers.length == 0) {
+    static Data build(List<SectionLights> sections, int rebaseX, int rebaseY, int rebaseZ) {
+        if (sections.isEmpty()) {
             return null;
         }
 
         Long2ObjectOpenHashMap<SourceSection> bySection = new Long2ObjectOpenHashMap<>(sections.size());
         for (SectionLights section : sections) {
-            double power = 0.0;
-            int end = Math.addExact(section.firstLight, section.lightCount);
-            for (int light = section.firstLight; light < end; light++) power += powers[light];
             bySection.put(RtTerrain.sectionKey(section.x, section.y, section.z),
-                    new SourceSection(section, power));
+                    new SourceSection(section));
         }
         // A cell is useful only near an emitter. Materializing the entire render-distance volume on
         // every streaming publication would make the CPU build grow with all geometry, even though a
         // far, unlit cell is already well served by the global proposal.
         LongOpenHashSet activeKeys = new LongOpenHashSet();
         for (SectionLights source : sections) {
-            if (source.lightCount == 0) continue;
+            if (!(source.power > 0.0)) continue;
             for (int dz = -NEIGHBOR_RADIUS; dz <= NEIGHBOR_RADIUS; dz++) {
                 for (int dy = -NEIGHBOR_RADIUS; dy <= NEIGHBOR_RADIUS; dy++) {
                     for (int dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
@@ -78,12 +74,11 @@ final class RtReGIR {
         int volume = (int) volumeLong;
         int[] cellOffsets = new int[volume];
         int[] cellCounts = new int[volume];
-        IntArrayList spanFirstLights = new IntArrayList();
-        IntArrayList spanLightCounts = new IntArrayList();
+        IntArrayList spanSectionSlots = new IntArrayList();
         FloatArrayList spanCdfs = new FloatArrayList();
         ArrayList<WeightedSpan> selected = new ArrayList<>(125);
         int populatedCells = 0;
-        long representedLights = 0L;
+        long representedSections = 0L;
 
         for (int cellIndex = 0; cellIndex < activeCount; cellIndex++) {
             SectionLights cell = active[cellIndex];
@@ -93,61 +88,59 @@ final class RtReGIR {
                     for (int dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
                         SourceSection source = bySection.get(RtTerrain.sectionKey(
                                 cell.x + dx, cell.y + dy, cell.z + dz));
-                        if (source == null || source.lights.lightCount == 0 || !(source.power > 0.0)) continue;
+                        if (source == null || !(source.lights.power > 0.0)) continue;
                         double distanceSq = 16.0 * 16.0 * (dx * dx + dy * dy + dz * dz);
-                        double weight = source.power / Math.max(SECTION_DISTANCE_FLOOR_SQ, distanceSq);
-                        selected.add(new WeightedSpan(
-                                source.lights.firstLight, source.lights.lightCount, weight));
+                        double weight = source.lights.power / Math.max(SECTION_DISTANCE_FLOOR_SQ, distanceSq);
+                        selected.add(new WeightedSpan(source.lights.sectionSlot, weight));
                     }
                 }
             }
 
             if (selected.isEmpty()) continue;
-            selected.sort(Comparator.comparingInt(WeightedSpan::firstLight));
+            selected.sort(Comparator.comparingInt(WeightedSpan::sectionSlot));
             double totalWeight = 0.0;
             for (WeightedSpan span : selected) totalWeight += span.weight;
 
             int linear = ((cell.z - minZ) * dimY + (cell.y - minY)) * dimX + (cell.x - minX);
-            cellOffsets[linear] = spanFirstLights.size();
+            cellOffsets[linear] = spanSectionSlots.size();
             cellCounts[linear] = selected.size();
             double cumulative = 0.0;
             for (int spanIndex = 0; spanIndex < selected.size(); spanIndex++) {
                 WeightedSpan span = selected.get(spanIndex);
                 cumulative += span.weight / totalWeight;
-                spanFirstLights.add(span.firstLight);
-                spanLightCounts.add(span.lightCount);
+                spanSectionSlots.add(span.sectionSlot);
                 spanCdfs.add(spanIndex + 1 == selected.size() ? 1.0f : (float) cumulative);
-                representedLights = Math.addExact(representedLights, span.lightCount);
+                representedSections++;
             }
             populatedCells++;
         }
 
-        if (spanFirstLights.isEmpty()) return null;
+        if (spanSectionSlots.isEmpty()) return null;
         return new Data(minX * 16 - rebaseX, minY * 16 - rebaseY, minZ * 16 - rebaseZ,
                 dimX, dimY, dimZ, cellOffsets, cellCounts,
-                spanFirstLights.toIntArray(), spanLightCounts.toIntArray(), spanCdfs.toFloatArray(),
-                populatedCells, representedLights);
+                spanSectionSlots.toIntArray(), spanCdfs.toFloatArray(),
+                populatedCells, representedSections);
     }
 
-    record SectionLights(int x, int y, int z, int firstLight, int lightCount) {
+    record SectionLights(int sectionSlot, int x, int y, int z, double power) {
     }
 
-    private record SourceSection(SectionLights lights, double power) {
+    private record SourceSection(SectionLights lights) {
     }
 
-    private record WeightedSpan(int firstLight, int lightCount, double weight) {
+    private record WeightedSpan(int sectionSlot, double weight) {
     }
 
     record Data(int originX, int originY, int originZ, int dimX, int dimY, int dimZ,
                 int[] cellOffsets, int[] cellCounts,
-                int[] spanFirstLights, int[] spanLightCounts, float[] spanCdfs,
-                int populatedCells, long representedLights) {
+                int[] spanSectionSlots, float[] spanCdfs,
+                int populatedCells, long representedSections) {
         long cellBytes() {
             return Math.multiplyExact((long) cellOffsets.length, 8L);
         }
 
         long spanBytes() {
-            return Math.multiplyExact((long) spanFirstLights.length, 12L);
+            return Math.multiplyExact((long) spanSectionSlots.length, 8L);
         }
     }
 }

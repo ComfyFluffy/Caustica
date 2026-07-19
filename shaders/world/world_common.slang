@@ -54,6 +54,9 @@ public struct WorldPush {
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
     public uint64_t lightBufAddr;     // ReSTIR DI global light buffer (0 = none published)
     public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
+    public uint64_t lightSectionAddr; // section-slot -> contiguous light/local-alias range
+    public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
+    public float3   lightRebaseOffset; // hierarchy rebase origin minus current terrain rebase origin
     public uint64_t regirCellAddr;    // dense ReGIR cell headers (0 = global proposals only)
     public uint64_t regirSpanAddr;      // packed weighted section spans referenced by cell headers
     public float4   regirOrigin;      // xyz minimum cell origin in rebased blocks, w cell size
@@ -88,12 +91,20 @@ public struct ReGIRCell {
     public uint spanCount;
 };
 
-// One contiguous range in the global light buffer. Spans in a cell are sorted by firstLight, and their
-// CDF is accumulated in that same order. This supports logarithmic weighted selection and exact local
-// proposal-PDF lookup for a sample drawn by the global branch.
-public struct ReGIRSpan {
+// Section-owned proposal metadata. The current first generation points into compact shared Light and
+// local-alias buffers; the shader contract is section-relative so those ranges can become independent
+// pages without changing ReGIR or reservoir sampling.
+public struct LightSection {
     public uint firstLight;
     public uint lightCount;
+    public float power;
+    public uint reserved;
+};
+
+// One section reference in a cell. Spans are sorted by stable terrain section slot, and their CDF is
+// accumulated in that order. The section header owns the light range and local alias distribution.
+public struct ReGIRSpan {
+    public uint sectionSlot;
     public float cdf;
 };
 

@@ -865,6 +865,10 @@ public final class RtComposite {
                     terrain.lightBufferAddress(),
                     CausticaConfig.Rt.Lights.POWER_SAMPLING.value()
                             ? terrain.lightAliasBufferAddress() : 0L,
+                    terrain.lightSectionBufferAddress(),
+                    terrain.lightLocalAliasBufferAddress(),
+                    new Float3(terrain.lightRebaseOffsetX(), terrain.lightRebaseOffsetY(),
+                            terrain.lightRebaseOffsetZ()),
                     CausticaConfig.Rt.Lights.REGIR_ENABLED.value()
                             ? terrain.regirCellBufferAddress() : 0L,
                     CausticaConfig.Rt.Lights.REGIR_ENABLED.value()
