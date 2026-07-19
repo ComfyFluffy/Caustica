@@ -12,7 +12,6 @@ import java.util.function.BooleanSupplier;
 final class RtReGIR {
     private static final int NEIGHBOR_RADIUS = 2;
     private static final int MAX_DENSE_GRID_CELLS = 4_000_000;
-    private static final double SECTION_DISTANCE_FLOOR_SQ = 16.0 * 16.0;
 
     private RtReGIR() {
     }
@@ -58,6 +57,7 @@ final class RtReGIR {
         int volume = (int) volumeLong;
         int[] cellOffsets = new int[volume];
         int[] cellCounts = new int[volume];
+        float[] cellInvWeightSums = new float[volume];
         long spanCountLong = 0L;
         for (int sourceIndex = 0; sourceIndex < sections.size(); sourceIndex++) {
             if ((sourceIndex & 63) == 0) checkCancelled(cancelled);
@@ -114,11 +114,13 @@ final class RtReGIR {
                         int linear = ((source.z + dz - minZ) * dimY
                                 + (source.y + dy - minY)) * dimX + (source.x + dx - minX);
                         int span = writeOffsets[linear]++;
-                        double distanceSq = 16.0 * 16.0 * (dx * dx + dy * dy + dz * dz);
+                        int distanceSq = dx * dx + dy * dy + dz * dz;
                         spanFirstLights[span] = source.firstLight;
                         spanLightCounts[span] = source.lightCount;
                         spanSelfGlobalMasses[span] = (float) (source.power / globalPower);
-                        spanWeights[span] = source.power / Math.max(SECTION_DISTANCE_FLOOR_SQ, distanceSq);
+                        // The common 16^2 block-to-section scale cancels during normalization. Keeping
+                        // this in section units lets the shader reconstruct the same weight in O(1).
+                        spanWeights[span] = source.power / Math.max(1, distanceSq);
                     }
                 }
             }
@@ -135,6 +137,7 @@ final class RtReGIR {
             if (count == 0) continue;
             double totalWeight = 0.0;
             for (int i = 0; i < count; i++) totalWeight += spanWeights[first + i];
+            cellInvWeightSums[cell] = (float) (1.0 / totalWeight);
 
             int smallCount = 0;
             int largeCount = 0;
@@ -174,7 +177,7 @@ final class RtReGIR {
         }
 
         return new Data(minX * 16 - rebaseX, minY * 16 - rebaseY, minZ * 16 - rebaseZ,
-                dimX, dimY, dimZ, cellOffsets, cellCounts,
+                dimX, dimY, dimZ, cellOffsets, cellCounts, cellInvWeightSums,
                 spanFirstLights, spanLightCounts, spanAliasFirstLights, spanAliasLightCounts,
                 spanAccept, spanSelfPdfs, spanAliasPdfs,
                 spanSelfGlobalMasses, spanAliasGlobalMasses, populatedCells, spanCountLong);
@@ -188,14 +191,14 @@ final class RtReGIR {
     }
 
     record Data(int originX, int originY, int originZ, int dimX, int dimY, int dimZ,
-                int[] cellOffsets, int[] cellCounts,
+                int[] cellOffsets, int[] cellCounts, float[] cellInvWeightSums,
                 int[] spanFirstLights, int[] spanLightCounts,
                 int[] spanAliasFirstLights, int[] spanAliasLightCounts,
                 float[] spanAccept, float[] spanSelfPdfs, float[] spanAliasPdfs,
                 float[] spanSelfGlobalMasses, float[] spanAliasGlobalMasses,
                 int populatedCells, long representedSections) {
         long cellBytes() {
-            return Math.multiplyExact((long) cellOffsets.length, 8L);
+            return Math.multiplyExact((long) cellOffsets.length, 12L);
         }
 
         long spanBytes() {

@@ -55,6 +55,7 @@ public struct WorldPush {
     public uint64_t lightBufAddr;     // ReSTIR DI global light buffer (0 = none published)
     public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
     public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
+    public uint64_t lightSectionMetaAddr; // per-light section coordinate/power for O(1) reverse PDFs
     public float3   lightRebaseOffset; // hierarchy rebase origin minus current terrain rebase origin
     public uint64_t regirCellAddr;    // dense ReGIR cell headers (0 = global proposals only)
     public uint64_t regirSpanAddr;      // packed weighted section spans referenced by cell headers
@@ -83,16 +84,24 @@ public struct LightAlias {
     public float aliasInvPdf;
 };
 
+// Duplicated once per light so a globally selected light can recover its cell-proposal section
+// probability with one direct load. sectionCoord is relative to the ReGIR grid origin, in sections.
+public struct LightSectionMetadata {
+    public int3  sectionCoord;
+    public float sectionPower;
+};
+
 // Dense ReGIR grid entry. Empty coordinates have spanCount=0; populated section cells point into an
 // immutable list of weighted section light ranges built and published alongside this grid.
 public struct ReGIRCell {
     public uint spanOffset;
     public uint spanCount;
+    public float invWeightSum;
 };
 
-// One Vose alias column for the section distribution of a cell. Self ranges remain sorted by global
-// light index, so the global proposal can recover the exact cell PDF with a metadata-only binary search.
-// Selection needs one 36-byte load and no dependent section-header or global-alias fetch.
+// One Vose alias column for the section distribution of a cell. Selection needs one 36-byte load and
+// no dependent section-header or global-alias fetch. Reverse PDFs use LightSectionMetadata instead of
+// searching the span records.
 public struct ReGIRSpan {
     public uint firstLight;
     public uint lightCount;

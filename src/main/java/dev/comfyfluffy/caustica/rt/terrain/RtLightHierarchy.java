@@ -40,6 +40,8 @@ final class RtLightHierarchy {
         int[] sectionFirstLights = new int[sectionCapacity];
         int[] sectionLightCounts = new int[sectionCapacity];
         float[] packedLights = new float[Math.multiplyExact(totalLights, GPU_FLOATS_PER_LIGHT)];
+        int[] lightSectionCoords = new int[Math.multiplyExact(totalLights, 3)];
+        float[] lightSectionPowers = new float[totalLights];
         double[] powers = new double[totalLights];
         ArrayList<RtReGIR.SectionLights> regirSections = new ArrayList<>(orderedSections.size());
 
@@ -56,6 +58,10 @@ final class RtLightHierarchy {
             for (int source = 0; source < section.lights.length;
                  source += SOURCE_FLOATS_PER_LIGHT, lightIndex++) {
                 int destination = lightIndex * GPU_FLOATS_PER_LIGHT;
+                int sectionDestination = lightIndex * 3;
+                lightSectionCoords[sectionDestination] = section.sectionX;
+                lightSectionCoords[sectionDestination + 1] = section.sectionY;
+                lightSectionCoords[sectionDestination + 2] = section.sectionZ;
                 float leR = section.lights[source + 16];
                 float leG = section.lights[source + 17];
                 float leB = section.lights[source + 18];
@@ -82,6 +88,9 @@ final class RtLightHierarchy {
             }
             sectionFirstLights[section.sectionSlot] = first;
             sectionLightCounts[section.sectionSlot] = count;
+            for (int i = first; i < lightIndex; i++) {
+                lightSectionPowers[i] = (float) sectionPower;
+            }
             if (sectionPower > 0.0) {
                 regirSections.add(new RtReGIR.SectionLights(first, count,
                         section.sectionX, section.sectionY, section.sectionZ, sectionPower));
@@ -105,7 +114,18 @@ final class RtLightHierarchy {
 
         RtReGIR.Data grid = totalLights > 0
                 ? RtReGIR.build(regirSections, rebaseX, rebaseY, rebaseZ, cancelled) : null;
-        return new Data(packedLights, globalAliases,
+        if (grid != null) {
+            int gridSectionX = (grid.originX() + rebaseX) / 16;
+            int gridSectionY = (grid.originY() + rebaseY) / 16;
+            int gridSectionZ = (grid.originZ() + rebaseZ) / 16;
+            for (int i = 0; i < totalLights; i++) {
+                int destination = i * 3;
+                lightSectionCoords[destination] -= gridSectionX;
+                lightSectionCoords[destination + 1] -= gridSectionY;
+                lightSectionCoords[destination + 2] -= gridSectionZ;
+            }
+        }
+        return new Data(packedLights, lightSectionCoords, lightSectionPowers, globalAliases,
                 sectionFirstLights, sectionLightCounts,
                 new AliasData(localAliasIndices, localAliasAccept,
                         localAliasSelfInvPdf, localAliasAliasInvPdf),
@@ -223,12 +243,17 @@ final class RtLightHierarchy {
         }
     }
 
-    record Data(float[] packedLights, AliasData globalAliases,
+    record Data(float[] packedLights, int[] lightSectionCoords, float[] lightSectionPowers,
+                AliasData globalAliases,
                 int[] sectionFirstLights, int[] sectionLightCounts,
                 AliasData localAliases, RtReGIR.Data grid, int lightCount,
                 int rebaseX, int rebaseY, int rebaseZ) {
         long lightBytes() {
             return Math.multiplyExact((long) packedLights.length, Float.BYTES);
+        }
+
+        long sectionMetadataBytes() {
+            return grid != null ? Math.multiplyExact((long) lightCount, 16L) : 0L;
         }
 
     }

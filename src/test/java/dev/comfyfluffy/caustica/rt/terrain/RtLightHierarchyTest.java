@@ -31,6 +31,17 @@ final class RtLightHierarchyTest {
         // Position is compacted into rebased world coordinates by the worker.
         assertEquals(0f, data.packedLights()[0], 0f);
         assertEquals(48f, data.packedLights()[2 * 16], 0f);
+        // Grid origin is section (-1,-2,-2), so metadata coordinates are grid-relative. Power is
+        // duplicated per light to make a globally selected light's reverse PDF a single direct load.
+        assertEquals(2, data.lightSectionCoords()[0]);
+        assertEquals(2, data.lightSectionCoords()[1]);
+        assertEquals(2, data.lightSectionCoords()[2]);
+        assertEquals(4f, data.lightSectionPowers()[0], 1.0e-6f);
+        assertEquals(5, data.lightSectionCoords()[6]);
+        assertEquals(4, data.lightSectionCoords()[7]);
+        assertEquals(3, data.lightSectionCoords()[8]);
+        assertEquals(2f, data.lightSectionPowers()[2], 1.0e-6f);
+        assertEquals(3L * 16L, data.sectionMetadataBytes());
     }
 
     @Test

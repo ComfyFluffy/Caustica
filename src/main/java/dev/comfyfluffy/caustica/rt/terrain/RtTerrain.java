@@ -239,6 +239,11 @@ public final class RtTerrain {
         return regir.published().lightAddress();
     }
 
+    /** Per-light section coordinate and power metadata for O(1) ReGIR reverse PDFs. */
+    public long lightSectionMetadataBufferAddress() {
+        return regir.published().sectionMetadataAddress();
+    }
+
     /** Power-weighted light alias table device address, or 0 for the shader's uniform fallback. */
     public long lightAliasBufferAddress() {
         return regir.published().globalAliasAddress();

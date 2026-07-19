@@ -53,6 +53,7 @@ final class RtReGIRTest {
         int count = data.cellCounts()[cell];
 
         assertEquals(2, count);
+        assertEquals(0.25f, data.cellInvWeightSums()[cell], 1.0e-6f);
         assertEquals(0.25, aliasProbability(data, first, count, 4), 1.0e-6);
         assertEquals(0.75, aliasProbability(data, first, count, 8), 1.0e-6);
         assertEquals(0.25f, data.spanSelfGlobalMasses()[first], 1.0e-6f);

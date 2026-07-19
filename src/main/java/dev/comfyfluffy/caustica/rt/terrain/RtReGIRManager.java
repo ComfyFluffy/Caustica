@@ -165,11 +165,13 @@ final class RtReGIRManager {
     private void submitUpload(RtContext ctx, long requestId, RtLightHierarchy.Data data) {
         RtReGIR.Data grid = data.grid();
         long lightBytes = data.lightBytes();
+        long sectionMetadataBytes = data.sectionMetadataBytes();
         long globalAliasBytes = data.globalAliases().bytes();
         long localAliasBytes = data.localAliases().bytes();
         long cellBytes = grid != null ? grid.cellBytes() : 0L;
         long spanBytes = grid != null ? grid.spanBytes() : 0L;
-        long uploadBytes = lightBytes + globalAliasBytes + localAliasBytes + cellBytes + spanBytes;
+        long uploadBytes = lightBytes + sectionMetadataBytes + globalAliasBytes
+                + localAliasBytes + cellBytes + spanBytes;
 
         Buffers buffers = new Buffers();
         RtBuffer upload = null;
@@ -177,6 +179,10 @@ final class RtReGIRManager {
             int usage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             buffers.lights = ctx.createAsyncBuffer(lightBytes, usage, false,
                     "terrain hierarchy lights " + requestId);
+            if (sectionMetadataBytes > 0L) {
+                buffers.sectionMetadata = ctx.createAsyncBuffer(sectionMetadataBytes, usage, false,
+                        "terrain hierarchy light section metadata " + requestId);
+            }
             buffers.globalAliases = ctx.createAsyncBuffer(globalAliasBytes, usage, false,
                     "terrain hierarchy global aliases " + requestId);
             buffers.localAliases = ctx.createAsyncBuffer(localAliasBytes, usage, false,
@@ -192,6 +198,16 @@ final class RtReGIRManager {
             long cursor = upload.mapped;
             MemoryUtil.memFloatBuffer(cursor, data.packedLights().length).put(data.packedLights());
             cursor += lightBytes;
+            if (sectionMetadataBytes > 0L) {
+                for (int i = 0; i < data.lightCount(); i++) {
+                    int coord = i * 3;
+                    MemoryUtil.memPutInt(cursor, data.lightSectionCoords()[coord]);
+                    MemoryUtil.memPutInt(cursor + 4, data.lightSectionCoords()[coord + 1]);
+                    MemoryUtil.memPutInt(cursor + 8, data.lightSectionCoords()[coord + 2]);
+                    MemoryUtil.memPutFloat(cursor + 12, data.lightSectionPowers()[i]);
+                    cursor += 16;
+                }
+            }
             writeAliases(cursor, data.globalAliases());
             cursor += globalAliasBytes;
             writeAliases(cursor, data.localAliases());
@@ -200,7 +216,8 @@ final class RtReGIRManager {
                 for (int i = 0; i < grid.cellOffsets().length; i++) {
                     MemoryUtil.memPutInt(cursor, grid.cellOffsets()[i]);
                     MemoryUtil.memPutInt(cursor + 4, grid.cellCounts()[i]);
-                    cursor += 8;
+                    MemoryUtil.memPutFloat(cursor + 8, grid.cellInvWeightSums()[i]);
+                    cursor += 12;
                 }
                 for (int i = 0; i < grid.spanFirstLights().length; i++) {
                     MemoryUtil.memPutInt(cursor, grid.spanFirstLights()[i]);
@@ -224,7 +241,8 @@ final class RtReGIRManager {
             try {
                 ctx.gpuExecutor().submit(
                         cmd -> recordUpload(cmd, submittedUpload, submittedBuffers,
-                                lightBytes, globalAliasBytes, localAliasBytes, cellBytes, spanBytes),
+                                lightBytes, sectionMetadataBytes, globalAliasBytes,
+                                localAliasBytes, cellBytes, spanBytes),
                         () -> { },
                         (build, failure) -> finishUpload(requestId, data,
                                 submittedUpload, submittedBuffers, build, failure));
@@ -269,7 +287,7 @@ final class RtReGIRManager {
     private void publish(RtContext ctx, Uploaded uploaded) {
         RtReGIR.Data grid = uploaded.data.grid();
         Buffers b = uploaded.buffers;
-        PublishedState next = new PublishedState(b.lights, b.globalAliases,
+        PublishedState next = new PublishedState(b.lights, b.sectionMetadata, b.globalAliases,
                 b.localAliases, b.cells, b.spans, uploaded.data.lightCount(),
                 grid != null ? grid.originX() : 0, grid != null ? grid.originY() : 0,
                 grid != null ? grid.originZ() : 0, grid != null ? grid.dimX() : 0,
@@ -354,13 +372,18 @@ final class RtReGIRManager {
     }
 
     private static void recordUpload(VkCommandBuffer cmd, RtBuffer upload, Buffers b,
-                                     long lightBytes, long globalAliasBytes, long localAliasBytes,
-                                     long cellBytes, long spanBytes) {
+                                     long lightBytes, long sectionMetadataBytes,
+                                     long globalAliasBytes, long localAliasBytes, long cellBytes,
+                                     long spanBytes) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCopy.Buffer region = VkBufferCopy.calloc(1, stack);
             long offset = 0L;
             copy(cmd, upload, b.lights, offset, lightBytes, region);
             offset += lightBytes;
+            if (sectionMetadataBytes > 0L) {
+                copy(cmd, upload, b.sectionMetadata, offset, sectionMetadataBytes, region);
+                offset += sectionMetadataBytes;
+            }
             copy(cmd, upload, b.globalAliases, offset, globalAliasBytes, region);
             offset += globalAliasBytes;
             copy(cmd, upload, b.localAliases, offset, localAliasBytes, region);
@@ -386,14 +409,18 @@ final class RtReGIRManager {
         }
     }
 
-    record PublishedState(RtBuffer lights, RtBuffer globalAliases, RtBuffer localAliases,
+    record PublishedState(RtBuffer lights, RtBuffer sectionMetadata,
+                          RtBuffer globalAliases, RtBuffer localAliases,
                           RtBuffer cells, RtBuffer spans, int lightCount,
                           int originX, int originY, int originZ, int dimX, int dimY, int dimZ,
                           int rebaseX, int rebaseY, int rebaseZ) {
         private static final PublishedState EMPTY = new PublishedState(
-                null, null, null, null, null, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                null, null, null, null, null, null, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         long lightAddress() { return lights != null ? lights.deviceAddress : 0L; }
+        long sectionMetadataAddress() {
+            return sectionMetadata != null ? sectionMetadata.deviceAddress : 0L;
+        }
         long globalAliasAddress() { return globalAliases != null ? globalAliases.deviceAddress : 0L; }
         long localAliasAddress() { return localAliases != null ? localAliases.deviceAddress : 0L; }
         long cellAddress() { return cells != null ? cells.deviceAddress : 0L; }
@@ -401,13 +428,15 @@ final class RtReGIRManager {
 
         private void retire(RtContext ctx, long lastGraphicsUse) {
             if (lights == null) return;
-            for (RtBuffer buffer : new RtBuffer[]{lights, globalAliases, localAliases, cells, spans}) {
+            for (RtBuffer buffer : new RtBuffer[]{
+                    lights, sectionMetadata, globalAliases, localAliases, cells, spans}) {
                 if (buffer != null) ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, buffer::destroy);
             }
         }
 
         private void destroy() {
-            for (RtBuffer buffer : new RtBuffer[]{lights, globalAliases, localAliases, cells, spans}) {
+            for (RtBuffer buffer : new RtBuffer[]{
+                    lights, sectionMetadata, globalAliases, localAliases, cells, spans}) {
                 if (buffer != null) buffer.destroy();
             }
         }
@@ -415,13 +444,15 @@ final class RtReGIRManager {
 
     private static final class Buffers {
         RtBuffer lights;
+        RtBuffer sectionMetadata;
         RtBuffer globalAliases;
         RtBuffer localAliases;
         RtBuffer cells;
         RtBuffer spans;
 
         void destroy() {
-            for (RtBuffer buffer : new RtBuffer[]{lights, globalAliases, localAliases, cells, spans}) {
+            for (RtBuffer buffer : new RtBuffer[]{
+                    lights, sectionMetadata, globalAliases, localAliases, cells, spans}) {
                 if (buffer != null) buffer.destroy();
             }
         }
