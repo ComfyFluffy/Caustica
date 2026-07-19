@@ -572,6 +572,10 @@ public final class CausticaConfig {
                     bool("caustica.rt.lightPowerSampling", "lights.power-sampling", true);
             public static final BooleanSetting REGIR_ENABLED =
                     bool("caustica.rt.regir", "lights.regir.enabled", true);
+            public static final BooleanSetting TEMPORAL_REUSE =
+                    bool("caustica.rt.restirTemporal", "lights.temporal-reuse", true);
+            public static final BooleanSetting TEMPORAL_PERMUTATION =
+                    bool("caustica.rt.restirPermutation", "lights.temporal-permutation", true);
             public static final FloatSetting MIN_FILL_RATIO =
                     finiteFloat("caustica.rt.lightMinFillRatio", "lights.min-fill-ratio", 0.25f);
             public static final BooleanSetting STATS = bool("caustica.rt.lightStats", "lights.stats", false);

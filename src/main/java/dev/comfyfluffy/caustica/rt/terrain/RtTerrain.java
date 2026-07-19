@@ -305,6 +305,11 @@ public final class RtTerrain {
         return regir.published().lightCount();
     }
 
+    /** Identity of the atomically published light hierarchy; changes invalidate temporal light samples. */
+    public long lightGeneration() {
+        return regir.published().generation();
+    }
+
     /** Per-tick residency update: window sync + dirty drain (plus the streaming fallback, see {@link #frame}). */
     public static void update(RtContext ctx) {
         INSTANCE.tick(ctx);

@@ -303,7 +303,8 @@ final class RtReGIRManager {
                 grid != null ? grid.originX() : 0, grid != null ? grid.originY() : 0,
                 grid != null ? grid.originZ() : 0, grid != null ? grid.dimX() : 0,
                 grid != null ? grid.dimY() : 0, grid != null ? grid.dimZ() : 0,
-                uploaded.data.rebaseX(), uploaded.data.rebaseY(), uploaded.data.rebaseZ());
+                uploaded.data.rebaseX(), uploaded.data.rebaseY(), uploaded.data.rebaseZ(),
+                uploaded.requestId);
         PublishedState old = published;
         // The executor's host-side timeline wait only proves that the transfer completed. It does not
         // establish device-memory visibility from the async queue to the graphics queue. Publish the
@@ -354,7 +355,7 @@ final class RtReGIRManager {
     private void publishEmpty(RtContext ctx, long requestId) {
         if (!isLatest(requestId)) return;
         PublishedState old = published;
-        published = PublishedState.EMPTY;
+        published = PublishedState.empty(requestId);
         old.retire(ctx, ctx.gpuExecutor().latestGraphicsUseValue());
     }
 
@@ -420,9 +421,14 @@ final class RtReGIRManager {
                           RtBuffer globalAliases, RtBuffer localAliases,
                           RtBuffer cells, RtBuffer spans, int lightCount,
                           int originX, int originY, int originZ, int dimX, int dimY, int dimZ,
-                          int rebaseX, int rebaseY, int rebaseZ) {
-        private static final PublishedState EMPTY = new PublishedState(
-                null, null, null, null, null, null, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                          int rebaseX, int rebaseY, int rebaseZ, long generation) {
+        private static final PublishedState EMPTY = empty(0L);
+
+        private static PublishedState empty(long generation) {
+            return new PublishedState(
+                    null, null, null, null, null, null, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, generation);
+        }
 
         long lightAddress() { return lights != null ? lights.deviceAddress : 0L; }
         long sectionMetadataAddress() {
