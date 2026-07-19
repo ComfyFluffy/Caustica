@@ -244,10 +244,6 @@ public final class RtTerrain {
         return regir.published().globalAliasAddress();
     }
 
-    public long lightSectionBufferAddress() {
-        return regir.published().sectionAddress();
-    }
-
     public long lightLocalAliasBufferAddress() {
         return regir.published().localAliasAddress();
     }

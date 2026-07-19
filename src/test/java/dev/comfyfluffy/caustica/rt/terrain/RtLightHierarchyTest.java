@@ -34,7 +34,7 @@ final class RtLightHierarchyTest {
     }
 
     @Test
-    void regirSpansReferenceSectionSlotsInsteadOfFlatLightRanges() {
+    void regirAliasSpansEmbedSortedFlatLightRanges() {
         RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
                 new RtLightHierarchy.SectionInput(9, 0, 0, 0, light(1f, 1f)),
                 new RtLightHierarchy.SectionInput(3, 1, 0, 0, light(1f, 1f))
@@ -47,8 +47,14 @@ final class RtLightHierarchyTest {
         int centerCell = (cellZ * grid.dimY() + cellY) * grid.dimX() + cellX;
         int firstSpan = grid.cellOffsets()[centerCell];
         assertEquals(2, grid.cellCounts()[centerCell]);
-        assertEquals(3, grid.spanSectionSlots()[firstSpan]);
-        assertEquals(9, grid.spanSectionSlots()[firstSpan + 1]);
+        assertEquals(0, grid.spanFirstLights()[firstSpan]);
+        assertEquals(1, grid.spanFirstLights()[firstSpan + 1]);
+        assertEquals(1, grid.spanLightCounts()[firstSpan]);
+        assertEquals(1, grid.spanLightCounts()[firstSpan + 1]);
+        assertEquals(0.5f, grid.spanSelfPdfs()[firstSpan], 1.0e-6f);
+        assertEquals(0.5f, grid.spanSelfPdfs()[firstSpan + 1], 1.0e-6f);
+        assertEquals(0.5f, grid.spanSelfGlobalMasses()[firstSpan], 1.0e-6f);
+        assertEquals(0.5f, grid.spanSelfGlobalMasses()[firstSpan + 1], 1.0e-6f);
     }
 
     @Test

@@ -54,7 +54,6 @@ public struct WorldPush {
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
     public uint64_t lightBufAddr;     // ReSTIR DI global light buffer (0 = none published)
     public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
-    public uint64_t lightSectionAddr; // section-slot -> contiguous light/local-alias range
     public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
     public float3   lightRebaseOffset; // hierarchy rebase origin minus current terrain rebase origin
     public uint64_t regirCellAddr;    // dense ReGIR cell headers (0 = global proposals only)
@@ -91,21 +90,19 @@ public struct ReGIRCell {
     public uint spanCount;
 };
 
-// Section-owned proposal metadata. The current first generation points into compact shared Light and
-// local-alias buffers; the shader contract is section-relative so those ranges can become independent
-// pages without changing ReGIR or reservoir sampling.
-public struct LightSection {
+// One Vose alias column for the section distribution of a cell. Self ranges remain sorted by global
+// light index, so the global proposal can recover the exact cell PDF with a metadata-only binary search.
+// Selection needs one 36-byte load and no dependent section-header or global-alias fetch.
+public struct ReGIRSpan {
     public uint firstLight;
     public uint lightCount;
-    public float power;
-    public uint reserved;
-};
-
-// One section reference in a cell. Spans are sorted by stable terrain section slot, and their CDF is
-// accumulated in that order. The section header owns the light range and local alias distribution.
-public struct ReGIRSpan {
-    public uint sectionSlot;
-    public float cdf;
+    public uint aliasFirstLight;
+    public uint aliasLightCount;
+    public float accept;
+    public float selfPdf;
+    public float aliasPdf;
+    public float selfGlobalMass;
+    public float aliasGlobalMass;
 };
 
 // TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).

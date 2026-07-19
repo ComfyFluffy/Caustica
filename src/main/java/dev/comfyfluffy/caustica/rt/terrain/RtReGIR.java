@@ -1,7 +1,7 @@
 package dev.comfyfluffy.caustica.rt.terrain;
 
-import java.util.concurrent.CancellationException;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -31,11 +31,13 @@ final class RtReGIR {
         int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
         int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
         int poweredCount = 0;
+        double globalPower = 0.0;
         for (int i = 0; i < sections.size(); i++) {
             if ((i & 255) == 0) checkCancelled(cancelled);
             SectionLights section = sections.get(i);
             if (!(section.power > 0.0)) continue;
             poweredCount++;
+            globalPower += section.power;
             minX = Math.min(minX, section.x - NEIGHBOR_RADIUS);
             minY = Math.min(minY, section.y - NEIGHBOR_RADIUS);
             minZ = Math.min(minZ, section.z - NEIGHBOR_RADIUS);
@@ -77,19 +79,30 @@ final class RtReGIR {
         }
 
         int populatedCells = 0;
+        int maxCellSpans = 0;
         int prefix = 0;
         for (int cell = 0; cell < volume; cell++) {
             cellOffsets[cell] = prefix;
             int count = cellCounts[cell];
             prefix += count;
-            if (count != 0) populatedCells++;
+            if (count != 0) {
+                populatedCells++;
+                maxCellSpans = Math.max(maxCellSpans, count);
+            }
         }
-        int[] spanSectionSlots = new int[prefix];
-        float[] spanCdfs = new float[prefix];
+        int[] spanFirstLights = new int[prefix];
+        int[] spanLightCounts = new int[prefix];
+        int[] spanAliasFirstLights = new int[prefix];
+        int[] spanAliasLightCounts = new int[prefix];
+        float[] spanAccept = new float[prefix];
+        float[] spanSelfPdfs = new float[prefix];
+        float[] spanAliasPdfs = new float[prefix];
+        float[] spanSelfGlobalMasses = new float[prefix];
+        float[] spanAliasGlobalMasses = new float[prefix];
         double[] spanWeights = new double[prefix];
         int[] writeOffsets = cellOffsets.clone();
 
-        // Sections arrive sorted by section slot. Appending sources in that order means every cell's
+        // Sections arrive sorted by first light. Appending sources in that order means every cell's
         // span range is already sorted, avoiding 125-element per-cell lists and sorts.
         for (int sourceIndex = 0; sourceIndex < sections.size(); sourceIndex++) {
             if ((sourceIndex & 63) == 0) checkCancelled(cancelled);
@@ -102,13 +115,19 @@ final class RtReGIR {
                                 + (source.y + dy - minY)) * dimX + (source.x + dx - minX);
                         int span = writeOffsets[linear]++;
                         double distanceSq = 16.0 * 16.0 * (dx * dx + dy * dy + dz * dz);
-                        spanSectionSlots[span] = source.sectionSlot;
+                        spanFirstLights[span] = source.firstLight;
+                        spanLightCounts[span] = source.lightCount;
+                        spanSelfGlobalMasses[span] = (float) (source.power / globalPower);
                         spanWeights[span] = source.power / Math.max(SECTION_DISTANCE_FLOOR_SQ, distanceSq);
                     }
                 }
             }
         }
 
+        double[] scaled = new double[maxCellSpans];
+        int[] small = new int[maxCellSpans];
+        int[] large = new int[maxCellSpans];
+        int[] aliases = new int[maxCellSpans];
         for (int cell = 0; cell < volume; cell++) {
             if ((cell & 4095) == 0) checkCancelled(cancelled);
             int first = cellOffsets[cell];
@@ -116,35 +135,71 @@ final class RtReGIR {
             if (count == 0) continue;
             double totalWeight = 0.0;
             for (int i = 0; i < count; i++) totalWeight += spanWeights[first + i];
-            double cumulative = 0.0;
+
+            int smallCount = 0;
+            int largeCount = 0;
             for (int i = 0; i < count; i++) {
-                cumulative += spanWeights[first + i] / totalWeight;
-                spanCdfs[first + i] = i + 1 == count ? 1.0f : (float) cumulative;
+                double probability = spanWeights[first + i] / totalWeight;
+                spanSelfPdfs[first + i] = (float) probability;
+                scaled[i] = probability * count;
+                if (scaled[i] < 1.0) small[smallCount++] = i;
+                else large[largeCount++] = i;
+            }
+            while (smallCount > 0 && largeCount > 0) {
+                int s = small[--smallCount];
+                int l = large[--largeCount];
+                spanAccept[first + s] = (float) scaled[s];
+                aliases[s] = l;
+                scaled[l] = scaled[l] + scaled[s] - 1.0;
+                if (scaled[l] < 1.0) small[smallCount++] = l;
+                else large[largeCount++] = l;
+            }
+            while (largeCount > 0) {
+                int i = large[--largeCount];
+                spanAccept[first + i] = 1.0f;
+                aliases[i] = i;
+            }
+            while (smallCount > 0) {
+                int i = small[--smallCount];
+                spanAccept[first + i] = 1.0f;
+                aliases[i] = i;
+            }
+            for (int i = 0; i < count; i++) {
+                int aliasSpan = first + aliases[i];
+                spanAliasFirstLights[first + i] = spanFirstLights[aliasSpan];
+                spanAliasLightCounts[first + i] = spanLightCounts[aliasSpan];
+                spanAliasPdfs[first + i] = spanSelfPdfs[aliasSpan];
+                spanAliasGlobalMasses[first + i] = spanSelfGlobalMasses[aliasSpan];
             }
         }
 
         return new Data(minX * 16 - rebaseX, minY * 16 - rebaseY, minZ * 16 - rebaseZ,
                 dimX, dimY, dimZ, cellOffsets, cellCounts,
-                spanSectionSlots, spanCdfs, populatedCells, spanCountLong);
+                spanFirstLights, spanLightCounts, spanAliasFirstLights, spanAliasLightCounts,
+                spanAccept, spanSelfPdfs, spanAliasPdfs,
+                spanSelfGlobalMasses, spanAliasGlobalMasses, populatedCells, spanCountLong);
     }
 
     private static void checkCancelled(BooleanSupplier cancelled) {
         if (cancelled.getAsBoolean()) throw new CancellationException("Superseded ReGIR build");
     }
 
-    record SectionLights(int sectionSlot, int x, int y, int z, double power) {
+    record SectionLights(int firstLight, int lightCount, int x, int y, int z, double power) {
     }
 
     record Data(int originX, int originY, int originZ, int dimX, int dimY, int dimZ,
                 int[] cellOffsets, int[] cellCounts,
-                int[] spanSectionSlots, float[] spanCdfs,
+                int[] spanFirstLights, int[] spanLightCounts,
+                int[] spanAliasFirstLights, int[] spanAliasLightCounts,
+                float[] spanAccept, float[] spanSelfPdfs, float[] spanAliasPdfs,
+                float[] spanSelfGlobalMasses, float[] spanAliasGlobalMasses,
                 int populatedCells, long representedSections) {
         long cellBytes() {
             return Math.multiplyExact((long) cellOffsets.length, 8L);
         }
 
         long spanBytes() {
-            return Math.multiplyExact((long) spanSectionSlots.length, 8L);
+            return Math.multiplyExact((long) spanFirstLights.length, 36L);
         }
     }
 }

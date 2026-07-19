@@ -452,25 +452,17 @@ float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 p
 
 // Select one light from the emitted-power distribution in O(1).
 void selectGlobalLight(inout uint proposalSeed, out uint lightIndex, out float invSourcePdf) {
-    uint column = min(uint(rndf(proposalSeed) * float(worldPush.lightCount)),
-            worldPush.lightCount - 1u);
+    float aliasSample = rndf(proposalSeed) * float(worldPush.lightCount);
+    uint column = min(uint(aliasSample), worldPush.lightCount - 1u);
     if (worldPush.lightAliasAddr != 0) {
         LightAlias a = ConstPtr<LightAlias>(worldPush.lightAliasAddr)[column];
-        bool self = rndf(proposalSeed) < a.accept;
+        bool self = aliasSample - float(column) < a.accept;
         lightIndex = self ? column : a.aliasIndex;
         invSourcePdf = self ? a.selfInvPdf : a.aliasInvPdf;
     } else {
         lightIndex = column;
         invSourcePdf = float(worldPush.lightCount);
     }
-}
-
-float globalLightPdf(uint lightIndex) {
-    if (worldPush.lightAliasAddr != 0) {
-        float invPdf = ConstPtr<LightAlias>(worldPush.lightAliasAddr)[lightIndex].selfInvPdf;
-        return invPdf > 0.0 ? 1.0 / invPdf : 0.0;
-    }
-    return 1.0 / float(worldPush.lightCount);
 }
 
 bool findReGIRCell(float3 p, out ReGIRCell cell) {
@@ -488,24 +480,25 @@ bool findReGIRCell(float3 p, out ReGIRCell cell) {
     return cell.spanCount > 0u;
 }
 
-float sectionLightPdf(LightSection section, uint lightIndex) {
-    if (lightIndex < section.firstLight || lightIndex >= section.firstLight + section.lightCount) {
+float sectionLightPdf(uint firstLight, uint lightCount, uint lightIndex) {
+    if (lightIndex < firstLight || lightIndex >= firstLight + lightCount) {
         return 0.0;
     }
-    uint localIndex = lightIndex - section.firstLight;
+    uint localIndex = lightIndex - firstLight;
     float invPdf = ConstPtr<LightAlias>(worldPush.lightLocalAliasAddr)
-            [section.firstLight + localIndex].selfInvPdf;
+            [firstLight + localIndex].selfInvPdf;
     return invPdf > 0.0 ? 1.0 / invPdf : 0.0;
 }
 
-void selectSectionLight(LightSection section, inout uint proposalSeed,
+void selectSectionLight(uint firstLight, uint lightCount, inout uint proposalSeed,
                         out uint lightIndex, out float localPdf) {
-    uint column = min(uint(rndf(proposalSeed) * float(section.lightCount)), section.lightCount - 1u);
-    LightAlias alias = ConstPtr<LightAlias>(worldPush.lightLocalAliasAddr)[section.firstLight + column];
-    bool self = rndf(proposalSeed) < alias.accept;
+    float aliasSample = rndf(proposalSeed) * float(lightCount);
+    uint column = min(uint(aliasSample), lightCount - 1u);
+    LightAlias alias = ConstPtr<LightAlias>(worldPush.lightLocalAliasAddr)[firstLight + column];
+    bool self = aliasSample - float(column) < alias.accept;
     uint localIndex = self ? column : alias.aliasIndex;
     float invPdf = self ? alias.selfInvPdf : alias.aliasInvPdf;
-    lightIndex = section.firstLight + localIndex;
+    lightIndex = firstLight + localIndex;
     localPdf = invPdf > 0.0 ? 1.0 / invPdf : 0.0;
 }
 
@@ -516,8 +509,7 @@ bool reGIRCellPdf(ReGIRCell cell, uint lightIndex, out float localPdf) {
     while (lo < hi) {
         uint mid = (lo + hi) >> 1u;
         ReGIRSpan span = spans[cell.spanOffset + mid];
-        LightSection section = ConstPtr<LightSection>(worldPush.lightSectionAddr)[span.sectionSlot];
-        if (section.firstLight + section.lightCount <= lightIndex) lo = mid + 1u;
+        if (span.firstLight + span.lightCount <= lightIndex) lo = mid + 1u;
         else hi = mid;
     }
     if (lo >= cell.spanCount) {
@@ -525,42 +517,38 @@ bool reGIRCellPdf(ReGIRCell cell, uint lightIndex, out float localPdf) {
         return false;
     }
     ReGIRSpan span = spans[cell.spanOffset + lo];
-    LightSection section = ConstPtr<LightSection>(worldPush.lightSectionAddr)[span.sectionSlot];
-    float lightPdf = sectionLightPdf(section, lightIndex);
+    float lightPdf = sectionLightPdf(span.firstLight, span.lightCount, lightIndex);
     if (lightPdf <= 0.0) {
         localPdf = 0.0;
         return false;
     }
-    float previousCdf = lo > 0u ? spans[cell.spanOffset + lo - 1u].cdf : 0.0;
-    localPdf = max(span.cdf - previousCdf, 0.0) * lightPdf;
+    localPdf = span.selfPdf * lightPdf;
     return localPdf > 0.0;
 }
 
 void selectReGIRSpanLight(ReGIRCell cell, inout uint proposalSeed,
-                          out uint lightIndex, out float localPdf) {
+                          out uint lightIndex, out float localPdf, out float globalPdf) {
     ConstPtr<ReGIRSpan> spans = ConstPtr<ReGIRSpan>(worldPush.regirSpanAddr);
-    float u = rndf(proposalSeed);
-    uint lo = 0u;
-    uint hi = cell.spanCount;
-    while (lo < hi) {
-        uint mid = (lo + hi) >> 1u;
-        if (spans[cell.spanOffset + mid].cdf < u) lo = mid + 1u;
-        else hi = mid;
-    }
-    uint spanIndex = min(lo, cell.spanCount - 1u);
-    ReGIRSpan span = spans[cell.spanOffset + spanIndex];
-    float previousCdf = spanIndex > 0u
-            ? spans[cell.spanOffset + spanIndex - 1u].cdf : 0.0;
-    LightSection section = ConstPtr<LightSection>(worldPush.lightSectionAddr)[span.sectionSlot];
+    float aliasSample = rndf(proposalSeed) * float(cell.spanCount);
+    uint column = min(uint(aliasSample), cell.spanCount - 1u);
+    ReGIRSpan span = spans[cell.spanOffset + column];
+    bool self = aliasSample - float(column) < span.accept;
+    uint firstLight = self ? span.firstLight : span.aliasFirstLight;
+    uint lightCount = self ? span.lightCount : span.aliasLightCount;
+    float sectionPdf = self ? span.selfPdf : span.aliasPdf;
+    float sectionGlobalMass = self ? span.selfGlobalMass : span.aliasGlobalMass;
     float lightPdf;
-    selectSectionLight(section, proposalSeed, lightIndex, lightPdf);
-    localPdf = max(span.cdf - previousCdf, 0.0) * lightPdf;
+    selectSectionLight(firstLight, lightCount, proposalSeed, lightIndex, lightPdf);
+    localPdf = sectionPdf * lightPdf;
+    globalPdf = worldPush.lightAliasAddr != 0
+            ? sectionGlobalMass * lightPdf : 1.0 / float(worldPush.lightCount);
 }
 
 // Sample the exact mixture q = alpha*qCell + (1-alpha)*qGlobal. qCell first selects a nearby section
 // by emitted power and section distance, then its section-local power alias. Every light in
 // the neighborhood is represented without a fixed cap; qGlobal gives distant lights full support.
-// Sorted spans make both weighted selection and the global branch's qCell lookup logarithmic.
+// Alias spans make weighted local selection O(1); sorted self ranges keep the global branch's exact
+// qCell lookup logarithmic without dependent section-header loads.
 void selectReGIRLight(ReGIRCell cell, bool hasCell, inout uint proposalSeed,
                       out uint lightIndex, out float invSourcePdf) {
     static const float LOCAL_PROBABILITY = 0.75;
@@ -572,8 +560,7 @@ void selectReGIRLight(ReGIRCell cell, bool hasCell, inout uint proposalSeed,
     float localPdf;
     float globalPdf;
     if (rndf(proposalSeed) < LOCAL_PROBABILITY) {
-        selectReGIRSpanLight(cell, proposalSeed, lightIndex, localPdf);
-        globalPdf = globalLightPdf(lightIndex);
+        selectReGIRSpanLight(cell, proposalSeed, lightIndex, localPdf, globalPdf);
     } else {
         float invGlobalPdf;
         selectGlobalLight(proposalSeed, lightIndex, invGlobalPdf);

@@ -7,10 +7,9 @@ import java.util.concurrent.CancellationException;
 import java.util.function.BooleanSupplier;
 
 /**
- * Worker-side immutable light hierarchy builder. The first hierarchy generation keeps light records
- * compact in one buffer, but all proposal metadata is section-owned: a section header names its
- * contiguous light range and local alias range, and ReGIR cells name section slots. This boundary lets
- * the compact ranges become independently allocated pages later without changing the shader sampler.
+ * Worker-side immutable light hierarchy builder. Lights remain compact and ordered by stable section
+ * slot; section-local aliases share the same ranges. ReGIR embeds those ranges in per-cell alias columns,
+ * avoiding a dependent section-header fetch in the shader while preserving exact proposal PDFs.
  */
 final class RtLightHierarchy {
     static final int SOURCE_FLOATS_PER_LIGHT = RtLightCollector.FLOATS_PER_LIGHT;
@@ -40,7 +39,6 @@ final class RtLightHierarchy {
 
         int[] sectionFirstLights = new int[sectionCapacity];
         int[] sectionLightCounts = new int[sectionCapacity];
-        float[] sectionPowers = new float[sectionCapacity];
         float[] packedLights = new float[Math.multiplyExact(totalLights, GPU_FLOATS_PER_LIGHT)];
         double[] powers = new double[totalLights];
         ArrayList<RtReGIR.SectionLights> regirSections = new ArrayList<>(orderedSections.size());
@@ -84,9 +82,8 @@ final class RtLightHierarchy {
             }
             sectionFirstLights[section.sectionSlot] = first;
             sectionLightCounts[section.sectionSlot] = count;
-            sectionPowers[section.sectionSlot] = (float) sectionPower;
             if (sectionPower > 0.0) {
-                regirSections.add(new RtReGIR.SectionLights(section.sectionSlot,
+                regirSections.add(new RtReGIR.SectionLights(first, count,
                         section.sectionX, section.sectionY, section.sectionZ, sectionPower));
             }
         }
@@ -109,7 +106,7 @@ final class RtLightHierarchy {
         RtReGIR.Data grid = totalLights > 0
                 ? RtReGIR.build(regirSections, rebaseX, rebaseY, rebaseZ, cancelled) : null;
         return new Data(packedLights, globalAliases,
-                sectionFirstLights, sectionLightCounts, sectionPowers,
+                sectionFirstLights, sectionLightCounts,
                 new AliasData(localAliasIndices, localAliasAccept,
                         localAliasSelfInvPdf, localAliasAliasInvPdf),
                 grid, totalLights, rebaseX, rebaseY, rebaseZ);
@@ -227,15 +224,12 @@ final class RtLightHierarchy {
     }
 
     record Data(float[] packedLights, AliasData globalAliases,
-                int[] sectionFirstLights, int[] sectionLightCounts, float[] sectionPowers,
+                int[] sectionFirstLights, int[] sectionLightCounts,
                 AliasData localAliases, RtReGIR.Data grid, int lightCount,
                 int rebaseX, int rebaseY, int rebaseZ) {
         long lightBytes() {
             return Math.multiplyExact((long) packedLights.length, Float.BYTES);
         }
 
-        long sectionBytes() {
-            return Math.multiplyExact((long) sectionFirstLights.length, 16L);
-        }
     }
 }
