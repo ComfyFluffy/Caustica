@@ -39,6 +39,13 @@ final class RtReGIRManager {
         return !completions.isEmpty();
     }
 
+    /** True only when no worker/upload owns a generation and no completion is waiting to be published. */
+    boolean isIdle() {
+        synchronized (taskLock) {
+            return activeTasks == 0 && completions.isEmpty();
+        }
+    }
+
     /** Replace any not-yet-started hierarchy snapshot; an in-progress older result self-discards. */
     void request(Input input) {
         synchronized (buildLock) {
@@ -139,7 +146,8 @@ final class RtReGIRManager {
                 }
                 try {
                     RtLightHierarchy.Data data = RtLightHierarchy.build(request.input.sections,
-                            request.input.rebaseX, request.input.rebaseY, request.input.rebaseZ);
+                            request.input.rebaseX, request.input.rebaseY, request.input.rebaseZ,
+                            () -> !isLatest(request.requestId));
                     if (isLatest(request.requestId)) {
                         completions.add(new Prepared(request.requestId, data, null));
                     }

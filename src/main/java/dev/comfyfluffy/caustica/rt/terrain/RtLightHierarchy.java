@@ -3,6 +3,8 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CancellationException;
+import java.util.function.BooleanSupplier;
 
 /**
  * Worker-side immutable light hierarchy builder. The first hierarchy generation keeps light records
@@ -18,13 +20,22 @@ final class RtLightHierarchy {
     }
 
     static Data build(List<SectionInput> sections, int rebaseX, int rebaseY, int rebaseZ) {
-        ArrayList<SectionInput> orderedSections = new ArrayList<>(sections);
-        orderedSections.sort(Comparator.comparingInt(SectionInput::sectionSlot));
+        return build(sections, rebaseX, rebaseY, rebaseZ, () -> false);
+    }
+
+    static Data build(List<SectionInput> sections, int rebaseX, int rebaseY, int rebaseZ,
+                      BooleanSupplier cancelled) {
+        List<SectionInput> orderedSections = orderedSections(sections, cancelled);
         int sectionCapacity = 0;
         int totalLights = 0;
-        for (SectionInput section : orderedSections) {
+        int maxSectionLights = 0;
+        for (int i = 0; i < orderedSections.size(); i++) {
+            if ((i & 255) == 0) checkCancelled(cancelled);
+            SectionInput section = orderedSections.get(i);
+            int count = lightCount(section.lights);
             sectionCapacity = Math.max(sectionCapacity, section.sectionSlot + 1);
-            totalLights = Math.addExact(totalLights, lightCount(section.lights));
+            totalLights = Math.addExact(totalLights, count);
+            maxSectionLights = Math.max(maxSectionLights, count);
         }
 
         int[] sectionFirstLights = new int[sectionCapacity];
@@ -35,7 +46,9 @@ final class RtLightHierarchy {
         ArrayList<RtReGIR.SectionLights> regirSections = new ArrayList<>(orderedSections.size());
 
         int lightIndex = 0;
-        for (SectionInput section : orderedSections) {
+        for (int sectionIndex = 0; sectionIndex < orderedSections.size(); sectionIndex++) {
+            if ((sectionIndex & 63) == 0) checkCancelled(cancelled);
+            SectionInput section = orderedSections.get(sectionIndex);
             int count = lightCount(section.lights);
             int first = lightIndex;
             double sectionPower = 0.0;
@@ -72,31 +85,29 @@ final class RtLightHierarchy {
             sectionFirstLights[section.sectionSlot] = first;
             sectionLightCounts[section.sectionSlot] = count;
             sectionPowers[section.sectionSlot] = (float) sectionPower;
-            regirSections.add(new RtReGIR.SectionLights(section.sectionSlot,
-                    section.sectionX, section.sectionY, section.sectionZ, sectionPower));
+            if (sectionPower > 0.0) {
+                regirSections.add(new RtReGIR.SectionLights(section.sectionSlot,
+                        section.sectionX, section.sectionY, section.sectionZ, sectionPower));
+            }
         }
 
-        AliasData globalAliases = buildAlias(powers, 0, totalLights);
+        AliasData globalAliases = buildAlias(powers, 0, totalLights, cancelled);
         int[] localAliasIndices = new int[totalLights];
         float[] localAliasAccept = new float[totalLights];
         float[] localAliasSelfInvPdf = new float[totalLights];
         float[] localAliasAliasInvPdf = new float[totalLights];
+        AliasScratch localScratch = new AliasScratch(maxSectionLights);
         for (int slot = 0; slot < sectionCapacity; slot++) {
+            if ((slot & 255) == 0) checkCancelled(cancelled);
             int count = sectionLightCounts[slot];
             if (count == 0) continue;
             int first = sectionFirstLights[slot];
-            AliasData local = buildAlias(powers, first, count);
-            for (int i = 0; i < count; i++) {
-                int destination = first + i;
-                localAliasIndices[destination] = local.aliasIndices[i];
-                localAliasAccept[destination] = local.accept[i];
-                localAliasSelfInvPdf[destination] = local.selfInvPdf[i];
-                localAliasAliasInvPdf[destination] = local.aliasInvPdf[i];
-            }
+            buildAliasInto(powers, first, count, localAliasIndices, localAliasAccept,
+                    localAliasSelfInvPdf, localAliasAliasInvPdf, first, localScratch, cancelled);
         }
 
         RtReGIR.Data grid = totalLights > 0
-                ? RtReGIR.build(regirSections, rebaseX, rebaseY, rebaseZ) : null;
+                ? RtReGIR.build(regirSections, rebaseX, rebaseY, rebaseZ, cancelled) : null;
         return new Data(packedLights, globalAliases,
                 sectionFirstLights, sectionLightCounts, sectionPowers,
                 new AliasData(localAliasIndices, localAliasAccept,
@@ -108,50 +119,98 @@ final class RtLightHierarchy {
         return lights != null ? lights.length / SOURCE_FLOATS_PER_LIGHT : 0;
     }
 
-    private static AliasData buildAlias(double[] powers, int offset, int count) {
+    private static List<SectionInput> orderedSections(List<SectionInput> sections,
+                                                      BooleanSupplier cancelled) {
+        int previousSlot = -1;
+        for (int i = 0; i < sections.size(); i++) {
+            if ((i & 255) == 0) checkCancelled(cancelled);
+            int slot = sections.get(i).sectionSlot;
+            if (slot < previousSlot) {
+                ArrayList<SectionInput> ordered = new ArrayList<>(sections);
+                ordered.sort(Comparator.comparingInt(SectionInput::sectionSlot));
+                return ordered;
+            }
+            previousSlot = slot;
+        }
+        return sections;
+    }
+
+    private static AliasData buildAlias(double[] powers, int offset, int count,
+                                        BooleanSupplier cancelled) {
         int[] alias = new int[count];
         float[] accept = new float[count];
         float[] selfInvPdf = new float[count];
         float[] aliasInvPdf = new float[count];
-        if (count == 0) return new AliasData(alias, accept, selfInvPdf, aliasInvPdf);
+        buildAliasInto(powers, offset, count, alias, accept, selfInvPdf, aliasInvPdf,
+                0, new AliasScratch(count), cancelled);
+        return new AliasData(alias, accept, selfInvPdf, aliasInvPdf);
+    }
 
+    private static void buildAliasInto(double[] powers, int powerOffset, int count,
+                                       int[] alias, float[] accept, float[] selfInvPdf,
+                                       float[] aliasInvPdf, int destinationOffset,
+                                       AliasScratch scratch, BooleanSupplier cancelled) {
+        if (count == 0) return;
         double total = 0.0;
-        for (int i = 0; i < count; i++) total += powers[offset + i];
-        if (!(total > 0.0)) return new AliasData(alias, accept, selfInvPdf, aliasInvPdf);
+        for (int i = 0; i < count; i++) {
+            if ((i & 1023) == 0) checkCancelled(cancelled);
+            total += powers[powerOffset + i];
+        }
+        if (!(total > 0.0)) return;
 
-        double[] scaled = new double[count];
-        int[] small = new int[count];
-        int[] large = new int[count];
+        double[] scaled = scratch.scaled;
+        int[] small = scratch.small;
+        int[] large = scratch.large;
         int smallCount = 0;
         int largeCount = 0;
         for (int i = 0; i < count; i++) {
-            double power = powers[offset + i];
+            double power = powers[powerOffset + i];
             scaled[i] = power * count / total;
-            selfInvPdf[i] = power > 0.0 ? (float) (total / power) : 0.0f;
+            selfInvPdf[destinationOffset + i] = power > 0.0 ? (float) (total / power) : 0.0f;
             if (scaled[i] < 1.0) small[smallCount++] = i;
             else large[largeCount++] = i;
         }
         while (smallCount > 0 && largeCount > 0) {
             int s = small[--smallCount];
             int l = large[--largeCount];
-            accept[s] = (float) scaled[s];
-            alias[s] = l;
+            accept[destinationOffset + s] = (float) scaled[s];
+            alias[destinationOffset + s] = l;
             scaled[l] = scaled[l] + scaled[s] - 1.0;
             if (scaled[l] < 1.0) small[smallCount++] = l;
             else large[largeCount++] = l;
         }
         while (largeCount > 0) {
             int i = large[--largeCount];
-            accept[i] = 1.0f;
-            alias[i] = i;
+            accept[destinationOffset + i] = 1.0f;
+            alias[destinationOffset + i] = i;
         }
         while (smallCount > 0) {
             int i = small[--smallCount];
-            accept[i] = 1.0f;
-            alias[i] = i;
+            accept[destinationOffset + i] = 1.0f;
+            alias[destinationOffset + i] = i;
         }
-        for (int i = 0; i < count; i++) aliasInvPdf[i] = selfInvPdf[alias[i]];
-        return new AliasData(alias, accept, selfInvPdf, aliasInvPdf);
+        for (int i = 0; i < count; i++) {
+            aliasInvPdf[destinationOffset + i] =
+                    selfInvPdf[destinationOffset + alias[destinationOffset + i]];
+        }
+    }
+
+    private static void checkCancelled(BooleanSupplier cancelled) {
+        if (cancelled.getAsBoolean()) {
+            throw new CancellationException("Superseded light hierarchy build");
+        }
+    }
+
+    private static final class AliasScratch {
+        final double[] scaled;
+        final int[] small;
+        final int[] large;
+
+        AliasScratch(int capacity) {
+            scaled = new double[capacity];
+            small = new int[capacity];
+            large = new int[capacity];
+        }
     }
 
     record SectionInput(int sectionSlot, int sectionX, int sectionY, int sectionZ, float[] lights) {

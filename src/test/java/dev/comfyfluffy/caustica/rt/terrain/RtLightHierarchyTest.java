@@ -3,8 +3,10 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.concurrent.CancellationException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 final class RtLightHierarchyTest {
     @Test
@@ -39,8 +41,14 @@ final class RtLightHierarchyTest {
         ), 0, 0, 0);
 
         RtReGIR.Data grid = data.grid();
-        assertEquals(3, grid.spanSectionSlots()[0]);
-        assertEquals(9, grid.spanSectionSlots()[1]);
+        int cellX = -grid.originX() / 16;
+        int cellY = -grid.originY() / 16;
+        int cellZ = -grid.originZ() / 16;
+        int centerCell = (cellZ * grid.dimY() + cellY) * grid.dimX() + cellX;
+        int firstSpan = grid.cellOffsets()[centerCell];
+        assertEquals(2, grid.cellCounts()[centerCell]);
+        assertEquals(3, grid.spanSectionSlots()[firstSpan]);
+        assertEquals(9, grid.spanSectionSlots()[firstSpan + 1]);
     }
 
     @Test
@@ -55,6 +63,15 @@ final class RtLightHierarchyTest {
                 oldGeneration.packedLights()[0] + oldToCurrent, 0f);
         assertEquals(rebuiltGeneration.grid().originX(),
                 oldGeneration.grid().originX() + oldToCurrent, 0f);
+    }
+
+    @Test
+    void supersededBuildStopsCooperatively() {
+        List<RtLightHierarchy.SectionInput> sections = List.of(
+                new RtLightHierarchy.SectionInput(0, 0, 0, 0, light(1f, 1f)));
+
+        assertThrows(CancellationException.class,
+                () -> RtLightHierarchy.build(sections, 0, 0, 0, () -> true));
     }
 
     private static float[] light(float area, float radiance) {

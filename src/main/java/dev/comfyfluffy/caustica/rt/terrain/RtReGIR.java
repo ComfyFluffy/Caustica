@@ -1,13 +1,8 @@
 package dev.comfyfluffy.caustica.rt.terrain;
 
-import it.unimi.dsi.fastutil.floats.FloatArrayList;
-import it.unimi.dsi.fastutil.ints.IntArrayList;
-import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
-
-import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.concurrent.CancellationException;
 import java.util.List;
+import java.util.function.BooleanSupplier;
 
 /**
  * CPU builder for the section-sized ReGIR proposal grid. Every nearby light remains eligible, but a
@@ -23,45 +18,32 @@ final class RtReGIR {
     }
 
     static Data build(List<SectionLights> sections, int rebaseX, int rebaseY, int rebaseZ) {
-        if (sections.isEmpty()) {
-            return null;
-        }
+        return build(sections, rebaseX, rebaseY, rebaseZ, () -> false);
+    }
 
-        Long2ObjectOpenHashMap<SourceSection> bySection = new Long2ObjectOpenHashMap<>(sections.size());
-        for (SectionLights section : sections) {
-            bySection.put(RtTerrain.sectionKey(section.x, section.y, section.z),
-                    new SourceSection(section));
-        }
-        // A cell is useful only near an emitter. Materializing the entire render-distance volume on
-        // every streaming publication would make the CPU build grow with all geometry, even though a
-        // far, unlit cell is already well served by the global proposal.
-        LongOpenHashSet activeKeys = new LongOpenHashSet();
-        for (SectionLights source : sections) {
-            if (!(source.power > 0.0)) continue;
-            for (int dz = -NEIGHBOR_RADIUS; dz <= NEIGHBOR_RADIUS; dz++) {
-                for (int dy = -NEIGHBOR_RADIUS; dy <= NEIGHBOR_RADIUS; dy++) {
-                    for (int dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
-                        long key = RtTerrain.sectionKey(source.x + dx, source.y + dy, source.z + dz);
-                        if (bySection.containsKey(key)) activeKeys.add(key);
-                    }
-                }
-            }
-        }
-        if (activeKeys.isEmpty()) return null;
-        SectionLights[] active = new SectionLights[activeKeys.size()];
-        int activeCount = 0;
+    static Data build(List<SectionLights> sections, int rebaseX, int rebaseY, int rebaseZ,
+                      BooleanSupplier cancelled) {
+        if (sections.isEmpty()) return null;
+
+        // Only powered sections enter this builder. Their +/-2-section extents define the cells that
+        // can use a local proposal; unlit terrain residency is irrelevant and no longer needs to be
+        // copied or hashed on every light update.
         int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
         int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
-        for (SectionLights section : sections) {
-            if (!activeKeys.contains(RtTerrain.sectionKey(section.x, section.y, section.z))) continue;
-            active[activeCount++] = section;
-            minX = Math.min(minX, section.x);
-            minY = Math.min(minY, section.y);
-            minZ = Math.min(minZ, section.z);
-            maxX = Math.max(maxX, section.x);
-            maxY = Math.max(maxY, section.y);
-            maxZ = Math.max(maxZ, section.z);
+        int poweredCount = 0;
+        for (int i = 0; i < sections.size(); i++) {
+            if ((i & 255) == 0) checkCancelled(cancelled);
+            SectionLights section = sections.get(i);
+            if (!(section.power > 0.0)) continue;
+            poweredCount++;
+            minX = Math.min(minX, section.x - NEIGHBOR_RADIUS);
+            minY = Math.min(minY, section.y - NEIGHBOR_RADIUS);
+            minZ = Math.min(minZ, section.z - NEIGHBOR_RADIUS);
+            maxX = Math.max(maxX, section.x + NEIGHBOR_RADIUS);
+            maxY = Math.max(maxY, section.y + NEIGHBOR_RADIUS);
+            maxZ = Math.max(maxZ, section.z + NEIGHBOR_RADIUS);
         }
+        if (poweredCount == 0) return null;
         int dimX = Math.addExact(Math.subtractExact(maxX, minX), 1);
         int dimY = Math.addExact(Math.subtractExact(maxY, minY), 1);
         int dimZ = Math.addExact(Math.subtractExact(maxZ, minZ), 1);
@@ -74,61 +56,83 @@ final class RtReGIR {
         int volume = (int) volumeLong;
         int[] cellOffsets = new int[volume];
         int[] cellCounts = new int[volume];
-        IntArrayList spanSectionSlots = new IntArrayList();
-        FloatArrayList spanCdfs = new FloatArrayList();
-        ArrayList<WeightedSpan> selected = new ArrayList<>(125);
-        int populatedCells = 0;
-        long representedSections = 0L;
-
-        for (int cellIndex = 0; cellIndex < activeCount; cellIndex++) {
-            SectionLights cell = active[cellIndex];
-            selected.clear();
+        long spanCountLong = 0L;
+        for (int sourceIndex = 0; sourceIndex < sections.size(); sourceIndex++) {
+            if ((sourceIndex & 63) == 0) checkCancelled(cancelled);
+            SectionLights source = sections.get(sourceIndex);
+            if (!(source.power > 0.0)) continue;
             for (int dz = -NEIGHBOR_RADIUS; dz <= NEIGHBOR_RADIUS; dz++) {
                 for (int dy = -NEIGHBOR_RADIUS; dy <= NEIGHBOR_RADIUS; dy++) {
                     for (int dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
-                        SourceSection source = bySection.get(RtTerrain.sectionKey(
-                                cell.x + dx, cell.y + dy, cell.z + dz));
-                        if (source == null || !(source.lights.power > 0.0)) continue;
-                        double distanceSq = 16.0 * 16.0 * (dx * dx + dy * dy + dz * dz);
-                        double weight = source.lights.power / Math.max(SECTION_DISTANCE_FLOOR_SQ, distanceSq);
-                        selected.add(new WeightedSpan(source.lights.sectionSlot, weight));
+                        int linear = ((source.z + dz - minZ) * dimY
+                                + (source.y + dy - minY)) * dimX + (source.x + dx - minX);
+                        cellCounts[linear]++;
+                        spanCountLong++;
                     }
                 }
             }
-
-            if (selected.isEmpty()) continue;
-            selected.sort(Comparator.comparingInt(WeightedSpan::sectionSlot));
-            double totalWeight = 0.0;
-            for (WeightedSpan span : selected) totalWeight += span.weight;
-
-            int linear = ((cell.z - minZ) * dimY + (cell.y - minY)) * dimX + (cell.x - minX);
-            cellOffsets[linear] = spanSectionSlots.size();
-            cellCounts[linear] = selected.size();
-            double cumulative = 0.0;
-            for (int spanIndex = 0; spanIndex < selected.size(); spanIndex++) {
-                WeightedSpan span = selected.get(spanIndex);
-                cumulative += span.weight / totalWeight;
-                spanSectionSlots.add(span.sectionSlot);
-                spanCdfs.add(spanIndex + 1 == selected.size() ? 1.0f : (float) cumulative);
-                representedSections++;
-            }
-            populatedCells++;
+        }
+        if (spanCountLong > Integer.MAX_VALUE) {
+            throw new IllegalStateException("ReGIR span count exceeds Java array capacity: " + spanCountLong);
         }
 
-        if (spanSectionSlots.isEmpty()) return null;
+        int populatedCells = 0;
+        int prefix = 0;
+        for (int cell = 0; cell < volume; cell++) {
+            cellOffsets[cell] = prefix;
+            int count = cellCounts[cell];
+            prefix += count;
+            if (count != 0) populatedCells++;
+        }
+        int[] spanSectionSlots = new int[prefix];
+        float[] spanCdfs = new float[prefix];
+        double[] spanWeights = new double[prefix];
+        int[] writeOffsets = cellOffsets.clone();
+
+        // Sections arrive sorted by section slot. Appending sources in that order means every cell's
+        // span range is already sorted, avoiding 125-element per-cell lists and sorts.
+        for (int sourceIndex = 0; sourceIndex < sections.size(); sourceIndex++) {
+            if ((sourceIndex & 63) == 0) checkCancelled(cancelled);
+            SectionLights source = sections.get(sourceIndex);
+            if (!(source.power > 0.0)) continue;
+            for (int dz = -NEIGHBOR_RADIUS; dz <= NEIGHBOR_RADIUS; dz++) {
+                for (int dy = -NEIGHBOR_RADIUS; dy <= NEIGHBOR_RADIUS; dy++) {
+                    for (int dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
+                        int linear = ((source.z + dz - minZ) * dimY
+                                + (source.y + dy - minY)) * dimX + (source.x + dx - minX);
+                        int span = writeOffsets[linear]++;
+                        double distanceSq = 16.0 * 16.0 * (dx * dx + dy * dy + dz * dz);
+                        spanSectionSlots[span] = source.sectionSlot;
+                        spanWeights[span] = source.power / Math.max(SECTION_DISTANCE_FLOOR_SQ, distanceSq);
+                    }
+                }
+            }
+        }
+
+        for (int cell = 0; cell < volume; cell++) {
+            if ((cell & 4095) == 0) checkCancelled(cancelled);
+            int first = cellOffsets[cell];
+            int count = cellCounts[cell];
+            if (count == 0) continue;
+            double totalWeight = 0.0;
+            for (int i = 0; i < count; i++) totalWeight += spanWeights[first + i];
+            double cumulative = 0.0;
+            for (int i = 0; i < count; i++) {
+                cumulative += spanWeights[first + i] / totalWeight;
+                spanCdfs[first + i] = i + 1 == count ? 1.0f : (float) cumulative;
+            }
+        }
+
         return new Data(minX * 16 - rebaseX, minY * 16 - rebaseY, minZ * 16 - rebaseZ,
                 dimX, dimY, dimZ, cellOffsets, cellCounts,
-                spanSectionSlots.toIntArray(), spanCdfs.toFloatArray(),
-                populatedCells, representedSections);
+                spanSectionSlots, spanCdfs, populatedCells, spanCountLong);
+    }
+
+    private static void checkCancelled(BooleanSupplier cancelled) {
+        if (cancelled.getAsBoolean()) throw new CancellationException("Superseded ReGIR build");
     }
 
     record SectionLights(int sectionSlot, int x, int y, int z, double power) {
-    }
-
-    private record SourceSection(SectionLights lights) {
-    }
-
-    private record WeightedSpan(int sectionSlot, double weight) {
     }
 
     record Data(int originX, int originY, int originZ, int dimX, int dimY, int dimZ,
