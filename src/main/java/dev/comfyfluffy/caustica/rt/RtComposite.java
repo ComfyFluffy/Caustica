@@ -868,10 +868,9 @@ public final class RtComposite {
                     CausticaConfig.Rt.Lights.REGIR_ENABLED.value()
                             ? terrain.regirCellBufferAddress() : 0L,
                     CausticaConfig.Rt.Lights.REGIR_ENABLED.value()
-                            ? terrain.regirCandidateBufferAddress() : 0L,
+                            ? terrain.regirSpanBufferAddress() : 0L,
                     new Float4(terrain.regirOriginX(), terrain.regirOriginY(), terrain.regirOriginZ(), 16f),
-                    new Int4(terrain.regirDimX(), terrain.regirDimY(), terrain.regirDimZ(),
-                            terrain.regirMaxCandidates()),
+                    new Int4(terrain.regirDimX(), terrain.regirDimY(), terrain.regirDimZ(), 0),
                     terrain.lightCount(),
                     CausticaConfig.Rt.Lights.RIS_CANDIDATES.value()
             ).write(push);

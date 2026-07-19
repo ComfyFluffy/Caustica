@@ -55,6 +55,7 @@ import org.lwjgl.vulkan.VkBufferCopy;
 import org.lwjgl.vulkan.VkCommandBuffer;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -252,8 +253,8 @@ public final class RtTerrain {
         return regir.published().cellAddress();
     }
 
-    public long regirCandidateBufferAddress() {
-        return regir.published().candidateAddress();
+    public long regirSpanBufferAddress() {
+        return regir.published().spanAddress();
     }
 
     public int regirOriginX() {
@@ -278,10 +279,6 @@ public final class RtTerrain {
 
     public int regirDimZ() {
         return regir.published().dimZ();
-    }
-
-    public int regirMaxCandidates() {
-        return RtReGIR.MAX_CANDIDATES;
     }
 
     /** Number of compact 64-byte records in the published light buffer. */
@@ -1458,8 +1455,14 @@ public final class RtTerrain {
         int baseY = rebase ? rby : blockY;
         int baseZ = rebase ? rbz : blockZ;
 
+        // Geometry extraction is driven by vanilla's block-dirty stream and can run continuously while
+        // the world ticks. Rebuilding the global light tables for every geometry publication clears the
+        // asynchronously published ReGIR state even when no emitter changed, making the shader alternate
+        // between global-only and cell proposals. Track the actual light-record diff instead.
+        boolean lightsChanged = false;
         for (SectionGeom g : removed) {
             table.removePublished(resident, published, g);
+            lightsChanged |= hasLights(g.lights);
         }
         retire(ctx, lastGraphicsUse, removed);
 
@@ -1482,6 +1485,7 @@ public final class RtTerrain {
                 continue;
             }
             SectionGeom prev = resident.get(ps.key());
+            lightsChanged |= !sameLightRecords(prev != null ? prev.lights : null, g.lights);
             if (prev != null && prev.slot >= 0) {
                 g.slot = prev.slot;
                 g.instanceIndex = prev.instanceIndex;
@@ -1547,10 +1551,20 @@ public final class RtTerrain {
             blockZ = rbz;
         }
         table.instances = table.instanceList;
-        if (!prepared.isEmpty() || !removed.isEmpty() || rebase) {
+        if (lightsChanged || rebase) {
             rebuildLightBuffer(ctx, lastGraphicsUse);
         }
         ready = true;
+    }
+
+    private static boolean hasLights(float[] lights) {
+        return lights != null && lights.length > 0;
+    }
+
+    /** Null and an empty collector result both mean that the section contributes no lights. */
+    static boolean sameLightRecords(float[] previous, float[] current) {
+        if (!hasLights(previous) && !hasLights(current)) return true;
+        return Arrays.equals(previous, current);
     }
 
     /** Detach + retire the current light and alias buffers after their last graphics submission. */
@@ -1598,9 +1612,6 @@ public final class RtTerrain {
             return;
         }
         float[] packedLights = new float[Math.multiplyExact(totalLights, gpuStride)];
-        float[] lightX = new float[totalLights];
-        float[] lightY = new float[totalLights];
-        float[] lightZ = new float[totalLights];
         double[] powers = new double[totalLights];
         int lightIndex = 0;
         for (int i = 0, n = table.instanceList.size(); i < n; i++) {
@@ -1615,9 +1626,9 @@ public final class RtTerrain {
                 float leG = lights[base + 17];
                 float leB = lights[base + 18];
                 int dst = lightIndex * gpuStride;
-                packedLights[dst] = lightX[lightIndex] = lights[base] + ox;
-                packedLights[dst + 1] = lightY[lightIndex] = lights[base + 1] + oy;
-                packedLights[dst + 2] = lightZ[lightIndex] = lights[base + 2] + oz;
+                packedLights[dst] = lights[base] + ox;
+                packedLights[dst + 1] = lights[base + 1] + oy;
+                packedLights[dst + 2] = lights[base + 2] + oz;
                 packedLights[dst + 3] = lights[base + 3];
                 packedLights[dst + 4] = lights[base + 4];
                 packedLights[dst + 5] = lights[base + 5];
@@ -1688,8 +1699,8 @@ public final class RtTerrain {
                     (lightBytes + aliasBytes) / 1024, generation);
         }
         if (CausticaConfig.Rt.Lights.REGIR_ENABLED.value()) {
-            regir.request(new RtReGIRManager.Input(regirSections,
-                    lightX, lightY, lightZ, powers, blockX, blockY, blockZ));
+            regir.request(new RtReGIRManager.Input(
+                    regirSections, powers, blockX, blockY, blockZ));
         }
     }
 

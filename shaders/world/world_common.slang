@@ -55,9 +55,9 @@ public struct WorldPush {
     public uint64_t lightBufAddr;     // ReSTIR DI global light buffer (0 = none published)
     public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
     public uint64_t regirCellAddr;    // dense ReGIR cell headers (0 = global proposals only)
-    public uint64_t regirCandidateAddr; // packed, sorted light indices referenced by cell headers
+    public uint64_t regirSpanAddr;      // packed weighted section spans referenced by cell headers
     public float4   regirOrigin;      // xyz minimum cell origin in rebased blocks, w cell size
-    public int4     regirGrid;        // xyz dense grid dimensions, w max candidates per populated cell
+    public int4     regirGrid;        // xyz dense grid dimensions, w reserved
     public uint     lightCount;       // packed Light records in lightBufAddr
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
 };
@@ -81,11 +81,20 @@ public struct LightAlias {
     public float aliasInvPdf;
 };
 
-// Dense ReGIR grid entry. Empty coordinates have candidateCount=0; populated section cells point into
-// a sorted uint light-index list so global samples can evaluate the exact local/global mixture PDF.
+// Dense ReGIR grid entry. Empty coordinates have spanCount=0; populated section cells point into an
+// immutable list of weighted section light ranges built and published alongside this grid.
 public struct ReGIRCell {
-    public uint candidateOffset;
-    public uint candidateCount;
+    public uint spanOffset;
+    public uint spanCount;
+};
+
+// One contiguous range in the global light buffer. Spans in a cell are sorted by firstLight, and their
+// CDF is accumulated in that same order. This supports logarithmic weighted selection and exact local
+// proposal-PDF lookup for a sample drawn by the global branch.
+public struct ReGIRSpan {
+    public uint firstLight;
+    public uint lightCount;
+    public float cdf;
 };
 
 // TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).

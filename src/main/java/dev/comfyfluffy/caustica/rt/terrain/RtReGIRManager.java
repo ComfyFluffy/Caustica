@@ -140,8 +140,8 @@ final class RtReGIRManager {
                 if (!isCurrent(request.generation)) continue;
                 Input input = request.input;
                 try {
-                    RtReGIR.Data data = RtReGIR.build(input.sections, input.lightX, input.lightY,
-                            input.lightZ, input.powers, input.rebaseX, input.rebaseY, input.rebaseZ);
+                    RtReGIR.Data data = RtReGIR.build(input.sections, input.powers,
+                            input.rebaseX, input.rebaseY, input.rebaseZ);
                     if (isCurrent(request.generation)) {
                         completions.add(new Prepared(request.generation, data, null));
                     }
@@ -158,17 +158,17 @@ final class RtReGIRManager {
 
     private void submitUpload(RtContext ctx, long uploadGeneration, RtReGIR.Data data) {
         long cellBytes = data.cellBytes();
-        long candidateBytes = data.candidateBytes();
+        long spanBytes = data.spanBytes();
         RtBuffer cells = null;
-        RtBuffer candidates = null;
+        RtBuffer spans = null;
         RtBuffer upload = null;
         try {
             int usage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             cells = ctx.createAsyncBuffer(cellBytes, usage, false,
                     "terrain ReGIR cells generation " + uploadGeneration);
-            candidates = ctx.createAsyncBuffer(candidateBytes, usage, false,
-                    "terrain ReGIR candidates generation " + uploadGeneration);
-            upload = ctx.createUploadBuffer(cellBytes + candidateBytes,
+            spans = ctx.createAsyncBuffer(spanBytes, usage, false,
+                    "terrain ReGIR spans generation " + uploadGeneration);
+            upload = ctx.createUploadBuffer(cellBytes + spanBytes,
                     "terrain ReGIR upload generation " + uploadGeneration);
             long cursor = upload.mapped;
             for (int i = 0; i < data.cellOffsets().length; i++) {
@@ -176,46 +176,51 @@ final class RtReGIRManager {
                 MemoryUtil.memPutInt(cursor + 4, data.cellCounts()[i]);
                 cursor += 8;
             }
-            MemoryUtil.memIntBuffer(upload.mapped + cellBytes, data.candidates().length)
-                    .put(data.candidates());
+            cursor = upload.mapped + cellBytes;
+            for (int i = 0; i < data.spanFirstLights().length; i++) {
+                MemoryUtil.memPutInt(cursor, data.spanFirstLights()[i]);
+                MemoryUtil.memPutInt(cursor + 4, data.spanLightCounts()[i]);
+                MemoryUtil.memPutFloat(cursor + 8, data.spanCdfs()[i]);
+                cursor += 12;
+            }
             upload.flush();
 
             RtBuffer submittedUpload = upload;
             RtBuffer submittedCells = cells;
-            RtBuffer submittedCandidates = candidates;
+            RtBuffer submittedSpans = spans;
             beginTask();
             boolean accepted = false;
             try {
                 ctx.gpuExecutor().submit(
                         cmd -> recordUpload(cmd, submittedUpload, submittedCells,
-                                submittedCandidates, cellBytes),
+                                submittedSpans, cellBytes),
                         () -> { },
                         (ignored, failure) -> finishUpload(uploadGeneration, data, submittedUpload,
-                                submittedCells, submittedCandidates, failure));
+                                submittedCells, submittedSpans, failure));
                 accepted = true;
                 upload = null;
                 cells = null;
-                candidates = null;
+                spans = null;
             } finally {
                 if (!accepted) finishTask();
             }
         } finally {
             if (upload != null) upload.destroy();
-            if (candidates != null) candidates.destroy();
+            if (spans != null) spans.destroy();
             if (cells != null) cells.destroy();
         }
     }
 
     private void finishUpload(long uploadGeneration, RtReGIR.Data data, RtBuffer upload,
-                              RtBuffer cells, RtBuffer candidates, Throwable failure) {
+                              RtBuffer cells, RtBuffer spans, Throwable failure) {
         try {
             upload.destroy();
         } finally {
             try {
                 if (isCurrent(uploadGeneration)) {
-                    completions.add(new Uploaded(uploadGeneration, data, cells, candidates, failure));
+                    completions.add(new Uploaded(uploadGeneration, data, cells, spans, failure));
                 } else {
-                    candidates.destroy();
+                    spans.destroy();
                     cells.destroy();
                 }
             } finally {
@@ -226,16 +231,16 @@ final class RtReGIRManager {
 
     private void publish(RtContext ctx, Uploaded uploaded) {
         PublishedState old = published;
-        published = new PublishedState(uploaded.cells, uploaded.candidates,
+        published = new PublishedState(uploaded.cells, uploaded.spans,
                 uploaded.data.originX(), uploaded.data.originY(), uploaded.data.originZ(),
                 uploaded.data.dimX(), uploaded.data.dimY(), uploaded.data.dimZ());
         old.retire(ctx, ctx.gpuExecutor().latestGraphicsUseValue());
 
         if (CausticaConfig.Rt.Lights.STATS.value()) {
             RtReGIR.Data data = uploaded.data;
-            CausticaMod.LOGGER.info("RT ReGIR generation {}: {} cells / {} candidates, {} KiB",
-                    uploaded.generation, data.populatedCells(), data.candidates().length,
-                    (data.cellBytes() + data.candidateBytes()) / 1024);
+            CausticaMod.LOGGER.info("RT ReGIR generation {}: {} cells / {} spans / {} represented lights, {} KiB",
+                    uploaded.generation, data.populatedCells(), data.spanFirstLights().length,
+                    data.representedLights(), (data.cellBytes() + data.spanBytes()) / 1024);
         }
     }
 
@@ -266,11 +271,11 @@ final class RtReGIRManager {
     }
 
     private static void recordUpload(VkCommandBuffer cmd, RtBuffer upload, RtBuffer cells,
-                                     RtBuffer candidates, long cellBytes) {
+                                     RtBuffer spans, long cellBytes) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCopy.Buffer region = VkBufferCopy.calloc(1, stack);
             copy(cmd, upload, cells, 0L, cellBytes, region);
-            copy(cmd, upload, candidates, cellBytes, candidates.size, region);
+            copy(cmd, upload, spans, cellBytes, spans.size, region);
         }
     }
 
@@ -280,12 +285,11 @@ final class RtReGIRManager {
         VK10.vkCmdCopyBuffer(cmd, upload.handle, destination.handle, region);
     }
 
-    record Input(List<RtReGIR.SectionLights> sections,
-                 float[] lightX, float[] lightY, float[] lightZ, double[] powers,
+    record Input(List<RtReGIR.SectionLights> sections, double[] powers,
                  int rebaseX, int rebaseY, int rebaseZ) {
     }
 
-    record PublishedState(RtBuffer cells, RtBuffer candidates,
+    record PublishedState(RtBuffer cells, RtBuffer spans,
                           int originX, int originY, int originZ,
                           int dimX, int dimY, int dimZ) {
         private static final PublishedState EMPTY = new PublishedState(null, null, 0, 0, 0, 0, 0, 0);
@@ -294,19 +298,19 @@ final class RtReGIRManager {
             return cells != null ? cells.deviceAddress : 0L;
         }
 
-        long candidateAddress() {
-            return candidates != null ? candidates.deviceAddress : 0L;
+        long spanAddress() {
+            return spans != null ? spans.deviceAddress : 0L;
         }
 
         private void retire(RtContext ctx, long lastGraphicsUse) {
             if (cells == null) return;
             ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, cells::destroy);
-            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, candidates::destroy);
+            ctx.gpuExecutor().enqueueDestroyAfterGraphics(lastGraphicsUse, spans::destroy);
         }
 
         private void destroy() {
             if (cells != null) cells.destroy();
-            if (candidates != null) candidates.destroy();
+            if (spans != null) spans.destroy();
         }
     }
 
@@ -317,9 +321,9 @@ final class RtReGIRManager {
     }
 
     private record Uploaded(long generation, RtReGIR.Data data, RtBuffer cells,
-                            RtBuffer candidates, Throwable failure) implements Completion {
+                            RtBuffer spans, Throwable failure) implements Completion {
         private void destroy() {
-            candidates.destroy();
+            spans.destroy();
             cells.destroy();
         }
     }

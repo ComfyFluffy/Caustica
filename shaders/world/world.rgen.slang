@@ -474,9 +474,9 @@ float globalLightPdf(uint lightIndex) {
 }
 
 bool findReGIRCell(float3 p, out ReGIRCell cell) {
-    cell.candidateOffset = 0u;
-    cell.candidateCount = 0u;
-    if (worldPush.regirCellAddr == 0 || worldPush.regirCandidateAddr == 0) return false;
+    cell.spanOffset = 0u;
+    cell.spanCount = 0u;
+    if (worldPush.regirCellAddr == 0 || worldPush.regirSpanAddr == 0) return false;
     int3 coord = int3(floor((p - worldPush.regirOrigin.xyz) / worldPush.regirOrigin.w));
     if (coord.x < 0 || coord.y < 0 || coord.z < 0
             || coord.x >= worldPush.regirGrid.x
@@ -485,26 +485,57 @@ bool findReGIRCell(float3 p, out ReGIRCell cell) {
     uint linear = (uint(coord.z) * uint(worldPush.regirGrid.y) + uint(coord.y))
             * uint(worldPush.regirGrid.x) + uint(coord.x);
     cell = ConstPtr<ReGIRCell>(worldPush.regirCellAddr)[linear];
-    return cell.candidateCount > 0u;
+    return cell.spanCount > 0u;
 }
 
-bool reGIRCellContains(ReGIRCell cell, uint lightIndex) {
-    ConstPtr<uint> candidates = ConstPtr<uint>(worldPush.regirCandidateAddr);
+bool reGIRCellPdf(ReGIRCell cell, uint lightIndex, out float localPdf) {
+    ConstPtr<ReGIRSpan> spans = ConstPtr<ReGIRSpan>(worldPush.regirSpanAddr);
     uint lo = 0u;
-    uint hi = cell.candidateCount;
+    uint hi = cell.spanCount;
     while (lo < hi) {
         uint mid = (lo + hi) >> 1u;
-        uint candidate = candidates[cell.candidateOffset + mid];
-        if (candidate < lightIndex) lo = mid + 1u;
+        ReGIRSpan span = spans[cell.spanOffset + mid];
+        if (span.firstLight + span.lightCount <= lightIndex) lo = mid + 1u;
         else hi = mid;
     }
-    return lo < cell.candidateCount
-            && candidates[cell.candidateOffset + lo] == lightIndex;
+    if (lo >= cell.spanCount) {
+        localPdf = 0.0;
+        return false;
+    }
+    ReGIRSpan span = spans[cell.spanOffset + lo];
+    if (lightIndex < span.firstLight || lightIndex >= span.firstLight + span.lightCount) {
+        localPdf = 0.0;
+        return false;
+    }
+    float previousCdf = lo > 0u ? spans[cell.spanOffset + lo - 1u].cdf : 0.0;
+    localPdf = max(span.cdf - previousCdf, 0.0) / float(span.lightCount);
+    return localPdf > 0.0;
 }
 
-// Sample the exact mixture q = alpha*qCell + (1-alpha)*qGlobal. qGlobal has full support, so cell
-// truncation only changes variance; lights outside the cell (including distant large emitters) remain
-// unbiased. The sorted cell list makes the global branch's qCell lookup logarithmic.
+void selectReGIRSpanLight(ReGIRCell cell, inout uint proposalSeed,
+                          out uint lightIndex, out float localPdf) {
+    ConstPtr<ReGIRSpan> spans = ConstPtr<ReGIRSpan>(worldPush.regirSpanAddr);
+    float u = rndf(proposalSeed);
+    uint lo = 0u;
+    uint hi = cell.spanCount;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (spans[cell.spanOffset + mid].cdf < u) lo = mid + 1u;
+        else hi = mid;
+    }
+    uint spanIndex = min(lo, cell.spanCount - 1u);
+    ReGIRSpan span = spans[cell.spanOffset + spanIndex];
+    float previousCdf = spanIndex > 0u
+            ? spans[cell.spanOffset + spanIndex - 1u].cdf : 0.0;
+    uint withinSpan = min(uint(rndf(proposalSeed) * float(span.lightCount)), span.lightCount - 1u);
+    lightIndex = span.firstLight + withinSpan;
+    localPdf = max(span.cdf - previousCdf, 0.0) / float(span.lightCount);
+}
+
+// Sample the exact mixture q = alpha*qCell + (1-alpha)*qGlobal. qCell first selects a nearby section
+// by emitted power and section distance, then a light uniformly within that section. Every light in
+// the neighborhood is represented without a fixed cap; qGlobal gives distant lights full support.
+// Sorted spans make both weighted selection and the global branch's qCell lookup logarithmic.
 void selectReGIRLight(ReGIRCell cell, bool hasCell, inout uint proposalSeed,
                       out uint lightIndex, out float invSourcePdf) {
     static const float LOCAL_PROBABILITY = 0.75;
@@ -516,17 +547,13 @@ void selectReGIRLight(ReGIRCell cell, bool hasCell, inout uint proposalSeed,
     float localPdf;
     float globalPdf;
     if (rndf(proposalSeed) < LOCAL_PROBABILITY) {
-        uint slot = min(uint(rndf(proposalSeed) * float(cell.candidateCount)),
-                cell.candidateCount - 1u);
-        lightIndex = ConstPtr<uint>(worldPush.regirCandidateAddr)[cell.candidateOffset + slot];
-        localPdf = 1.0 / float(cell.candidateCount);
+        selectReGIRSpanLight(cell, proposalSeed, lightIndex, localPdf);
         globalPdf = globalLightPdf(lightIndex);
     } else {
         float invGlobalPdf;
         selectGlobalLight(proposalSeed, lightIndex, invGlobalPdf);
         globalPdf = 1.0 / invGlobalPdf;
-        localPdf = reGIRCellContains(cell, lightIndex)
-                ? 1.0 / float(cell.candidateCount) : 0.0;
+        reGIRCellPdf(cell, lightIndex, localPdf);
     }
     float sourcePdf = LOCAL_PROBABILITY * localPdf + (1.0 - LOCAL_PROBABILITY) * globalPdf;
     invSourcePdf = 1.0 / max(sourcePdf, 1.0e-20);

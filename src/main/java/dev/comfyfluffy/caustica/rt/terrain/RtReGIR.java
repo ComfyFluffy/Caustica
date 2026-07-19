@@ -1,36 +1,40 @@
 package dev.comfyfluffy.caustica.rt.terrain;
 
+import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 
-import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /**
- * CPU builder for the section-sized ReGIR proposal grid. A cell stores a small, sorted set of
- * influential light indices; the shader mixes its uniform cell proposal with the full global power
- * proposal, so truncating the cell set changes variance and locality but never removes a light's support.
+ * CPU builder for the section-sized ReGIR proposal grid. Every nearby light remains eligible, but a
+ * cell stores one weighted contiguous range per lit section instead of duplicating every light index.
+ * The span count is naturally bounded by the spatial neighborhood, not by an arbitrary light cap.
  */
 final class RtReGIR {
-    static final int MAX_CANDIDATES = 32;
-
-    private static final int GLOBAL_CANDIDATES = 8;
     private static final int NEIGHBOR_RADIUS = 2;
     private static final int MAX_DENSE_GRID_CELLS = 4_000_000;
+    private static final double SECTION_DISTANCE_FLOOR_SQ = 16.0 * 16.0;
 
     private RtReGIR() {
     }
 
-    static Data build(List<SectionLights> sections, float[] lightX, float[] lightY, float[] lightZ,
-                      double[] powers, int rebaseX, int rebaseY, int rebaseZ) {
+    static Data build(List<SectionLights> sections, double[] powers,
+                      int rebaseX, int rebaseY, int rebaseZ) {
         if (sections.isEmpty() || powers.length == 0) {
             return null;
         }
 
-        Long2ObjectOpenHashMap<SectionLights> bySection = new Long2ObjectOpenHashMap<>(sections.size());
+        Long2ObjectOpenHashMap<SourceSection> bySection = new Long2ObjectOpenHashMap<>(sections.size());
         for (SectionLights section : sections) {
-            bySection.put(RtTerrain.sectionKey(section.x, section.y, section.z), section);
+            double power = 0.0;
+            int end = Math.addExact(section.firstLight, section.lightCount);
+            for (int light = section.firstLight; light < end; light++) power += powers[light];
+            bySection.put(RtTerrain.sectionKey(section.x, section.y, section.z),
+                    new SourceSection(section, power));
         }
         // A cell is useful only near an emitter. Materializing the entire render-distance volume on
         // every streaming publication would make the CPU build grow with all geometry, even though a
@@ -74,104 +78,76 @@ final class RtReGIR {
         int volume = (int) volumeLong;
         int[] cellOffsets = new int[volume];
         int[] cellCounts = new int[volume];
-        IntArrayList candidates = new IntArrayList(Math.multiplyExact(activeCount, MAX_CANDIDATES));
-
-        int[] global = strongestLights(powers, Math.min(GLOBAL_CANDIDATES, powers.length));
-        int[] seen = new int[powers.length];
-        int stamp = 0;
-        int[] selected = new int[MAX_CANDIDATES];
-        double[] selectedScore = new double[MAX_CANDIDATES];
+        IntArrayList spanFirstLights = new IntArrayList();
+        IntArrayList spanLightCounts = new IntArrayList();
+        FloatArrayList spanCdfs = new FloatArrayList();
+        ArrayList<WeightedSpan> selected = new ArrayList<>(125);
+        int populatedCells = 0;
+        long representedLights = 0L;
 
         for (int cellIndex = 0; cellIndex < activeCount; cellIndex++) {
             SectionLights cell = active[cellIndex];
-            if (++stamp == 0) {
-                Arrays.fill(seen, 0);
-                stamp = 1;
-            }
-            int count = 0;
-            for (int light : global) {
-                if (seen[light] != stamp) {
-                    seen[light] = stamp;
-                    selected[count] = light;
-                    selectedScore[count] = Double.POSITIVE_INFINITY; // reserved global-support slots
-                    count++;
-                }
-            }
-            int reserved = count;
-            double centerX = cell.x * 16.0 - rebaseX + 8.0;
-            double centerY = cell.y * 16.0 - rebaseY + 8.0;
-            double centerZ = cell.z * 16.0 - rebaseZ + 8.0;
+            selected.clear();
             for (int dz = -NEIGHBOR_RADIUS; dz <= NEIGHBOR_RADIUS; dz++) {
                 for (int dy = -NEIGHBOR_RADIUS; dy <= NEIGHBOR_RADIUS; dy++) {
                     for (int dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
-                        SectionLights source = bySection.get(RtTerrain.sectionKey(
+                        SourceSection source = bySection.get(RtTerrain.sectionKey(
                                 cell.x + dx, cell.y + dy, cell.z + dz));
-                        if (source == null) continue;
-                        int end = source.firstLight + source.lightCount;
-                        for (int light = source.firstLight; light < end; light++) {
-                            if (seen[light] == stamp) continue;
-                            seen[light] = stamp;
-                            double lx = lightX[light] - centerX;
-                            double ly = lightY[light] - centerY;
-                            double lz = lightZ[light] - centerZ;
-                            // One block squared prevents singular rankings for lights inside the cell.
-                            double score = powers[light] / Math.max(1.0, lx * lx + ly * ly + lz * lz);
-                            if (count < MAX_CANDIDATES) {
-                                selected[count] = light;
-                                selectedScore[count] = score;
-                                count++;
-                            } else {
-                                int weakest = reserved;
-                                for (int i = reserved + 1; i < count; i++) {
-                                    if (selectedScore[i] < selectedScore[weakest]) weakest = i;
-                                }
-                                if (score > selectedScore[weakest]) {
-                                    selected[weakest] = light;
-                                    selectedScore[weakest] = score;
-                                }
-                            }
-                        }
+                        if (source == null || source.lights.lightCount == 0 || !(source.power > 0.0)) continue;
+                        double distanceSq = 16.0 * 16.0 * (dx * dx + dy * dy + dz * dz);
+                        double weight = source.power / Math.max(SECTION_DISTANCE_FLOOR_SQ, distanceSq);
+                        selected.add(new WeightedSpan(
+                                source.lights.firstLight, source.lights.lightCount, weight));
                     }
                 }
             }
 
-            Arrays.sort(selected, 0, count); // shader membership uses binary search
+            if (selected.isEmpty()) continue;
+            selected.sort(Comparator.comparingInt(WeightedSpan::firstLight));
+            double totalWeight = 0.0;
+            for (WeightedSpan span : selected) totalWeight += span.weight;
+
             int linear = ((cell.z - minZ) * dimY + (cell.y - minY)) * dimX + (cell.x - minX);
-            cellOffsets[linear] = candidates.size();
-            cellCounts[linear] = count;
-            candidates.addElements(candidates.size(), selected, 0, count);
-        }
-
-        return new Data(minX * 16 - rebaseX, minY * 16 - rebaseY, minZ * 16 - rebaseZ,
-                dimX, dimY, dimZ, cellOffsets, cellCounts, candidates.toIntArray(), activeCount);
-    }
-
-    private static int[] strongestLights(double[] powers, int count) {
-        int[] result = new int[count];
-        Arrays.fill(result, -1);
-        for (int light = 0; light < powers.length; light++) {
-            for (int slot = 0; slot < count; slot++) {
-                if (result[slot] < 0 || powers[light] > powers[result[slot]]) {
-                    for (int move = count - 1; move > slot; move--) result[move] = result[move - 1];
-                    result[slot] = light;
-                    break;
-                }
+            cellOffsets[linear] = spanFirstLights.size();
+            cellCounts[linear] = selected.size();
+            double cumulative = 0.0;
+            for (int spanIndex = 0; spanIndex < selected.size(); spanIndex++) {
+                WeightedSpan span = selected.get(spanIndex);
+                cumulative += span.weight / totalWeight;
+                spanFirstLights.add(span.firstLight);
+                spanLightCounts.add(span.lightCount);
+                spanCdfs.add(spanIndex + 1 == selected.size() ? 1.0f : (float) cumulative);
+                representedLights = Math.addExact(representedLights, span.lightCount);
             }
+            populatedCells++;
         }
-        return result;
+
+        if (spanFirstLights.isEmpty()) return null;
+        return new Data(minX * 16 - rebaseX, minY * 16 - rebaseY, minZ * 16 - rebaseZ,
+                dimX, dimY, dimZ, cellOffsets, cellCounts,
+                spanFirstLights.toIntArray(), spanLightCounts.toIntArray(), spanCdfs.toFloatArray(),
+                populatedCells, representedLights);
     }
 
     record SectionLights(int x, int y, int z, int firstLight, int lightCount) {
     }
 
+    private record SourceSection(SectionLights lights, double power) {
+    }
+
+    private record WeightedSpan(int firstLight, int lightCount, double weight) {
+    }
+
     record Data(int originX, int originY, int originZ, int dimX, int dimY, int dimZ,
-                int[] cellOffsets, int[] cellCounts, int[] candidates, int populatedCells) {
+                int[] cellOffsets, int[] cellCounts,
+                int[] spanFirstLights, int[] spanLightCounts, float[] spanCdfs,
+                int populatedCells, long representedLights) {
         long cellBytes() {
             return Math.multiplyExact((long) cellOffsets.length, 8L);
         }
 
-        long candidateBytes() {
-            return Math.multiplyExact((long) candidates.length, Integer.BYTES);
+        long spanBytes() {
+            return Math.multiplyExact((long) spanFirstLights.length, 12L);
         }
     }
 }
