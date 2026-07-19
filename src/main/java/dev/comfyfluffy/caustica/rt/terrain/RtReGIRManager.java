@@ -3,6 +3,7 @@ package dev.comfyfluffy.caustica.rt.terrain;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtContext;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import net.minecraft.client.Minecraft;
 import org.lwjgl.system.MemoryStack;
@@ -222,8 +223,8 @@ final class RtReGIRManager {
                                 lightBytes, globalAliasBytes, sectionBytes,
                                 localAliasBytes, cellBytes, spanBytes),
                         () -> { },
-                        (ignored, failure) -> finishUpload(requestId, data,
-                                submittedUpload, submittedBuffers, failure));
+                        (build, failure) -> finishUpload(requestId, data,
+                                submittedUpload, submittedBuffers, build, failure));
                 accepted = true;
                 upload = null;
                 buffers = null;
@@ -247,12 +248,14 @@ final class RtReGIRManager {
     }
 
     private void finishUpload(long requestId, RtLightHierarchy.Data data, RtBuffer upload,
-                              Buffers buffers, Throwable failure) {
+                              Buffers buffers, RtGpuExecutor.Build build, Throwable failure) {
         try {
             upload.destroy();
         } finally {
             try {
-                if (isLatest(requestId)) completions.add(new Uploaded(requestId, data, buffers, failure));
+                if (isLatest(requestId)) {
+                    completions.add(new Uploaded(requestId, data, buffers, build, failure));
+                }
                 else buffers.destroy();
             } finally {
                 finishTask();
@@ -270,6 +273,11 @@ final class RtReGIRManager {
                 grid != null ? grid.dimY() : 0, grid != null ? grid.dimZ() : 0,
                 uploaded.data.rebaseX(), uploaded.data.rebaseY(), uploaded.data.rebaseZ());
         PublishedState old = published;
+        // The executor's host-side timeline wait only proves that the transfer completed. It does not
+        // establish device-memory visibility from the async queue to the graphics queue. Publish the
+        // exact upload build so beginGraphicsTerrainUse() attaches the required semaphore dependency
+        // before any shader can dereference this generation's buffer device addresses.
+        ctx.gpuExecutor().markPublished(uploaded.build);
         published = next;
         old.retire(ctx, ctx.gpuExecutor().latestGraphicsUseValue());
 
@@ -427,7 +435,7 @@ final class RtReGIRManager {
     private record Prepared(long requestId, RtLightHierarchy.Data data, Throwable failure)
             implements Completion { }
     private record Uploaded(long requestId, RtLightHierarchy.Data data, Buffers buffers,
-                            Throwable failure) implements Completion {
+                            RtGpuExecutor.Build build, Throwable failure) implements Completion {
         void destroy() { buffers.destroy(); }
     }
     private record Request(long requestId, Input input) { }
