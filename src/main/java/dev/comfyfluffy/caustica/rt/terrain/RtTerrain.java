@@ -507,7 +507,7 @@ public final class RtTerrain {
             }
         }
 
-        flushLightHierarchyUpdate();
+        flushLightHierarchyUpdate(ctx);
 
     }
 
@@ -1565,7 +1565,7 @@ public final class RtTerrain {
             // streaming state, not "no world" — keep tracing (sky/entities only) instead of handing the
             // frame back to vanilla; see ensureEmptyTableReady.
             markLightHierarchyDirty();
-            flushLightHierarchyUpdate();
+            flushLightHierarchyUpdate(ctx);
             ensureEmptyTableReady(ctx);
             return;
         }
@@ -1611,15 +1611,16 @@ public final class RtTerrain {
     }
 
     /** Snapshot only lit sections once the previous complete generation has published. */
-    private void flushLightHierarchyUpdate() {
+    private void flushLightHierarchyUpdate(RtContext ctx) {
         if (!lightHierarchyDirty || !regir.isIdle()) return;
         long now = System.nanoTime();
         if (lastLightHierarchyRequestNanos != 0L
                 && now - lastLightHierarchyRequestNanos < LIGHT_HIERARCHY_UPDATE_INTERVAL_NANOS) {
             return;
         }
-        regir.request(new RtReGIRManager.Input(new ArrayList<>(lightSections.values()),
-                blockX, blockY, blockZ));
+        // The manager creates one immutable worker snapshot directly from the sorted values view,
+        // avoiding the previous ArrayList + defensive-copy pair on the render thread.
+        regir.request(ctx, lightSections.values(), blockX, blockY, blockZ);
         lightHierarchyDirty = false;
         lastLightHierarchyRequestNanos = now;
     }

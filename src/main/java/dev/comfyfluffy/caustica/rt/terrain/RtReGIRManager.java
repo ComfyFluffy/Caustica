@@ -12,14 +12,16 @@ import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkBufferCopy;
 import org.lwjgl.vulkan.VkCommandBuffer;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Coalesced asynchronous lifecycle for one coherent light-hierarchy generation. CPU packing, global
  * and section-local alias construction, and ReGIR construction all run on a worker. The render thread
- * only submits a prepared upload and atomically publishes GPU-complete buffers; the previous complete
- * generation remains shader-visible until that point.
+ * only atomically publishes GPU-complete buffers; the worker also allocates/fills staging and device
+ * buffers and enqueues the copy on {@link RtGpuExecutor}. The previous complete generation remains
+ * shader-visible until that point.
  */
 final class RtReGIRManager {
     private final Object buildLock = new Object();
@@ -47,10 +49,12 @@ final class RtReGIRManager {
     }
 
     /** Replace any not-yet-started hierarchy snapshot; an in-progress older result self-discards. */
-    void request(Input input) {
+    void request(RtContext ctx, Collection<RtLightHierarchy.SectionInput> sections,
+                 int rebaseX, int rebaseY, int rebaseZ) {
+        Input input = new Input(List.copyOf(sections), rebaseX, rebaseY, rebaseZ);
         synchronized (buildLock) {
             long requestId = ++latestRequest;
-            pendingRequest = new Request(requestId, input);
+            pendingRequest = new Request(requestId, ctx, input);
             if (workerRunning) return;
             workerRunning = true;
             beginTask();
@@ -65,7 +69,7 @@ final class RtReGIRManager {
         }
     }
 
-    /** Submit worker results and publish only fully uploaded, internally coherent generations. */
+    /** Publish only fully uploaded, internally coherent worker generations. */
     void publishReady(RtContext ctx) {
         Completion completion;
         while ((completion = completions.poll()) != null) {
@@ -78,7 +82,7 @@ final class RtReGIRManager {
                 if (prepared.data.lightCount() == 0) {
                     publishEmpty(ctx, prepared.requestId);
                 } else {
-                    submitUpload(ctx, prepared.requestId, prepared.data);
+                    throw new IllegalStateException("Non-empty RT light hierarchy reached render-thread preparation");
                 }
                 continue;
             }
@@ -149,7 +153,13 @@ final class RtReGIRManager {
                             request.input.rebaseX, request.input.rebaseY, request.input.rebaseZ,
                             () -> !isLatest(request.requestId));
                     if (isLatest(request.requestId)) {
-                        completions.add(new Prepared(request.requestId, data, null));
+                        if (data.lightCount() == 0) {
+                            completions.add(new Prepared(request.requestId, data, null));
+                        } else {
+                            // VMA allocation, staging serialization/flush, and executor enqueue all stay
+                            // on this worker. The render thread only atomically publishes Uploaded.
+                            submitUpload(request.ctx, request.requestId, data);
+                        }
                     }
                 } catch (Throwable t) {
                     if (isLatest(request.requestId)) {
@@ -240,6 +250,7 @@ final class RtReGIRManager {
             boolean accepted = false;
             try {
                 ctx.gpuExecutor().submit(
+                        () -> !isLatest(requestId),
                         cmd -> recordUpload(cmd, submittedUpload, submittedBuffers,
                                 lightBytes, sectionMetadataBytes, globalAliasBytes,
                                 localAliasBytes, cellBytes, spanBytes),
@@ -402,12 +413,8 @@ final class RtReGIRManager {
         VK10.vkCmdCopyBuffer(cmd, upload.handle, destination.handle, region);
     }
 
-    record Input(List<RtLightHierarchy.SectionInput> sections,
-                 int rebaseX, int rebaseY, int rebaseZ) {
-        Input {
-            sections = List.copyOf(sections);
-        }
-    }
+    private record Input(List<RtLightHierarchy.SectionInput> sections,
+                         int rebaseX, int rebaseY, int rebaseZ) { }
 
     record PublishedState(RtBuffer lights, RtBuffer sectionMetadata,
                           RtBuffer globalAliases, RtBuffer localAliases,
@@ -465,5 +472,5 @@ final class RtReGIRManager {
                             RtGpuExecutor.Build build, Throwable failure) implements Completion {
         void destroy() { buffers.destroy(); }
     }
-    private record Request(long requestId, Input input) { }
+    private record Request(long requestId, RtContext ctx, Input input) { }
 }
