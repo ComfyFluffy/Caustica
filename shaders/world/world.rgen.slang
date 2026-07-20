@@ -379,7 +379,7 @@ float3 sampleGGXVNDF(float3 n, float3 ve, float rough, inout uint s) {
     return normalize(Ne.x * t + Ne.y * b + Ne.z * n);                 // -> world space
 }
 
-// ===== RIS emitter NEE (RESTIR_PLAN.md) =================================================================
+// ===== RIS emitter NEE =================================================================
 // Block emitters (torches, glowstone, lava, ...) get explicit NEE: per diffuse vertex, stream M uniform
 // candidates from the global light buffer through a weighted reservoir keyed by the UNSHADOWED target
 // p-hat = luminance(f * Le * G * area), then spend ONE shadow ray on the survivor. Sun/moon NEE stays
