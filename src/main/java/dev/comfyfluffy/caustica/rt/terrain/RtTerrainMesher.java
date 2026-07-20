@@ -46,6 +46,7 @@ import net.minecraft.core.SectionPos;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.RedStoneWireBlock;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
@@ -440,6 +441,14 @@ final class RtTerrainMesher {
             q.nx = nx; q.ny = ny; q.nz = nz;
 
             ChunkSectionLayer layer = quad.chunkLayer();
+            // Minecraft 26.2 classifies redstone wire as TRANSLUCENT even though it is an alpha-tested
+            // cutout block (transparent background, opaque wire). Force it into the CUTOUT bucket so the
+            // any-hit shader can discard transparent pixels. Genuine translucent blocks (glass, ice) are
+            // unaffected — their TRANSLUCENT layer is correct.
+            if (layer == ChunkSectionLayer.TRANSLUCENT && state != null
+                    && state.getBlock() instanceof RedStoneWireBlock) {
+                layer = ChunkSectionLayer.CUTOUT;
+            }
             q.cutout = layer != ChunkSectionLayer.SOLID;
             q.translucent = layer == ChunkSectionLayer.TRANSLUCENT;
 
