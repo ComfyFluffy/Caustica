@@ -17,18 +17,18 @@ import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
- * Coalesced asynchronous lifecycle for one coherent light-hierarchy generation. CPU packing, global
- * and section-local alias construction, and light grid construction all run on a worker. The render
- * thread only atomically publishes GPU-complete buffers; the worker also allocates/fills staging and
- * device buffers and enqueues the copy on {@link RtGpuExecutor}. The previous complete generation
- * remains shader-visible until that point.
+ * Asynchronous lifecycle for one light-hierarchy generation at a time. CPU packing, global and
+ * section-local alias construction, and light grid construction all run on a worker. The render thread
+ * only atomically publishes GPU-complete buffers; the worker also allocates/fills staging and device
+ * buffers and enqueues the copy on {@link RtGpuExecutor}. The previous complete generation remains
+ * shader-visible until that point. This class does not coalesce concurrent requests itself — {@link
+ * #request} requires the caller to already be idle (see {@link #isIdle()}); {@link RtTerrain} is the
+ * single caller and owns the dirty/throttle coalescing in front of it.
  */
 final class RtLightGridManager {
     private final Object buildLock = new Object();
     private final Object taskLock = new Object();
     private final ConcurrentLinkedQueue<Completion> completions = new ConcurrentLinkedQueue<>();
-    private Request pendingRequest;
-    private boolean workerRunning;
     private int activeTasks;
     private volatile long latestRequest;
     private PublishedState published = PublishedState.EMPTY;
@@ -48,24 +48,28 @@ final class RtLightGridManager {
         }
     }
 
-    /** Replace any not-yet-started hierarchy snapshot; an in-progress older result self-discards. */
+    /**
+     * Start building one hierarchy snapshot. The caller owns coalescing: this manager processes one
+     * generation at a time, so callers must only invoke this while {@link #isIdle()}.
+     */
     void request(RtContext ctx, Collection<RtLightHierarchy.SectionInput> sections,
                  int rebaseX, int rebaseY, int rebaseZ) {
+        if (!isIdle()) {
+            throw new IllegalStateException(
+                    "RtLightGridManager.request() called while a generation is still in flight");
+        }
         Input input = new Input(List.copyOf(sections), rebaseX, rebaseY, rebaseZ);
+        long requestId;
         synchronized (buildLock) {
-            long requestId = ++latestRequest;
-            pendingRequest = new Request(requestId, ctx, input);
-            if (workerRunning) return;
-            workerRunning = true;
-            beginTask();
-            try {
-                RtWorkerPool.INSTANCE.submit(this::runWorker);
-            } catch (Throwable t) {
-                workerRunning = false;
-                pendingRequest = null;
-                finishTask();
-                throw t;
-            }
+            requestId = ++latestRequest;
+        }
+        Request request = new Request(requestId, ctx, input);
+        beginTask();
+        try {
+            RtWorkerPool.INSTANCE.submit(() -> runWorker(request));
+        } catch (Throwable t) {
+            finishTask();
+            throw t;
         }
     }
 
@@ -73,17 +77,15 @@ final class RtLightGridManager {
     void publishReady(RtContext ctx) {
         Completion completion;
         while ((completion = completions.poll()) != null) {
-            if (completion instanceof Prepared prepared) {
-                if (!isLatest(prepared.requestId)) continue;
-                if (prepared.failure != null) {
+            if (completion instanceof Failed failed) {
+                if (isLatest(failed.requestId)) {
                     throw new RuntimeException("RT light hierarchy build failed for request "
-                            + prepared.requestId, prepared.failure);
+                            + failed.requestId, failed.failure);
                 }
-                if (prepared.data.lightCount() == 0) {
-                    publishEmpty(ctx, prepared.requestId);
-                } else {
-                    throw new IllegalStateException("Non-empty RT light hierarchy reached render-thread preparation");
-                }
+                continue;
+            }
+            if (completion instanceof Empty empty) {
+                if (isLatest(empty.requestId)) publishEmpty(ctx, empty.requestId);
                 continue;
             }
 
@@ -108,10 +110,10 @@ final class RtLightGridManager {
         old.retire(ctx, lastGraphicsUse);
     }
 
+    /** Invalidate the current generation (in-flight build/upload self-discards) and drop any completion. */
     void cancelPending() {
         synchronized (buildLock) {
             latestRequest++;
-            pendingRequest = null;
         }
         discardCompletions();
     }
@@ -136,36 +138,23 @@ final class RtLightGridManager {
         old.destroy();
     }
 
-    private void runWorker() {
+    private void runWorker(Request request) {
         try {
-            while (true) {
-                Request request;
-                synchronized (buildLock) {
-                    request = pendingRequest;
-                    pendingRequest = null;
-                    if (request == null) {
-                        workerRunning = false;
-                        return;
-                    }
+            RtLightHierarchy.Data data = RtLightHierarchy.build(request.input.sections,
+                    request.input.rebaseX, request.input.rebaseY, request.input.rebaseZ,
+                    () -> !isLatest(request.requestId));
+            if (isLatest(request.requestId)) {
+                if (data.lightCount() == 0) {
+                    completions.add(new Empty(request.requestId));
+                } else {
+                    // VMA allocation, staging serialization/flush, and executor enqueue all stay on this
+                    // worker. The render thread only atomically publishes Uploaded.
+                    submitUpload(request.ctx, request.requestId, data);
                 }
-                try {
-                    RtLightHierarchy.Data data = RtLightHierarchy.build(request.input.sections,
-                            request.input.rebaseX, request.input.rebaseY, request.input.rebaseZ,
-                            () -> !isLatest(request.requestId));
-                    if (isLatest(request.requestId)) {
-                        if (data.lightCount() == 0) {
-                            completions.add(new Prepared(request.requestId, data, null));
-                        } else {
-                            // VMA allocation, staging serialization/flush, and executor enqueue all stay
-                            // on this worker. The render thread only atomically publishes Uploaded.
-                            submitUpload(request.ctx, request.requestId, data);
-                        }
-                    }
-                } catch (Throwable t) {
-                    if (isLatest(request.requestId)) {
-                        completions.add(new Prepared(request.requestId, null, t));
-                    }
-                }
+            }
+        } catch (Throwable t) {
+            if (isLatest(request.requestId)) {
+                completions.add(new Failed(request.requestId, t));
             }
         } finally {
             finishTask();
@@ -444,9 +433,9 @@ final class RtLightGridManager {
         }
     }
 
-    private sealed interface Completion permits Prepared, Uploaded { }
-    private record Prepared(long requestId, RtLightHierarchy.Data data, Throwable failure)
-            implements Completion { }
+    private sealed interface Completion permits Failed, Empty, Uploaded { }
+    private record Failed(long requestId, Throwable failure) implements Completion { }
+    private record Empty(long requestId) implements Completion { }
     private record Uploaded(long requestId, RtLightHierarchy.Data data, RtBuffer arena, Layout layout,
                             RtGpuExecutor.Build build, Throwable failure) implements Completion {
         void destroy() { arena.destroy(); }
