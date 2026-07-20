@@ -25,8 +25,7 @@ final class RtReGIRTest {
         for (int firstLight : data.spanFirstLights()) assertEquals(7, firstLight);
         for (int count : data.spanLightCounts()) assertEquals(2, count);
         for (float accept : data.spanAccept()) assertEquals(1f, accept, 0f);
-        for (float pdf : data.spanSelfPdfs()) assertEquals(1f, pdf, 0f);
-        for (float mass : data.spanSelfGlobalMasses()) assertEquals(1f, mass, 0f);
+        assertEquals(125L * 16L, data.spanBytes());
     }
 
     @Test
@@ -56,8 +55,6 @@ final class RtReGIRTest {
         assertEquals(0.25f, data.cellInvWeightSums()[cell], 1.0e-6f);
         assertEquals(0.25, aliasProbability(data, first, count, 4), 1.0e-6);
         assertEquals(0.75, aliasProbability(data, first, count, 8), 1.0e-6);
-        assertEquals(0.25f, data.spanSelfGlobalMasses()[first], 1.0e-6f);
-        assertEquals(0.75f, data.spanSelfGlobalMasses()[first + 1], 1.0e-6f);
     }
 
     @Test

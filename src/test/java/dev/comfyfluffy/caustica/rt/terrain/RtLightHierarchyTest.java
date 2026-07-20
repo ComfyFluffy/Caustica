@@ -25,23 +25,18 @@ final class RtLightHierarchyTest {
         assertEquals(2, data.sectionFirstLights()[5]);
         assertEquals(1, data.sectionLightCounts()[5]);
 
-        // Section slot 2 has light powers 1 and 3, so their reciprocal local PDFs are 4 and 4/3.
-        assertEquals(4f, data.localAliases().selfInvPdf()[0], 1.0e-6f);
-        assertEquals(4f / 3f, data.localAliases().selfInvPdf()[1], 1.0e-6f);
+        // Section slot 2 has light powers 1 and 3.
+        assertEquals(0.25, aliasProbability(data.localAliases(), 0, 2, 0), 1.0e-6);
+        assertEquals(0.75, aliasProbability(data.localAliases(), 0, 2, 1), 1.0e-6);
         // Position is compacted into rebased world coordinates by the worker.
         assertEquals(0f, data.packedLights()[0], 0f);
-        assertEquals(48f, data.packedLights()[2 * 16], 0f);
-        // Grid origin is section (-1,-2,-2), so metadata coordinates are grid-relative. Power is
-        // duplicated per light to make a globally selected light's reverse PDF a single direct load.
-        assertEquals(2, data.lightSectionCoords()[0]);
-        assertEquals(2, data.lightSectionCoords()[1]);
-        assertEquals(2, data.lightSectionCoords()[2]);
-        assertEquals(4f, data.lightSectionPowers()[0], 1.0e-6f);
-        assertEquals(5, data.lightSectionCoords()[6]);
-        assertEquals(4, data.lightSectionCoords()[7]);
-        assertEquals(3, data.lightSectionCoords()[8]);
-        assertEquals(2f, data.lightSectionPowers()[2], 1.0e-6f);
-        assertEquals(3L * 16L, data.sectionMetadataBytes());
+        assertEquals(48f, data.packedLights()[2 * 12], 0f);
+        // Grid-relative section coordinates live in the final Light48 lane.
+        assertPackedCoord(data.packedLights()[11], 2, 2, 2);
+        assertPackedCoord(data.packedLights()[2 * 12 + 11], 5, 4, 3);
+        assertEquals(1f / 6f, data.invGlobalPowerSum(), 1.0e-6f);
+        assertEquals(3L * 48L, data.lightBytes());
+        assertEquals(3L * 8L, data.globalAliases().bytes());
     }
 
     @Test
@@ -62,10 +57,27 @@ final class RtLightHierarchyTest {
         assertEquals(1, grid.spanFirstLights()[firstSpan + 1]);
         assertEquals(1, grid.spanLightCounts()[firstSpan]);
         assertEquals(1, grid.spanLightCounts()[firstSpan + 1]);
-        assertEquals(0.5f, grid.spanSelfPdfs()[firstSpan], 1.0e-6f);
-        assertEquals(0.5f, grid.spanSelfPdfs()[firstSpan + 1], 1.0e-6f);
-        assertEquals(0.5f, grid.spanSelfGlobalMasses()[firstSpan], 1.0e-6f);
-        assertEquals(0.5f, grid.spanSelfGlobalMasses()[firstSpan + 1], 1.0e-6f);
+        assertEquals(0.5, spanAliasProbability(grid, firstSpan, 2, 0), 1.0e-6);
+        assertEquals(0.5, spanAliasProbability(grid, firstSpan, 2, 1), 1.0e-6);
+        assertEquals(grid.spanFirstLights().length * 16L, grid.spanBytes());
+    }
+
+    @Test
+    void mortonOrderOverridesUnrelatedStableSlotOrder() {
+        RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
+                new RtLightHierarchy.SectionInput(0, 8, 0, 0, light(1f, 1f)),
+                new RtLightHierarchy.SectionInput(9, 0, 0, 0, light(1f, 1f))), 0, 0, 0);
+
+        assertEquals(0, data.sectionFirstLights()[9]);
+        assertEquals(1, data.sectionFirstLights()[0]);
+    }
+
+    @Test
+    void packedRadianceRoundTripsRepresentativeHdrValues() {
+        int packed = RtLightHierarchy.packR11G11B10(0.125f, 5.0f, 31.5f);
+        assertEquals(0.125f, RtLightHierarchy.unpackUnsignedFloat(packed & 0x7ff, 6), 0.002f);
+        assertEquals(5.0f, RtLightHierarchy.unpackUnsignedFloat((packed >>> 11) & 0x7ff, 6), 0.04f);
+        assertEquals(31.5f, RtLightHierarchy.unpackUnsignedFloat((packed >>> 22) & 0x3ff, 5), 0.5f);
     }
 
     @Test
@@ -105,5 +117,40 @@ final class RtLightHierarchyTest {
         System.arraycopy(a, 0, result, 0, a.length);
         System.arraycopy(b, 0, result, a.length, b.length);
         return result;
+    }
+
+    private static double aliasProbability(RtLightHierarchy.AliasData data, int first, int count,
+                                           int targetLocalIndex) {
+        double probability = 0.0;
+        for (int column = 0; column < count; column++) {
+            int index = first + column;
+            if (column == targetLocalIndex) probability += data.accept()[index] / count;
+            if (data.aliasIndices()[index] == targetLocalIndex) {
+                probability += (1.0 - data.accept()[index]) / count;
+            }
+        }
+        return probability;
+    }
+
+    private static double spanAliasProbability(RtReGIR.Data data, int first, int count,
+                                               int targetFirstLight) {
+        double probability = 0.0;
+        for (int column = 0; column < count; column++) {
+            int span = first + column;
+            if (data.spanFirstLights()[span] == targetFirstLight) {
+                probability += data.spanAccept()[span] / count;
+            }
+            if (data.spanAliasFirstLights()[span] == targetFirstLight) {
+                probability += (1.0 - data.spanAccept()[span]) / count;
+            }
+        }
+        return probability;
+    }
+
+    private static void assertPackedCoord(float packedFloat, int x, int y, int z) {
+        int packed = Float.floatToRawIntBits(packedFloat);
+        assertEquals(x, packed & 0x3ff);
+        assertEquals(y, (packed >>> 10) & 0x3ff);
+        assertEquals(z, (packed >>> 20) & 0x3ff);
     }
 }

@@ -578,6 +578,9 @@ public final class CausticaConfig {
                     bool("caustica.rt.restirPermutation", "lights.temporal-permutation", true);
             public static final FloatSetting MIN_FILL_RATIO =
                     finiteFloat("caustica.rt.lightMinFillRatio", "lights.min-fill-ratio", 0.25f);
+            public static final IntSetting HIERARCHY_BUDGET_MIB =
+                    intAtLeast("caustica.rt.lightHierarchyBudgetMiB",
+                            "lights.hierarchy-budget-mib", 256, 16);
             public static final BooleanSetting STATS = bool("caustica.rt.lightStats", "lights.stats", false);
             public static final BooleanSetting DUMP = bool("caustica.rt.lightDump", "lights.dump", false);
             public static final IntSetting DUMP_RADIUS =

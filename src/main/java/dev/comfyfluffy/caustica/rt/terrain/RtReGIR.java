@@ -30,13 +30,15 @@ final class RtReGIR {
         int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
         int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
         int poweredCount = 0;
-        double globalPower = 0.0;
         for (int i = 0; i < sections.size(); i++) {
             if ((i & 255) == 0) checkCancelled(cancelled);
             SectionLights section = sections.get(i);
             if (!(section.power > 0.0)) continue;
             poweredCount++;
-            globalPower += section.power;
+            if (section.lightCount > 0xffff) {
+                throw new IllegalStateException("Section light count exceeds Span16 capacity: "
+                        + section.lightCount);
+            }
             minX = Math.min(minX, section.x - NEIGHBOR_RADIUS);
             minY = Math.min(minY, section.y - NEIGHBOR_RADIUS);
             minZ = Math.min(minZ, section.z - NEIGHBOR_RADIUS);
@@ -95,10 +97,6 @@ final class RtReGIR {
         int[] spanAliasFirstLights = new int[prefix];
         int[] spanAliasLightCounts = new int[prefix];
         float[] spanAccept = new float[prefix];
-        float[] spanSelfPdfs = new float[prefix];
-        float[] spanAliasPdfs = new float[prefix];
-        float[] spanSelfGlobalMasses = new float[prefix];
-        float[] spanAliasGlobalMasses = new float[prefix];
         double[] spanWeights = new double[prefix];
         int[] writeOffsets = cellOffsets.clone();
 
@@ -117,7 +115,6 @@ final class RtReGIR {
                         int distanceSq = dx * dx + dy * dy + dz * dz;
                         spanFirstLights[span] = source.firstLight;
                         spanLightCounts[span] = source.lightCount;
-                        spanSelfGlobalMasses[span] = (float) (source.power / globalPower);
                         // The common 16^2 block-to-section scale cancels during normalization. Keeping
                         // this in section units lets the shader reconstruct the same weight in O(1).
                         spanWeights[span] = source.power / Math.max(1, distanceSq);
@@ -142,9 +139,7 @@ final class RtReGIR {
             int smallCount = 0;
             int largeCount = 0;
             for (int i = 0; i < count; i++) {
-                double probability = spanWeights[first + i] / totalWeight;
-                spanSelfPdfs[first + i] = (float) probability;
-                scaled[i] = probability * count;
+                scaled[i] = spanWeights[first + i] * count / totalWeight;
                 if (scaled[i] < 1.0) small[smallCount++] = i;
                 else large[largeCount++] = i;
             }
@@ -171,16 +166,13 @@ final class RtReGIR {
                 int aliasSpan = first + aliases[i];
                 spanAliasFirstLights[first + i] = spanFirstLights[aliasSpan];
                 spanAliasLightCounts[first + i] = spanLightCounts[aliasSpan];
-                spanAliasPdfs[first + i] = spanSelfPdfs[aliasSpan];
-                spanAliasGlobalMasses[first + i] = spanSelfGlobalMasses[aliasSpan];
             }
         }
 
         return new Data(minX * 16 - rebaseX, minY * 16 - rebaseY, minZ * 16 - rebaseZ,
                 dimX, dimY, dimZ, cellOffsets, cellCounts, cellInvWeightSums,
                 spanFirstLights, spanLightCounts, spanAliasFirstLights, spanAliasLightCounts,
-                spanAccept, spanSelfPdfs, spanAliasPdfs,
-                spanSelfGlobalMasses, spanAliasGlobalMasses, populatedCells, spanCountLong);
+                spanAccept, populatedCells, spanCountLong);
     }
 
     private static void checkCancelled(BooleanSupplier cancelled) {
@@ -194,15 +186,13 @@ final class RtReGIR {
                 int[] cellOffsets, int[] cellCounts, float[] cellInvWeightSums,
                 int[] spanFirstLights, int[] spanLightCounts,
                 int[] spanAliasFirstLights, int[] spanAliasLightCounts,
-                float[] spanAccept, float[] spanSelfPdfs, float[] spanAliasPdfs,
-                float[] spanSelfGlobalMasses, float[] spanAliasGlobalMasses,
-                int populatedCells, long representedSections) {
+                float[] spanAccept, int populatedCells, long representedSections) {
         long cellBytes() {
             return Math.multiplyExact((long) cellOffsets.length, 12L);
         }
 
         long spanBytes() {
-            return Math.multiplyExact((long) spanFirstLights.length, 36L);
+            return Math.multiplyExact((long) spanFirstLights.length, 16L);
         }
     }
 }

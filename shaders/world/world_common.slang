@@ -56,8 +56,7 @@ public struct WorldPush {
     public uint64_t lightBufAddr;     // ReSTIR DI global light buffer (0 = none published)
     public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
     public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
-    public uint64_t lightSectionMetaAddr; // per-light section coordinate/power for O(1) reverse PDFs
-    public float3   lightRebaseOffset; // hierarchy rebase origin minus current terrain rebase origin
+    public float4   lightRebase;      // xyz hierarchy-to-current rebase, w inverse total light power
     public uint64_t regirCellAddr;    // dense ReGIR cell headers (0 = global proposals only)
     public uint64_t regirSpanAddr;      // packed weighted section spans referenced by cell headers
     public float4   regirOrigin;      // xyz minimum cell origin in rebased blocks, w cell size
@@ -69,30 +68,18 @@ public struct WorldPush {
     public float3   restirRebase;     // current terrain rebase origin minus previous history's origin
 };
 
-// ReSTIR DI hot area-light record. The CPU collector retains a richer 80 B section-local record, but
-// publish compacts the fields touched by every RIS candidate into four vec4s (64 B). Cold material
-// and UV metadata will live in a separate survivor-only buffer when exact-texel Le is implemented.
+// 48-byte hot area-light record. Radiance uses packed R11G11B10 and the grid-relative owner section
+// uses three unsigned 10-bit coordinates; the geometric normal is reconstructed from the half axes.
 public struct Light {
-    public float4 posArea;   // xyz rectangle center, w rectangle area
-    public float4 normalLeR; // xyz outward normal, w mean radiance R
-    public float4 halfULeG;  // xyz world half-axis U, w mean radiance G
-    public float4 halfVLeB;  // xyz world half-axis V, w mean radiance B
+    public float4 posArea;
+    public float4 halfULe;       // xyz world half-axis U, w bitcast R11G11B10 radiance
+    public float4 halfVSection;  // xyz half-axis V, w bitcast 10:10:10 section + normal-flip bit
 };
 
-// Vose alias-table column. One random column load yields both the chosen light index and the reciprocal
-// source PDF needed by RIS, avoiding a second scattered probability-buffer read.
+// Eight-byte Vose alias-table column. PDFs are reconstructed from the selected Light.
 public struct LightAlias {
     public uint  aliasIndex;
     public float accept;
-    public float selfInvPdf;
-    public float aliasInvPdf;
-};
-
-// Duplicated once per light so a globally selected light can recover its cell-proposal section
-// probability with one direct load. sectionCoord is relative to the ReGIR grid origin, in sections.
-public struct LightSectionMetadata {
-    public int3  sectionCoord;
-    public float sectionPower;
 };
 
 // Dense ReGIR grid entry. Empty coordinates have spanCount=0; populated section cells point into an
@@ -103,19 +90,12 @@ public struct ReGIRCell {
     public float invWeightSum;
 };
 
-// One Vose alias column for the section distribution of a cell. Selection needs one 36-byte load and
-// no dependent section-header or global-alias fetch. Reverse PDFs use LightSectionMetadata instead of
-// searching the span records.
+// One 16-byte Vose alias column for a cell's section distribution. The two light counts are uint16s.
 public struct ReGIRSpan {
     public uint firstLight;
-    public uint lightCount;
     public uint aliasFirstLight;
-    public uint aliasLightCount;
+    public uint packedLightCounts; // low16 self, high16 alias
     public float accept;
-    public float selfPdf;
-    public float aliasPdf;
-    public float selfGlobalMass;
-    public float aliasGlobalMass;
 };
 
 // TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).
