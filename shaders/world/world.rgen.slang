@@ -417,7 +417,7 @@ Reservoir resEmpty() {
 // Unshadowed contribution f*Le*G*area of a fixed light sample point at surface (p,n,v); out p-hat = its
 // luminance (the resampling target). Same BRDF split the sun NEE uses.
 float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 p, float3 n, float3 v,
-                         float3 diffAlb, float3 F0, float rough, bool pbr, out float phat) {
+                         float3 diffAlb, float3 F0, float rough, bool pbr, bool twoSided, out float phat) {
     phat = 0.0;
     float3 toL = sp - p;
     float dist2 = dot(toL, toL);
@@ -427,7 +427,10 @@ float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 p
     float dist = sqrt(dist2);
     float3 wi = toL / dist;
     float ndl = dot(n, wi);
-    if (ndl <= 0.0) {
+    if (twoSided) {
+        // Billboards have no back face: light striking either side illuminates the same texel.
+        ndl = abs(ndl);
+    } else if (ndl <= 0.0) {
         return float3(0.0, 0.0, 0.0); // light below the surface horizon
     }
     float cosL = max(0.0, dot(lnrm, -wi));
@@ -567,7 +570,7 @@ void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposal
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
 // sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
 Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough, bool pbr,
-                     inout uint seed, inout uint proposalSeed) {
+                     inout uint seed, inout uint proposalSeed, bool twoSided) {
     Reservoir r = resEmpty();
     LightGridCell gridCell;
     int3 gridCellCoord;
@@ -605,7 +608,7 @@ Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, fl
         float3 lightNormal = lightGeometricNormal(lg);
         float phat;
         evalSampleContrib(sp, lightNormal, le, lg.posArea.w, p, n, v,
-                diffAlb, F0, rough, pbr, phat);
+                diffAlb, F0, rough, pbr, twoSided, phat);
         if (phat <= 0.0) {
             continue;
         }
@@ -627,13 +630,13 @@ Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, fl
 // Shade a finalized reservoir: recompute the survivor's contribution at (p,n,v), cast ONE shadow ray,
 // and return throughput-free radiance contrib*vis*W.
 float3 shadeReservoir(Reservoir s, float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough,
-                      bool pbr, out float3 vis) {
+                      bool pbr, out float3 vis, bool twoSided) {
     vis = float3(0.0, 0.0, 0.0);
     if (s.W <= 0.0 || s.phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
     float phat;
-    float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, p, n, v, diffAlb, F0, rough, pbr, phat);
+    float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, p, n, v, diffAlb, F0, rough, pbr, twoSided, phat);
     if (phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
@@ -949,6 +952,17 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
                 }
             }
 
+            // RIS direct lighting from block emitters (lava, glowstone, torches, ...) — same reservoir
+            // sampler as terrain/entities above, but two-sided: a billboard has no back face, so light
+            // striking either side of the quad should still land (matches the sun/moon NEE above).
+            if (risOn) {
+                float3 v = -rd;
+                float3 p = hitPos + n * SURF_BIAS;
+                Reservoir r = risInitial(p, n, v, albedo, float3(0.0, 0.0, 0.0), 1.0, false, seed, proposalSeed, true);
+                float3 risVis;
+                L += throughput * shadeReservoir(r, p, n, v, albedo, float3(0.0, 0.0, 0.0), 1.0, false, risVis, true);
+            }
+
             if (bounce >= maxBounces) {
                 break;
             }
@@ -1099,9 +1113,9 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
 
         // RIS direct lighting from block emitters (single-frame only, no temporal reservoir reuse).
         if (risOn) {
-            Reservoir r = risInitial(p, n, v, diffAlb, F0, rough, pbr, seed, proposalSeed);
+            Reservoir r = risInitial(p, n, v, diffAlb, F0, rough, pbr, seed, proposalSeed, false);
             float3 risVis;
-            L += throughput * shadeReservoir(r, p, n, v, diffAlb, F0, rough, pbr, risVis);
+            L += throughput * shadeReservoir(r, p, n, v, diffAlb, F0, rough, pbr, risVis, false);
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the
