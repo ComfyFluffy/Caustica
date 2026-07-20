@@ -863,15 +863,12 @@ public final class RtComposite {
                     // RIS emitter NEE: published light buffer + RIS candidate count (0 = emitter NEE off;
                     // the shader also requires lightCount > 0, so an empty buffer degrades to legacy gather).
                     terrain.lightBufferAddress(),
-                    CausticaConfig.Rt.Lights.POWER_SAMPLING.value()
-                            ? terrain.lightAliasBufferAddress() : 0L,
+                    terrain.lightAliasBufferAddress(),
                     terrain.lightLocalAliasBufferAddress(),
                     new Float4(terrain.lightRebaseOffsetX(), terrain.lightRebaseOffsetY(),
                             terrain.lightRebaseOffsetZ(), terrain.lightInvGlobalPowerSum()),
-                    CausticaConfig.Rt.Lights.LIGHT_GRID_ENABLED.value()
-                            ? terrain.lightGridCellBufferAddress() : 0L,
-                    CausticaConfig.Rt.Lights.LIGHT_GRID_ENABLED.value()
-                            ? terrain.lightGridSpanBufferAddress() : 0L,
+                    terrain.lightGridCellBufferAddress(),
+                    terrain.lightGridSpanBufferAddress(),
                     new Float4(terrain.lightGridOriginX(), terrain.lightGridOriginY(), terrain.lightGridOriginZ(), 16f),
                     new Int4(terrain.lightGridDimX(), terrain.lightGridDimY(), terrain.lightGridDimZ(), 0),
                     terrain.lightCount(),

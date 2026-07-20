@@ -162,21 +162,7 @@ final class RtLightGridManager {
     }
 
     private void submitUpload(RtContext ctx, long requestId, RtLightHierarchy.Data data) {
-        long budgetBytes = Math.multiplyExact(
-                (long) CausticaConfig.Rt.Lights.HIERARCHY_BUDGET_MIB.value(), 1024L * 1024L);
         Layout layout = Layout.of(data, data.grid() != null);
-        if (layout.totalBytes > budgetBytes && layout.hasGrid) {
-            CausticaMod.LOGGER.warn("RT light hierarchy {} requires {} MiB (budget {} MiB); "
-                            + "publishing its global proposal only", requestId,
-                    (layout.totalBytes + 0xfffffL) >> 20, budgetBytes >> 20);
-            layout = Layout.of(data, false);
-        }
-        if (layout.totalBytes > budgetBytes) {
-            CausticaMod.LOGGER.error("RT light hierarchy {} global data requires {} MiB "
-                            + "(budget {} MiB); retaining the previous published generation",
-                    requestId, (layout.totalBytes + 0xfffffL) >> 20, budgetBytes >> 20);
-            return;
-        }
 
         RtBuffer arena = null;
         RtBuffer upload = null;
