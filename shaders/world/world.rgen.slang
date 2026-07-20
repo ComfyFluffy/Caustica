@@ -380,12 +380,14 @@ float3 sampleGGXVNDF(float3 n, float3 ve, float rough, inout uint s) {
     return normalize(Ne.x * t + Ne.y * b + Ne.z * n);                 // -> world space
 }
 
-// ===== ReSTIR DI: RIS emitter NEE + primary-vertex temporal reuse (RESTIR_PLAN.md) =====================
+// ===== RIS emitter NEE (RESTIR_PLAN.md) =================================================================
 // Block emitters (torches, glowstone, lava, ...) get explicit NEE: per diffuse vertex, stream M uniform
 // candidates from the global light buffer through a weighted reservoir keyed by the UNSHADOWED target
 // p-hat = luminance(f * Le * G * area), then spend ONE shadow ray on the survivor. Sun/moon NEE stays
 // separate and additive. Lights are footprint bounding RECTANGLES (RtLightCollector): sampling a point
 // uniformly over the rectangle has pdf 1/area, so `area` rides the contribution like any area light.
+// Single-frame RIS only (no temporal reservoir reuse): DLSS-RR's own history already denoises this well
+// enough that a persistent per-pixel reservoir wasn't worth the added complexity and VRAM.
 
 // A reservoir in registers. pos/lnrm/le/area describe the chosen emitter sample; W is its unbiased
 // contribution weight, M the effective sample count. wSum/phat are streaming scratch (not persisted).
@@ -400,19 +402,6 @@ struct Reservoir {
     float phat;
 };
 
-// One persistent per-pixel reservoir. Four float4 lanes keep the device record at 64 B: the selected
-// light sample, its effective sample count/normal, its radiance/normalization weight, and the primary
-// surface used to reject disocclusions. Sample and surface positions use the writing frame's terrain-
-// rebased coordinates and are translated by worldPush.restirRebase when read.
-struct ReservoirRec {
-    float4 samplePosArea;
-    float4 lightNormalM;
-    float4 radianceW;
-    float4 surfaceNormalPos;
-};
-
-static const float TEMPORAL_M_CAP = 20.0;
-
 Reservoir resEmpty() {
     Reservoir r;
     r.pos = float3(0.0, 0.0, 0.0);
@@ -424,63 +413,6 @@ Reservoir resEmpty() {
     r.wSum = 0.0;
     r.phat = 0.0;
     return r;
-}
-
-float2 octWrap(float2 v) {
-    return (1.0 - abs(v.yx)) * float2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
-}
-
-// Octahedral normal packed into one 32-bit lane as two UNORM16 values. The lane is treated only as bits.
-float packNormal(float3 n) {
-    n /= abs(n.x) + abs(n.y) + abs(n.z) + 1.0e-8;
-    float2 e = n.z >= 0.0 ? n.xy : octWrap(n.xy);
-    uint2 q = uint2(round(saturate(e * 0.5 + 0.5) * 65535.0));
-    return asfloat(q.x | (q.y << 16u));
-}
-
-float3 unpackNormal(float packed) {
-    uint q = asuint(packed);
-    float2 e = float2(float(q & 0xffffu), float(q >> 16u)) * (2.0 / 65535.0) - 1.0;
-    float3 n = float3(e, 1.0 - abs(e.x) - abs(e.y));
-    float t = max(-n.z, 0.0);
-    n.xy += float2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
-    return normalize(n);
-}
-
-// RTXDI-style permutation sampling. Re-keying the temporal read within a 4x4 neighborhood prevents
-// a static camera from feeding each pixel its own reservoir forever (fixed grain that RR can learn as
-// image detail). Surface validation below rejects shuffled neighbors across geometry boundaries.
-int2 applyPermutation(int2 prevPix, uint frame) {
-    int2 offset = int2(int(frame & 3u), int((frame >> 2u) & 3u));
-    prevPix += offset;
-    prevPix.x = prevPix.x ^ 3;
-    prevPix.y = prevPix.y ^ 3;
-    return prevPix - offset;
-}
-
-Reservoir loadReservoir(uint64_t address, uint index, out float3 surfaceNormal, out float3 surfacePos) {
-    ReservoirRec rec = ConstPtr<ReservoirRec>(address)[index];
-    Reservoir r;
-    r.pos = rec.samplePosArea.xyz;
-    r.area = rec.samplePosArea.w;
-    r.lnrm = rec.lightNormalM.xyz;
-    r.M = rec.lightNormalM.w;
-    r.le = rec.radianceW.xyz;
-    r.W = rec.radianceW.w;
-    r.wSum = 0.0;
-    r.phat = 0.0;
-    surfaceNormal = unpackNormal(rec.surfaceNormalPos.x);
-    surfacePos = rec.surfaceNormalPos.yzw;
-    return r;
-}
-
-void storeReservoir(uint64_t address, uint index, Reservoir r, float3 surfaceNormal, float3 surfacePos) {
-    ReservoirRec rec;
-    rec.samplePosArea = float4(r.pos, r.area);
-    rec.lightNormalM = float4(r.lnrm, r.M);
-    rec.radianceW = float4(r.le, r.W);
-    rec.surfaceNormalPos = float4(packNormal(surfaceNormal), surfacePos.x, surfacePos.y, surfacePos.z);
-    RWPtr<ReservoirRec>(address)[index] = rec;
 }
 
 // Unshadowed contribution f*Le*G*area of a fixed light sample point at surface (p,n,v); out p-hat = its
@@ -693,25 +625,8 @@ Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, fl
     return r;
 }
 
-// Stream one already-resampled input reservoir into `s`, re-evaluating its target at the current pixel.
-// This is Bitterli et al. Algorithm 4's reservoir-of-reservoirs update: an input represents Mi candidates
-// and contributes weight p-hat-current * Wi * Mi.
-void resMerge(inout Reservoir s, Reservoir input, float Mi, float phatCurrent, inout uint seed) {
-    s.M += Mi;
-    float w = phatCurrent * input.W * Mi;
-    if (w <= 0.0) return;
-    s.wSum += w;
-    if (rndf(seed) * s.wSum < w) {
-        s.pos = input.pos;
-        s.lnrm = input.lnrm;
-        s.le = input.le;
-        s.area = input.area;
-        s.phat = phatCurrent;
-    }
-}
-
 // Shade a finalized reservoir: recompute the survivor's contribution at (p,n,v), cast ONE shadow ray,
-// and return throughput-free radiance contrib*vis*W. `vis` is reported for S2's visibility reuse.
+// and return throughput-free radiance contrib*vis*W.
 float3 shadeReservoir(Reservoir s, float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough,
                       bool pbr, out float3 vis) {
     vis = float3(0.0, 0.0, 0.0);
@@ -1181,65 +1096,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             }
         }
 
-        // ReSTIR DI: RIS direct lighting from block emitters. Temporal reuse maps one reservoir to each
-        // primary pixel, so it runs only at bounce 0 and for the first SPP sample. Every other vertex keeps
-        // the single-frame RIS path. The merged survivor always gets a fresh visibility ray.
+        // RIS direct lighting from block emitters (single-frame only, no temporal reservoir reuse).
         if (risOn) {
-            bool doTemporal = (worldPush.flags & 4u) != 0u && bounce == 0 && sampleIndex == 0u
-                    && worldPush.restirCurAddr != 0;
-            if (doTemporal) {
-                Reservoir cur = risInitial(p, n, v, diffAlb, F0, rough, pbr, seed, proposalSeed);
-                Reservoir merged = resEmpty();
-                resMerge(merged, cur, cur.M, cur.phat, seed);
-
-                float4 prevClip = mul(worldPush.prevViewProj,
-                        float4(gv_motionHitCamRel + worldPush.camDelta - gv_motionObjDisp, 1.0));
-                int2 size = int2(DispatchRaysDimensions().xy);
-                int2 prevPix = int2(-1, -1);
-                if (prevClip.w > 0.0) {
-                    float2 prevNdc = prevClip.xy / prevClip.w;
-                    prevPix = int2(floor((prevNdc * 0.5 + 0.5) * float2(size)));
-                    if ((worldPush.flags & 8u) != 0u) {
-                        prevPix = applyPermutation(prevPix, worldPush.frameIndex);
-                    }
-                }
-
-                if (worldPush.restirPrevAddr != 0
-                        && all(prevPix >= int2(0, 0)) && all(prevPix < size)) {
-                    float3 previousSurfaceNormal;
-                    float3 previousSurfacePos;
-                    uint previousIndex = uint(prevPix.y) * uint(size.x) + uint(prevPix.x);
-                    Reservoir previous = loadReservoir(worldPush.restirPrevAddr, previousIndex,
-                            previousSurfaceNormal, previousSurfacePos);
-                    previous.pos -= worldPush.restirRebase;
-                    previousSurfacePos -= worldPush.restirRebase;
-
-                    // Compare in the previous frame's world position. This makes moving entities reject
-                    // correctly instead of accepting small motion merely because it fits the distance slack.
-                    float3 expectedPreviousSurfacePos = hitPos - gv_motionObjDisp;
-                    float distanceThreshold = max(0.1 * payload.hitT, 0.25);
-                    if (previous.M > 0.0 && previous.W > 0.0
-                            && dot(previousSurfaceNormal, n) > 0.9
-                            && distance(previousSurfacePos, expectedPreviousSurfacePos) < distanceThreshold) {
-                        float previousM = min(previous.M, TEMPORAL_M_CAP * cur.M);
-                        float previousPhat;
-                        evalSampleContrib(previous.pos, previous.lnrm, previous.le, previous.area,
-                                p, n, v, diffAlb, F0, rough, pbr, previousPhat);
-                        resMerge(merged, previous, previousM, previousPhat, seed);
-                    }
-                }
-
-                merged.W = merged.phat > 0.0 ? merged.wSum / (merged.M * merged.phat) : 0.0;
-                float3 risVis;
-                L += throughput * shadeReservoir(merged, p, n, v, diffAlb, F0, rough, pbr, risVis);
-                if (max(risVis.r, max(risVis.g, risVis.b)) <= 0.0) merged.W = 0.0;
-                uint currentIndex = pix.y * uint(size.x) + pix.x;
-                storeReservoir(worldPush.restirCurAddr, currentIndex, merged, n, hitPos);
-            } else {
-                Reservoir r = risInitial(p, n, v, diffAlb, F0, rough, pbr, seed, proposalSeed);
-                float3 risVis;
-                L += throughput * shadeReservoir(r, p, n, v, diffAlb, F0, rough, pbr, risVis);
-            }
+            Reservoir r = risInitial(p, n, v, diffAlb, F0, rough, pbr, seed, proposalSeed);
+            float3 risVis;
+            L += throughput * shadeReservoir(r, p, n, v, diffAlb, F0, rough, pbr, risVis);
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the
@@ -1313,13 +1174,6 @@ void main() {
     worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0]; // load the per-frame push data from the BDA buffer
     int2 pix = int2(DispatchRaysIndex().xy);
     float2 size = float2(DispatchRaysDimensions().xy);
-    // Not every primary ray reaches an opaque RIS vertex (sky, water, glass, particles). Invalidate this
-    // frame's destination slot up front so those pixels cannot expose a two-frames-old reservoir when the
-    // ping-pong buffer comes around again. An opaque primary temporal path overwrites the full record later.
-    if ((worldPush.flags & 4u) != 0u && worldPush.restirCurAddr != 0) {
-        uint historyIndex = uint(pix.y) * uint(size.x) + uint(pix.x);
-        RWPtr<ReservoirRec>(worldPush.restirCurAddr)[historyIndex].lightNormalM.w = 0.0;
-    }
     float2 uv = (float2(pix) + 0.5) / size;
     float2 ndc = uv * 2.0 - 1.0; // unjittered pixel centre — the motion vector reprojects this
 

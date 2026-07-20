@@ -112,11 +112,6 @@ public final class RtComposite {
         return CausticaConfig.Rt.Composite.MAX_BOUNCES.value();
     }
 
-    private static boolean temporalReuse() {
-        return CausticaConfig.Rt.Lights.TEMPORAL_REUSE.value()
-                && CausticaConfig.Rt.Lights.RIS_CANDIDATES.value() > 0;
-    }
-
     private static boolean waterWaves() {
         return CausticaConfig.Rt.Composite.WATER_WAVES.value();
     }
@@ -239,19 +234,6 @@ public final class RtComposite {
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
     private final RtExposure exposure = new RtExposure();
-    // ReSTIR DI temporal history: two 64-byte-per-pixel device-local buffers. Only the first SPP sample's
-    // primary diffuse vertex writes a record; the next traced frame reprojects and reads it. The write
-    // index advances only after a frame actually writes history, so skipped/debug/no-light frames cannot
-    // make the ping-pong select an unwritten buffer.
-    private static final int RESTIR_RESERVOIR_BYTES = 64;
-    private RtBuffer[] restirReservoirs;
-    private boolean restirNeedsClear;
-    private boolean restirHasHistory;
-    private int restirWriteIndex;
-    private int restirPrevBlockX;
-    private int restirPrevBlockY;
-    private int restirPrevBlockZ;
-    private long restirPrevLightGeneration;
 
     // Trace + guide buffers run at render res; composite (display-mapping) runs at display res.
     private int displayW = -1;
@@ -475,7 +457,6 @@ public final class RtComposite {
                 }
             }
             ensureOutput(ctx, width, height);
-            syncReservoirConfiguration(ctx);
             // Cheap idempotent check every frame (not just on resize): if the exposure mode is switched
             // manual -> auto at runtime (video settings), the auto-mode histogram/state/pipeline must be
             // allocated before recordFrame's exposure.record() below needs them, or it throws.
@@ -635,8 +616,6 @@ public final class RtComposite {
     public void onResourceReloadStart() {
         reloadRebindRequested = true;
         materialBindingsReady = false;
-        restirHasHistory = false;
-        restirNeedsClear = restirReservoirs != null;
         setCelestialUvAtlas(0L);
         RtEntities.INSTANCE.onResourceReload();
         RtContext ctx = RtContext.currentOrNull();
@@ -693,45 +672,6 @@ public final class RtComposite {
             rrOutput.destroy();
             rrOutput = null;
         }
-        destroyReservoirs();
-    }
-
-    private void syncReservoirConfiguration(RtContext ctx) {
-        if (!temporalReuse()) {
-            restirHasHistory = false;
-            return;
-        }
-        if (restirReservoirs != null) {
-            return;
-        }
-        long pixels = Math.multiplyExact((long) renderW, (long) renderH);
-        long bytes = Math.multiplyExact(pixels, RESTIR_RESERVOIR_BYTES);
-        int usage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        RtBuffer first = ctx.createBuffer(bytes, usage, false,
-                "rt ReSTIR reservoir 0 " + renderW + "x" + renderH);
-        try {
-            RtBuffer second = ctx.createBuffer(bytes, usage, false,
-                    "rt ReSTIR reservoir 1 " + renderW + "x" + renderH);
-            restirReservoirs = new RtBuffer[]{first, second};
-        } catch (Throwable t) {
-            first.destroy();
-            throw t;
-        }
-        restirNeedsClear = true;
-        restirHasHistory = false;
-        restirWriteIndex = 0;
-    }
-
-    private void destroyReservoirs() {
-        if (restirReservoirs != null) {
-            for (RtBuffer buffer : restirReservoirs) {
-                if (buffer != null) buffer.destroy();
-            }
-            restirReservoirs = null;
-        }
-        restirNeedsClear = false;
-        restirHasHistory = false;
-        restirWriteIndex = 0;
     }
 
     private void ensureOutput(RtContext ctx, int width, int height) {
@@ -784,7 +724,6 @@ public final class RtComposite {
         // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
         rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
         exposure.ensureResources(ctx);
-        syncReservoirConfiguration(ctx);
 
         mvHasPrev = false; // recreated images -> first MV frame is zero
         if (worldPipeline != null) {
@@ -826,15 +765,6 @@ public final class RtComposite {
         RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
         int debugView = debugView();
         RtTerrain terrain = RtTerrain.currentOrNull();
-        long lightGeneration = terrain.lightGeneration();
-        boolean temporalWrite = temporalReuse() && restirReservoirs != null
-                && terrain.lightCount() > 0 && debugView == 0;
-        boolean temporalHistory = temporalWrite && restirHasHistory
-                && restirPrevLightGeneration == lightGeneration;
-        long restirPreviousAddress = temporalHistory
-                ? restirReservoirs[restirWriteIndex ^ 1].deviceAddress : 0L;
-        long restirCurrentAddress = temporalWrite
-                ? restirReservoirs[restirWriteIndex].deviceAddress : 0L;
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope frameLabel = RtDebugLabels.scope(ctx, cmd, "composite frame")) {
             // RR drives the upscale: trace + jitter at render res, DLSS-RR denoises+upscales to display.
             // Jitter is suppressed for the no-RR reference and for the debug guide views (raw inspection).
@@ -871,12 +801,6 @@ public final class RtComposite {
             }
             if (waterWaves()) {
                 flags |= 0b10000; // W1: animated water wave normals
-            }
-            if (temporalWrite) {
-                flags |= 0b00100;
-                if (temporalHistory && CausticaConfig.Rt.Lights.TEMPORAL_PERMUTATION.value()) {
-                    flags |= 0b01000;
-                }
             }
 
             // W1/W2 water parameters: camera-biome tint plus wrapped animation time. Per-water-body tint
@@ -951,21 +875,9 @@ public final class RtComposite {
                     new Float4(terrain.regirOriginX(), terrain.regirOriginY(), terrain.regirOriginZ(), 16f),
                     new Int4(terrain.regirDimX(), terrain.regirDimY(), terrain.regirDimZ(), 0),
                     terrain.lightCount(),
-                    CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
-                    restirPreviousAddress,
-                    restirCurrentAddress,
-                    new Float3(temporalHistory ? terrain.blockX - restirPrevBlockX : 0f,
-                            temporalHistory ? terrain.blockY - restirPrevBlockY : 0f,
-                            temporalHistory ? terrain.blockZ - restirPrevBlockZ : 0f)
+                    CausticaConfig.Rt.Lights.RIS_CANDIDATES.value()
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
-            if (restirNeedsClear && restirReservoirs != null) {
-                for (RtBuffer reservoir : restirReservoirs) {
-                    VK10.vkCmdFillBuffer(cmd, reservoir.handle, 0L, VK10.VK_WHOLE_SIZE, 0);
-                }
-                restirNeedsClear = false;
-                VulkanCommandEncoder.memoryBarrier(cmd, stack);
-            }
             // Upload any entity textures registered this frame into the bindless set before the trace.
             RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
             // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
@@ -1056,16 +968,6 @@ public final class RtComposite {
         long graphicsUse = gpuExecutor.beginGraphicsTerrainUse(encoder);
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
         pendingTerrainGraphicsUse = graphicsUse;
-        if (temporalWrite) {
-            restirPrevBlockX = terrain.blockX;
-            restirPrevBlockY = terrain.blockY;
-            restirPrevBlockZ = terrain.blockZ;
-            restirPrevLightGeneration = lightGeneration;
-            restirHasHistory = true;
-            restirWriteIndex ^= 1;
-        } else {
-            restirHasHistory = false;
-        }
     }
 
     /**

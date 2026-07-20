@@ -8,7 +8,6 @@ module world_common;
 // scalarBlockLayout device feature. Keep std430 unless RtDeviceBringup explicitly enables that feature;
 // this alias is the single layout switch and generated Java serialization stays in lock-step.
 public typealias ConstPtr<T> = Ptr<T, Access.Read, AddressSpace.Device, Std430DataLayout>;
-public typealias RWPtr<T> = Ptr<T, Access.ReadWrite, AddressSpace.Device, Std430DataLayout>;
 
 // Push constant block. The hot inline lanes avoid dereferencing WorldPush for values that are read in
 // hit shaders or used for raygen control flow.
@@ -39,7 +38,7 @@ public struct WorldPush {
     public uint     spp;
     public float2   jitter;
     public uint64_t entityTableAddr;  // entity geometry table
-    public uint     flags;            // bit0 submerged, bit1 PBR, bit2 temporal ReSTIR, bit3 permutation, bit4 waves
+    public uint     flags;            // bit0 submerged, bit1 PBR, bit4 waves
     public uint     maxBounces;
     public float4   sunDir;           // xyz true sun direction, w dayFactor 0..1
     public float4   lightDir;         // xyz active NEE light dir, w square half-angle (rad)
@@ -63,9 +62,6 @@ public struct WorldPush {
     public int4     regirGrid;        // xyz dense grid dimensions, w reserved
     public uint     lightCount;       // packed Light records in lightBufAddr
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
-    public uint64_t restirPrevAddr;   // previous-frame per-pixel ReservoirRec buffer (0 = no valid history)
-    public uint64_t restirCurAddr;    // current-frame per-pixel ReservoirRec buffer (0 = temporal disabled)
-    public float3   restirRebase;     // current terrain rebase origin minus previous history's origin
 };
 
 // 48-byte hot area-light record. Radiance uses packed R11G11B10 and the grid-relative owner section

@@ -21,11 +21,18 @@ lava, lanterns…) contribute **only when a path ray happens to land on them** (
 - **Stage 0** — enumerate emissive quads into a samplable light list (one area light per quad).
 - **Stage 1** — RIS NEE at each diffuse vertex: M candidates → weighted-reservoir select 1 by
   unshadowed p̂ = luminance(f·Le·G·area) → ONE shadow ray. `W = (wSum/M)/p̂`.
-- **Stage 2** — temporal reservoir reuse across frames via the MV (64 B ping-pong reservoirs).
-- **Stage 3** — (new work) power/nearby-weighted candidate sampling, then spatial reuse.
+- **Stage 3** — power/nearby-weighted candidate sampling (ReGIR grid, done). Spatial reuse remains
+  open work.
 
 Sun/moon NEE stays separate and additive. `risCandidates = 0` ⇒ everything off, bit-identical to
 today's always-gather behaviour.
+
+**Stage 2 (temporal reservoir reuse) was implemented and then removed (2026-07-20).** Persistent
+per-pixel reservoirs (64 B ping-pong buffers, MV reprojection, permutation sampling) worked and were
+GPU-verified, but temporal reuse fights DLSS-RR's own history/AA rather than complementing it, and
+single-frame RIS over the ReGIR grid is already sufficient noise-wise. The removed machinery is
+recoverable from git history (`d1b22e3` "temporal reuse" and neighboring commits on this branch) if
+temporal reuse is revisited later; it is intentionally not kept around dark in the shipping path.
 
 ## Why not the RTXDI SDK
 
@@ -34,8 +41,7 @@ library is unusable from the Java/LWJGL host outright; the HLSL shader headers a
 resampling loop via the `RAB_*` application bridge, which conflicts with our inline single-rgen
 tracer and its MC-specific behavior (membership/always-gather gate, water/glass paths, RR guide
 capture, BDA std430 ABI). Our ~22k lights don't need machinery sized for millions. Licensing is
-NOT the blocker (Apache-2.0 since RTX Kit). What we port as ideas, per stage: permutation sampling
-(S2, already in), boiling filter (S2, if temporal blotching appears), power-based presampling
+NOT the blocker (Apache-2.0 since RTX Kit). What we port as ideas, per stage: power-based presampling
 tiles OR ReGIR for the S3 sampler (ReGIR's world-space grid is a natural fit for MC sections),
 pairwise MIS for S3 spatial, approximate-p̂/exact-Le-at-shade split (S3 color).
 
@@ -85,25 +91,18 @@ manual `_s.png` resource reads, hand-rolled hasS branching). All of that is gone
    emitter (its shadow ray finds no occluder and it brightens the scene). Retire the old buffer
    with the same in-flight-frame lifecycle the section table generations use.
 3. **Push constants are generated.** Add to `WorldPush` in `world_common.slang`:
-   `uint64_t lightBufAddr`, `uint lightCount`, `uint risCandidates`, and (Stage 2)
-   `uint64_t restirPrevAddr`, `uint64_t restirCurAddr`, `float4 restirRebase`. Java serialization
-   regenerates from Slang reflection — none of the old branch's manual 336→368 offset bookkeeping.
-   Claim free `WorldPush.flags` bits for "temporal armed" and "permutation on" (bit0 submerged,
-   bit1 PBR, bit4 waves are taken; verify 2/3/5+ at implementation time).
-4. **Shader port is GLSL → Slang.** `Light` (48 B: posArea, normalPad, le) and `ReservoirRec`
-   (64 B: {sampleP,area}{lightN,M}{Le,W}{octNormal,surfP}) become structs read via
-   `ConstPtr<T>` (std430 — the layout parameter is load-bearing, see world_common banner); the
-   reservoir write side needs the read-write Ptr alias. Helpers to port: `risInitial`,
-   `evalSampleContrib`, `resMerge` (Bitterli Alg. 4), `shadeReservoir`, oct-normal pack/unpack
-   (`packHalf2` exists in world_common). `tracePath` gains `(int2 pix, float2 size, bool
-   primarySample)` like the old branch.
+   `uint64_t lightBufAddr`, `uint lightCount`, `uint risCandidates`. Java serialization regenerates
+   from Slang reflection — none of the old branch's manual 336→368 offset bookkeeping.
+4. **Shader port is GLSL → Slang.** `Light` (48 B: posArea, normalPad, le) becomes a struct read via
+   `ConstPtr<T>` (std430 — the layout parameter is load-bearing, see world_common banner). Helpers
+   to port: `risInitial`, `evalSampleContrib`, `shadeReservoir`. `tracePath` gains `(int2 pix,
+   float2 size, bool primarySample)` like the old branch.
 5. **Guides already exist.** `gv_emission`/`gv_emissionSource` are captured at bounce 0; the RIS
    shading slots in next to the sun NEE block; visibility uses the existing hit-object
    `visibility()` (SER-safe).
 6. **Config** goes through `CausticaConfig` runtime settings (system-property override works the
    same as the old `-D` flags): `risCandidates` (int, def 8, 0=off), `lightMinFillRatio`
-   (float, def 0.25), `restirTemporal` (bool, def on), `restirPermutation` (bool, def on),
-   `lightStats` / `lightDump` / `lightDumpRadius` debug settings.
+   (float, def 0.25), `lightStats` / `lightDump` / `lightDumpRadius` debug settings.
 
 ## Stages
 
@@ -156,18 +155,12 @@ values wired in RtComposite. GPU verify list below still open.
   emitters; torch/glowstone noise visibly drops; no seam between an emitter's lit surroundings and
   its directly-viewed face; `compileJava compileShaders -q` clean.
 
-### S2 — temporal reservoir reuse
-Port the validated design 1:1 (see memory/old branch for full detail): 64 B ping-pong reservoirs
-(device-local BDA, `renderW×renderH×64`, zero-fill on create, indexed `frameCounter&1`), reproject
-via `prevViewProj·(gv_motionHitCamRel + camDelta − gv_motionObjDisp)`, RTXDI permutation sampling
-(per-frame XOR-by-3 shuffle in 4×4 blocks — prevents fixed-pattern grain DLSS-RR can't remove),
-rebase correction (`restirRebase = terrainBlock − prevTerrainBlock`), disocclusion reject
-(`dot(prevN,n)>0.9`, surfP distance < max(0.1·hitT, 0.25), prev.M>0, prev.W>0), M cap
-`min(prev.M, 20·cur.M)`, visibility reuse (vis≤0 ⇒ W=0 before store), history-valid flag reset on
-resize (align with `mvHasPrev`). Temporal path only at bounce 0 / first SPP sample; all other
-vertices keep single-frame RIS.
-- **Verify (GPU):** noise drop vs `restirTemporal=false`; no light-trails on pan; no leaks at
-  edges; walk far enough to force a rebase; static-camera fixed-pattern check (permutation A/B).
+### S2 — temporal reservoir reuse (implemented, then removed)
+Was implemented 1:1 per the old branch's validated design: 64 B ping-pong reservoirs, MV
+reprojection, RTXDI permutation sampling, rebase correction, disocclusion reject, M cap, visibility
+reuse. GPU-verified working. **Removed 2026-07-20**: temporal reuse fights DLSS-RR's own
+history/AA rather than complementing it, and single-frame RIS over the ReGIR grid (S3) is already
+sufficient. Recoverable from git history (`d1b22e3` "temporal reuse" on this branch) if revisited.
 
 ### S3 — candidate sampling + spatial reuse (new work, in this order)
 1. **Power/nearby-weighted candidate sampling** — uniform RIS over the whole list starves
@@ -193,10 +186,9 @@ vertices keep single-frame RIS.
    RIS is unbiased under an approximate target p̂, so this is exact, at one fetch/pixel/frame.
    Main visual payoff: lava and fire — large, mottled, ANIMATED emitters where the epoch-frozen
    mean is visibly wrong; an at-shade fetch of live albedo × emission mask tracks the animation.
-   Reservoir records store Le for temporal reuse — store the MEAN there (stable across frames)
-   and re-fetch the texel at final shade only.
-3. **Spatial reuse** — two-pass neighbor reservoir merge; revisit biased-vs-unbiased MIS if leaks
-   appear.
+3. **Spatial reuse** — no longer planned; spatial reservoir merging has the same
+   fights-DLSS-RR issue that got temporal reuse removed (see S2). Revisit only if single-frame RIS
+   over a wider/cascaded ReGIR grid turns out insufficient.
 
 ## Known deferred issues (unchanged from the old branch)
 - **Redstone-torch self-occlusion**: the emitter's own solid two-layer mesh shadows its lights
