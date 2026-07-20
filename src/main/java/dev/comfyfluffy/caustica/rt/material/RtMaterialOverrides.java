@@ -93,9 +93,14 @@ public final class RtMaterialOverrides {
         if (ior != null && (!Float.isFinite(ior) || ior <= 0.0f)) {
             throw new IllegalArgumentException("transmission.ior must be positive");
         }
-        if (emissionStrength != null && (!Float.isFinite(emissionStrength)
-                || emissionStrength < 0.0f || emissionStrength > 5.0f)) {
-            throw new IllegalArgumentException("emission.strength must be in [0,5]");
+        if (emissionStrength != null && !Float.isFinite(emissionStrength)) {
+            throw new IllegalArgumentException("emission.strength must be finite");
+        }
+        if (emissionStrength != null && (emissionStrength < 0.0f || emissionStrength > 5.0f)) {
+            float clamped = Math.max(0.0f, Math.min(5.0f, emissionStrength));
+            CausticaMod.LOGGER.warn("RT material override {}: emission.strength {} out of range [0,5], clamping to {}",
+                    source, emissionStrength, clamped);
+            emissionStrength = clamped;
         }
         return new Rule(source, sprite, block, model, roughness, metalness, ior, transmission,
                 emissionStrength);
