@@ -38,7 +38,7 @@ public struct WorldPush {
     public uint     spp;
     public float2   jitter;
     public uint64_t entityTableAddr;  // entity geometry table
-    public uint     flags;            // bit0 submerged, bit1 PBR, bit4 waves
+    public uint     flags;            // bit0 camera submerged, bit1 PBR BRDF, bit4 water waves
     public uint     maxBounces;
     public float4   sunDir;           // xyz true sun direction, w dayFactor 0..1
     public float4   lightDir;         // xyz active NEE light dir, w square half-angle (rad)
@@ -52,50 +52,7 @@ public struct WorldPush {
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
-    public uint64_t lightBufAddr;     // RIS emitter-NEE global light buffer (0 = none published)
-    public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
-    public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
-    public float4   lightRebase;      // xyz hierarchy-to-current rebase, w inverse total light power
-    public uint64_t lightGridCellAddr;   // dense light grid cell headers (0 = global proposals only)
-    public uint64_t lightGridSpanAddr;   // packed weighted section spans referenced by cell headers
-    public float4   lightGridOrigin;     // xyz minimum cell origin in rebased blocks, w cell size
-    public int4     lightGridDims;       // xyz dense grid dimensions, w reserved
-    public uint     lightCount;       // packed Light records in lightBufAddr
-    public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
 };
-
-// 48-byte hot area-light record. Radiance uses packed R11G11B10 and the grid-relative owner section
-// uses three unsigned 10-bit coordinates; the geometric normal is reconstructed from the half axes.
-public struct Light {
-    public float4 posArea;
-    public float4 halfULe;       // xyz world half-axis U, w bitcast R11G11B10 radiance
-    public float4 halfVSection;  // xyz half-axis V, w bitcast 10:10:10 section + normal-flip bit
-};
-
-// Eight-byte Vose alias-table column. PDFs are reconstructed from the selected Light.
-public struct LightAlias {
-    public uint  aliasIndex;
-    public float accept;
-};
-
-// Dense light grid cell entry. Empty coordinates have spanCount=0; populated section cells point into
-// an immutable list of weighted section light ranges built and published alongside this grid.
-public struct LightGridCell {
-    public uint spanOffset;
-    public uint spanCount;
-    public float invWeightSum;
-};
-
-// One 16-byte Vose alias column for a cell's section distribution. The two light counts are uint16s.
-public struct LightGridSpan {
-    public uint firstLight;
-    public uint aliasFirstLight;
-    public uint packedLightCounts; // low16 self, high16 alias
-    public float accept;
-};
-
-// TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).
-public static const uint TERRAIN_PRIM_IN_LIGHT_BUFFER = 1u;
 
 // Radiance-ray payload (location 0). Member order and types are a cross-stage ABI.
 public struct Payload {
@@ -112,9 +69,6 @@ public struct Payload {
 };
 
 public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
-// Set by world.rchit on a terrain hit whose prim carries TERRAIN_PRIM_IN_LIGHT_BUFFER: this emitter is
-// RIS-sampled, so raygen gates its direct-hit emission on diffuse continuation rays (no double count).
-public static const uint PAYLOAD_EMITTER_IN_LIST = 128u;
 // Set by world.rchit on a MATERIAL_WATER hit: true when the incoming ray travels against the prim's
 // outward face normal (entering the water volume), false when it exits (water -> air). Bit 2
 // (PAYLOAD_SHOW_CELESTIAL) is only meaningful on a miss and this bit only on a hit, so they never need
@@ -126,6 +80,7 @@ public static const uint EMISSION_SOURCE_NONE = 0u;
 public static const uint EMISSION_SOURCE_UNIFORM = 1u;
 public static const uint EMISSION_SOURCE_HEURISTIC = 2u;
 public static const uint EMISSION_SOURCE_LAB_PBR = 3u;
+public static const uint EMISSION_SOURCE_OVERRIDE = 4u;
 
 public static const uint PAYLOAD_MATERIAL_MASK = 3u;
 public static const uint MATERIAL_OPAQUE = 0u;
@@ -171,14 +126,11 @@ public struct MaterialHeader {
 public static const uint MATERIAL_FEATURE_SPEC = 1u;
 public static const uint MATERIAL_FEATURE_NORMAL = 2u;
 public static const uint MATERIAL_FEATURE_HEURISTIC_EMISSION = 4u;
+public static const uint MATERIAL_FEATURE_OVERRIDE_EMISSION = 8u;
 public static const uint MATERIAL_FEATURE_STOCHASTIC_ALPHA = 16u;
-// Final HDR emission strength (EMISSIVE_STRENGTH baseline * any JSON override multiplier), baked in Java
-// at material-compile time (RtMaterialRegistry) and packed here as a 16-bit fraction of the max — every
-// emissive material carries a value (0 for non-emissive), not just resource-pack-overridden ones, so the
-// full features word's spare 16 bits (8..23) go to it instead of the 8 bits the old override-only field used.
 public static const uint MATERIAL_EMISSION_STRENGTH_SHIFT = 8u;
-public static const uint MATERIAL_EMISSION_STRENGTH_MASK = 65535u;
-public static const float MATERIAL_MAX_EMISSION_STRENGTH = 32.0;
+public static const uint MATERIAL_EMISSION_STRENGTH_MASK = 255u;
+public static const float MATERIAL_MAX_OVERRIDE_EMISSION_STRENGTH = 4.0;
 public static const uint MATERIAL_MAX_LOD_SHIFT = 24u;
 public static const uint MATERIAL_MAX_LOD_MASK = 255u;
 

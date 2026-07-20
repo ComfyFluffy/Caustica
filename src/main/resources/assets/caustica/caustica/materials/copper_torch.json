@@ -1,9 +1,0 @@
-{
-  "format": 1,
-  "match": {
-    "sprite": "minecraft:block/copper_torch"
-  },
-  "emission": {
-    "strength": 3.0
-  }
-}

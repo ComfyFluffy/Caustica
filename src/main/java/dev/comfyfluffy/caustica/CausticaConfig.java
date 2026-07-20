@@ -96,14 +96,6 @@ public final class CausticaConfig {
         FILE.setComment("reflex",
                 " NVIDIA Reflex (VK_NV_low_latency2). Default off; gated additionally by device support.\n"
                         + " minimum-interval-us: 0 = no framerate cap (Reflex just paces submission).");
-        FILE.setComment("lights",
-                " RIS direct lighting from block emitters (torches, glowstone, lava, ...): per diffuse\n"
-                        + " vertex, resample ris-candidates power-weighted proposals and spend one shadow ray on\n"
-                        + " the survivor. ris-candidates = 0 disables it entirely (emitters just gather on direct\n"
-                        + " hit, same as with no NEE). Power-weighted sampling and the local per-section light\n"
-                        + " grid are always active whenever RIS is on. min-fill-ratio drops emissive footprints\n"
-                        + " below that fraction of their bounding rectangle (speckle/sparse crossed planes), so\n"
-                        + " only reasonably compact glows become lights. stats/dump/dump-radius are debug logging.");
         FILE.setComment("hdr",
                 " HDR display output (ST.2084/PQ). When enabled the swapchain is created in PQ automatically\n"
                         + " (falls back to SDR if the surface doesn't advertise it). paper-white-nits / peak-nits\n"
@@ -572,21 +564,6 @@ public final class CausticaConfig {
             }
         }
 
-        /** RIS block-emitter lights. {@code ris-candidates = 0} disables everything. */
-        public static final class Lights {
-            public static final IntSetting RIS_CANDIDATES =
-                    intAtLeast("caustica.rt.risCandidates", "lights.ris-candidates", 8, 0);
-            public static final FloatSetting MIN_FILL_RATIO =
-                    finiteFloat("caustica.rt.lightMinFillRatio", "lights.min-fill-ratio", 0.25f);
-            public static final BooleanSetting STATS = bool("caustica.rt.lightStats", "lights.stats", false);
-            public static final BooleanSetting DUMP = bool("caustica.rt.lightDump", "lights.dump", false);
-            public static final IntSetting DUMP_RADIUS =
-                    intAtLeast("caustica.rt.lightDumpRadius", "lights.dump-radius", 12, 1);
-
-            private Lights() {
-            }
-        }
-
         public static final class Omm {
             public static final BooleanSetting ENABLED = bool("caustica.rt.omm", "omm.enabled", true);
             public static final IntSetting SUBDIVISION =
@@ -701,7 +678,7 @@ public final class CausticaConfig {
             public static final FloatSetting MIN_EV =
                     finiteFloat("caustica.rt.exposure.minEv", "exposure.min-ev", -1.5f);
             public static final FloatSetting MAX_EV =
-                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 4.0f);
+                    finiteFloat("caustica.rt.exposure.maxEv", "exposure.max-ev", 3.0f);
             public static final FloatSetting ADAPT_UP =
                     exposureScale("caustica.rt.exposure.adaptUp", "exposure.adapt-up", 0.12f);
             public static final FloatSetting ADAPT_DOWN =

@@ -176,8 +176,8 @@ public final class RtComposite {
     // Set when a new material epoch is published. The first composite returns to vanilla so the next
     // client tick can apply RtTerrain's full-clear before any old-epoch primitive IDs are traced.
     private boolean materialEpochTraceGate;
-    // World push data lives in a host-visible BDA ring; only the slot address and a small hot subset are
-    // pushed inline (the full generated structure exceeds NVIDIA's 256-byte push-constant ceiling).
+    // World push data (256 B) lives in a host-visible BDA ring; only the 8-byte slot address is pushed
+    // inline (256-byte NVIDIA push constant ceiling is otherwise exhausted by the world push struct).
     // One slot per in-flight frame, cycled per frame so an in-flight slot is never overwritten.
     private static final int PUSH_RING = 6;
     private RtBuffer[] pushRing;
@@ -763,11 +763,10 @@ public final class RtComposite {
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).caustica$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
-        int debugView = debugView();
-        RtTerrain terrain = RtTerrain.currentOrNull();
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope frameLabel = RtDebugLabels.scope(ctx, cmd, "composite frame")) {
             // RR drives the upscale: trace + jitter at render res, DLSS-RR denoises+upscales to display.
             // Jitter is suppressed for the no-RR reference and for the debug guide views (raw inspection).
+            int debugView = debugView();
             boolean rrPath = RtDlssRr.enabled() && debugView == 0;
             float jitterX = 0f;
             float jitterY = 0f;
@@ -778,6 +777,7 @@ public final class RtComposite {
             }
 
             boolean rrDone = false;
+            RtTerrain terrain = RtTerrain.currentOrNull();
             // Select the next BDA ring slot; the generated WorldPushData serializer fills it once all
             // frame-derived values (including entity addresses and block-breaking entries) are known.
             pushSlot = (pushSlot + 1) % PUSH_RING;
@@ -859,20 +859,7 @@ public final class RtComposite {
                     waterAnchor,
                     mvCurProjView,
                     breaking.length,
-                    breaking,
-                    // RIS emitter NEE: published light buffer + RIS candidate count (0 = emitter NEE off;
-                    // the shader also requires lightCount > 0, so an empty buffer degrades to legacy gather).
-                    terrain.lightBufferAddress(),
-                    terrain.lightAliasBufferAddress(),
-                    terrain.lightLocalAliasBufferAddress(),
-                    new Float4(terrain.lightRebaseOffsetX(), terrain.lightRebaseOffsetY(),
-                            terrain.lightRebaseOffsetZ(), terrain.lightInvGlobalPowerSum()),
-                    terrain.lightGridCellBufferAddress(),
-                    terrain.lightGridSpanBufferAddress(),
-                    new Float4(terrain.lightGridOriginX(), terrain.lightGridOriginY(), terrain.lightGridOriginZ(), 16f),
-                    new Int4(terrain.lightGridDimX(), terrain.lightGridDimY(), terrain.lightGridDimZ(), 0),
-                    terrain.lightCount(),
-                    CausticaConfig.Rt.Lights.RIS_CANDIDATES.value()
+                    breaking
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.

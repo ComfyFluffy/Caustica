@@ -72,11 +72,11 @@ final class RtSectionBuilder {
             blas = RtAccel.prepareTerrainBlas(ctx, positions, vertCount, indices,
                     packed.bucketTris(), ommInput, compactBlas, label + " BLAS");
             return new PreparedSection(key, positions, indices, uvs, material, upload, blas,
-                    packed.triBase(), sox, soy, soz, packed.lights());
+                    packed.triBase(), sox, soy, soz);
         } catch (Throwable t) {
             if (blas != null) {
                 destroy(new PreparedSection(key, positions, indices, uvs, material, upload, blas,
-                        packed.triBase(), sox, soy, soz, packed.lights()));
+                        packed.triBase(), sox, soy, soz));
             } else {
                 if (upload != null) upload.destroy();
                 if (material != null) material.destroy();
@@ -130,11 +130,10 @@ final class RtSectionBuilder {
         prepared.positions.destroy();
     }
 
-    /** Worker-owned native section state paired with its prepared BLAS. {@code lights} = packed
-     *  section-local RIS light records (CPU-side, flattened into the global buffer at publish). */
+    /** Worker-owned native section state paired with its prepared BLAS. */
     record PreparedSection(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs,
                            RtBuffer material, RtBuffer upload, RtAccel.PreparedBlas blas, int[] triBase,
-                           int sx, int sy, int sz, float[] lights) {
+                           int sx, int sy, int sz) {
         void releaseUpload() {
             upload.destroy();
         }
@@ -146,7 +145,7 @@ final class RtSectionBuilder {
 
         PreparedSection withBlas(RtAccel.PreparedBlas replacement) {
             return new PreparedSection(key, positions, indices, uvs, material, upload, replacement,
-                    triBase, sx, sy, sz, lights);
+                    triBase, sx, sy, sz);
         }
     }
 }

@@ -67,7 +67,6 @@ uint payloadEmissionSource() {
 // Set by world.rchit only on a MATERIAL_WATER hit (see PAYLOAD_WATER_ENTERING) — whether the ray was
 // travelling into the water volume (vs. out of it) at this hit's face.
 bool payloadWaterEntering() { return (payload.flags & PAYLOAD_WATER_ENTERING) != 0u; }
-bool payloadEmitterInList() { return (payload.flags & PAYLOAD_EMITTER_IN_LIST) != 0u; }
 float payloadRoughness() { return unpackHalf2(payload.roughMetal).x; }
 float payloadMetalness() { return unpackHalf2(payload.roughMetal).y; }
 float payloadEmission() { return unpackHalf2(payload.emissionSss).x; }
@@ -85,6 +84,7 @@ static const float INV_PI = 0.31830988618;
 // The analytic sky (gradient + sun/moon discs + stars) is computed in world.rmiss. On a miss, raygen
 // reads payload.albedo and accumulates that sky radiance. The directional NEE light is pushed separately
 // as worldPush.lightDir / worldPush.lightRadiance / worldPush.sunDir.
+static const float EMISSIVE_STRENGTH = 5.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
 static const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 static const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
 
@@ -379,299 +379,6 @@ float3 sampleGGXVNDF(float3 n, float3 ve, float rough, inout uint s) {
     return normalize(Ne.x * t + Ne.y * b + Ne.z * n);                 // -> world space
 }
 
-// ===== RIS emitter NEE =================================================================
-// Block emitters (torches, glowstone, lava, ...) get explicit NEE: per diffuse vertex, stream M uniform
-// candidates from the global light buffer through a weighted reservoir keyed by the UNSHADOWED target
-// p-hat = luminance(f * Le * G * area), then spend ONE shadow ray on the survivor. Sun/moon NEE stays
-// separate and additive. Lights are footprint bounding RECTANGLES (RtLightCollector): sampling a point
-// uniformly over the rectangle has pdf 1/area, so `area` rides the contribution like any area light.
-// Single-frame RIS only (no temporal reservoir reuse): DLSS-RR's own history already denoises this well
-// enough that a persistent per-pixel reservoir wasn't worth the added complexity and VRAM.
-// One resample serves three mutually exclusive receiver terms (see evalSampleContrib): front BRDF,
-// two-sided particle billboards, and LabPBR SSS backscatter from lights BEHIND the surface — all share
-// the reservoir and its single shadow ray, whose origin follows the survivor's side of the surface.
-
-// A reservoir in registers. pos/lnrm/le/area describe the chosen emitter sample; W is its unbiased
-// contribution weight, M the effective sample count. wSum/phat are streaming scratch (not persisted).
-struct Reservoir {
-    float3 pos;  // light sample point (rebased world space)
-    float3 lnrm; // emitter outward normal
-    float3 le;   // emitter radiance
-    float area;  // emitter rectangle area (the area-light pdf factor)
-    float M;
-    float W;
-    float wSum;
-    float phat;
-};
-
-Reservoir resEmpty() {
-    Reservoir r;
-    r.pos = float3(0.0, 0.0, 0.0);
-    r.lnrm = float3(0.0, 0.0, 0.0);
-    r.le = float3(0.0, 0.0, 0.0);
-    r.area = 0.0;
-    r.M = 0.0;
-    r.W = 0.0;
-    r.wSum = 0.0;
-    r.phat = 0.0;
-    return r;
-}
-
-// Unshadowed contribution of a fixed light sample point at surface (hitPos,n,v); out p-hat = its
-// luminance (the resampling target). Evaluated from the UNBIASED hitPos — SURF_BIAS is applied only to
-// the shadow-ray origin in shadeReservoir, on whichever side the survivor sample lands. Three receiver
-// modes share one target function because they are mutually exclusive per candidate:
-//   - front hemisphere (ndl>0): the same Lambert(+GGX) BRDF split the sun NEE uses;
-//   - twoSided (particles): billboards have no back face, ndl=abs(ndl) folds both sides into the front;
-//   - back hemisphere with sss>0 (LabPBR leaves/grass): HG transmission phase — cosT = dot(wi,rd) peaks
-//     when the ray points from the light through the slab toward the camera (same as the sun SSS term).
-float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 hitPos, float3 n,
-                         float3 v, float3 rd, float3 diffAlb, float3 F0, float rough, bool pbr,
-                         bool twoSided, float sss, out float phat) {
-    phat = 0.0;
-    float3 toL = sp - hitPos;
-    float dist2 = dot(toL, toL);
-    if (dist2 < 1.0e-6) {
-        return float3(0.0, 0.0, 0.0);
-    }
-    float dist = sqrt(dist2);
-    float3 wi = toL / dist;
-    float cosL = max(0.0, dot(lnrm, -wi));
-    if (cosL <= 0.0) {
-        return float3(0.0, 0.0, 0.0); // receiver behind the emitter face
-    }
-    float ndl = dot(n, wi);
-    if (twoSided) {
-        ndl = abs(ndl);
-    }
-    float3 contrib = float3(0.0, 0.0, 0.0);
-    if (ndl > 0.0) {
-        float G = ndl * cosL / dist2; // area-light geometry term (x area)
-        float3 brdf = diffAlb * INV_PI;
-        if (pbr) {
-            float3 h = normalize(wi + v);
-            float ndh = max(0.0, dot(n, h));
-            float ndv = max(1.0e-4, dot(n, v));
-            float vdh = max(0.0, dot(v, h));
-            float D = ggxD(ndh, rough);
-            float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
-            float3 Fs = fresnelSchlick(vdh, F0);
-            brdf += (D * Gs) * Fs / (4.0 * ndv * ndl);
-        }
-        contrib = brdf * le * (G * area);
-    } else if (sss > 0.0) {
-        float backNdl = -ndl;
-        float G = backNdl * cosL / dist2;
-        float cosT = dot(wi, rd);
-        contrib = diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * le * (G * area);
-    }
-    phat = luminance(contrib);
-    return contrib;
-}
-
-// Select one light from the emitted-power distribution in O(1).
-void selectGlobalLight(inout uint proposalSeed, out uint lightIndex) {
-    float aliasSample = rndf(proposalSeed) * float(worldPush.lightCount);
-    uint column = min(uint(aliasSample), worldPush.lightCount - 1u);
-    if (worldPush.lightAliasAddr != 0) {
-        LightAlias a = ConstPtr<LightAlias>(worldPush.lightAliasAddr)[column];
-        bool self = aliasSample - float(column) < a.accept;
-        lightIndex = self ? column : a.aliasIndex;
-    } else {
-        lightIndex = column;
-    }
-}
-
-bool findLightGridCell(float3 p, out LightGridCell cell, out int3 cellCoord) {
-    cell.spanOffset = 0u;
-    cell.spanCount = 0u;
-    cell.invWeightSum = 0.0;
-    cellCoord = int3(0, 0, 0);
-    if (worldPush.lightGridCellAddr == 0 || worldPush.lightGridSpanAddr == 0) return false;
-    int3 coord = int3(floor((p - worldPush.lightGridOrigin.xyz) / worldPush.lightGridOrigin.w));
-    if (coord.x < 0 || coord.y < 0 || coord.z < 0
-            || coord.x >= worldPush.lightGridDims.x
-            || coord.y >= worldPush.lightGridDims.y
-            || coord.z >= worldPush.lightGridDims.z) return false;
-    uint linear = (uint(coord.z) * uint(worldPush.lightGridDims.y) + uint(coord.y))
-            * uint(worldPush.lightGridDims.x) + uint(coord.x);
-    cell = ConstPtr<LightGridCell>(worldPush.lightGridCellAddr)[linear];
-    cellCoord = coord;
-    return cell.spanCount > 0u;
-}
-
-void selectSectionLight(uint firstLight, uint lightCount, inout uint proposalSeed,
-                        out uint lightIndex) {
-    float aliasSample = rndf(proposalSeed) * float(lightCount);
-    uint column = min(uint(aliasSample), lightCount - 1u);
-    LightAlias alias = ConstPtr<LightAlias>(worldPush.lightLocalAliasAddr)[firstLight + column];
-    bool self = aliasSample - float(column) < alias.accept;
-    uint localIndex = self ? column : alias.aliasIndex;
-    lightIndex = firstLight + localIndex;
-}
-
-float unpackUnsignedFloat(uint bits, uint mantissaBits) {
-    uint mantissaMask = (1u << mantissaBits) - 1u;
-    uint mantissa = bits & mantissaMask;
-    uint exponent = (bits >> mantissaBits) & 31u;
-    if (exponent == 0u) {
-        return float(mantissa) * exp2(float(1 - 15 - int(mantissaBits)));
-    }
-    return (1.0 + float(mantissa) / float(1u << mantissaBits))
-            * exp2(float(int(exponent) - 15));
-}
-
-float3 lightRadiance(Light light) {
-    uint packed = asuint(light.halfULe.w);
-    return float3(unpackUnsignedFloat(packed & 0x7ffu, 6u),
-            unpackUnsignedFloat((packed >> 11u) & 0x7ffu, 6u),
-            unpackUnsignedFloat((packed >> 22u) & 0x3ffu, 5u));
-}
-
-int3 lightSectionCoord(Light light) {
-    uint packed = asuint(light.halfVSection.w);
-    return int3(int(packed & 0x3ffu), int((packed >> 10u) & 0x3ffu),
-            int((packed >> 20u) & 0x3ffu));
-}
-
-float3 lightGeometricNormal(Light light) {
-    float3 normal = normalize(cross(light.halfULe.xyz, light.halfVSection.xyz));
-    return (asuint(light.halfVSection.w) & 0x40000000u) != 0u ? -normal : normal;
-}
-
-float proposalPdf(Light light, float3 le, LightGridCell cell, int3 cellCoord,
-                  float localProbability) {
-    float power = max(0.0, light.posArea.w * luminance(le));
-    float globalPdf = worldPush.lightAliasAddr != 0
-            ? power * worldPush.lightRebase.w : 1.0 / float(worldPush.lightCount);
-    float localPdf = 0.0;
-    if (localProbability > 0.0 && power > 0.0) {
-        int3 delta = lightSectionCoord(light) - cellCoord;
-        if (all(abs(delta) <= int3(2, 2, 2))) {
-            float3 deltaF = float3(delta);
-            localPdf = power * cell.invWeightSum / max(1.0, dot(deltaF, deltaF));
-        }
-    }
-    return localProbability * localPdf + (1.0 - localProbability) * globalPdf;
-}
-
-void selectLightGridSpanLight(LightGridCell cell, inout uint proposalSeed,
-                              out uint lightIndex) {
-    ConstPtr<LightGridSpan> spans = ConstPtr<LightGridSpan>(worldPush.lightGridSpanAddr);
-    float aliasSample = rndf(proposalSeed) * float(cell.spanCount);
-    uint column = min(uint(aliasSample), cell.spanCount - 1u);
-    LightGridSpan span = spans[cell.spanOffset + column];
-    bool self = aliasSample - float(column) < span.accept;
-    uint firstLight = self ? span.firstLight : span.aliasFirstLight;
-    uint lightCount = self ? (span.packedLightCounts & 0xffffu)
-            : (span.packedLightCounts >> 16u);
-    selectSectionLight(firstLight, lightCount, proposalSeed, lightIndex);
-}
-
-// Sample the exact mixture q = alpha*qCell + (1-alpha)*qGlobal. qCell first selects a nearby section
-// by emitted power and section distance, then its section-local power alias. Every light in
-// the neighborhood is represented without a fixed cap; qGlobal gives distant lights full support.
-// Alias spans make weighted local selection O(1). The mixture PDF is reconstructed after the single
-// Light48 load: section power cancels with the section-local light PDF.
-void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposalSeed,
-                          out uint lightIndex) {
-    if (useLocal) {
-        selectLightGridSpanLight(cell, proposalSeed, lightIndex);
-    } else {
-        selectGlobalLight(proposalSeed, lightIndex);
-    }
-}
-
-// Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
-// sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
-Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
-                     float rough, bool pbr, bool twoSided, float sss,
-                     inout uint seed, inout uint proposalSeed) {
-    Reservoir r = resEmpty();
-    LightGridCell gridCell;
-    int3 gridCellCoord;
-    float3 gridLookup = hitPos;
-    if (worldPush.lightGridCellAddr != 0) {
-        // Stochastically blend across hard section boundaries. Every cell proposal retains full global
-        // support, so conditioning on this independently jittered lookup remains unbiased.
-        gridLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
-                * worldPush.lightGridOrigin.w;
-    }
-    bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
-    uint candidateCount = worldPush.risCandidates;
-    // Deterministically stratify the proposal mixture. At the default M=8 this schedules exactly six
-    // local and two global candidates, with every lane taking the same branch for a given candidate.
-    // Counts that are not divisible by four use the nearest practical split with at least one global
-    // candidate; M=1 is global-only so the estimator retains full support.
-    uint globalCandidateCount = hasGridCell
-            ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
-    uint localCandidateCount = candidateCount - globalCandidateCount;
-    float localProbability = float(localCandidateCount) / float(candidateCount);
-    for (uint c = 0u; c < worldPush.risCandidates; c++) {
-        r.M += 1.0;
-        uint li;
-        uint globalsBefore = (c * globalCandidateCount) / candidateCount;
-        uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
-        bool useLocal = hasGridCell && globalsAfter == globalsBefore;
-        selectLightGridLight(gridCell, useLocal, proposalSeed, li);
-        Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
-        // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
-        float s = rndf(seed) * 2.0 - 1.0;
-        float t = rndf(seed) * 2.0 - 1.0;
-        float3 sp = lg.posArea.xyz + worldPush.lightRebase.xyz
-                + s * lg.halfULe.xyz + t * lg.halfVSection.xyz;
-        float3 le = lightRadiance(lg);
-        float3 lightNormal = lightGeometricNormal(lg);
-        float phat;
-        evalSampleContrib(sp, lightNormal, le, lg.posArea.w, hitPos, n, v, rd,
-                diffAlb, F0, rough, pbr, twoSided, sss, phat);
-        if (phat <= 0.0) {
-            continue;
-        }
-        float sourcePdf = proposalPdf(lg, le, gridCell, gridCellCoord, localProbability);
-        float w = phat / max(sourcePdf, 1.0e-20);
-        r.wSum += w;
-        if (rndf(seed) * r.wSum < w) { // weighted reservoir update
-            r.pos = sp;
-            r.lnrm = lightNormal;
-            r.le = le;
-            r.area = lg.posArea.w;
-            r.phat = phat;
-        }
-    }
-    r.W = r.phat > 0.0 ? (r.wSum / (r.M * r.phat)) : 0.0;
-    return r;
-}
-
-// Shade a finalized reservoir: recompute the survivor's contribution at (hitPos,n,v), cast ONE shadow
-// ray, and return throughput-free radiance contrib*vis*W. The one ray serves whichever term fired for
-// the survivor (front BRDF, twoSided billboard, or SSS backscatter) — the origin is biased toward the
-// sample's side of the surface.
-float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
-                      float3 F0, float rough, bool pbr, bool twoSided, float sss, out float3 vis) {
-    vis = float3(0.0, 0.0, 0.0);
-    if (s.W <= 0.0 || s.phat <= 0.0) {
-        return float3(0.0, 0.0, 0.0);
-    }
-    float phat;
-    float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, hitPos, n, v, rd,
-            diffAlb, F0, rough, pbr, twoSided, sss, phat);
-    if (phat <= 0.0) {
-        return float3(0.0, 0.0, 0.0);
-    }
-    // Pick the shadow-ray origin on the sample's side of the surface FIRST, then measure the ray from
-    // that origin — measuring dist from hitPos while tracing from the biased origin shifts the ray tip
-    // up to SURF_BIAS*ndl toward the emitter plane, beating the 0.001*dist stop-short margin for lights
-    // closer than ~SURF_BIAS/0.001 blocks -> shadow ray hits the emitter's own face -> per-texel black.
-    float side = dot(n, s.pos - hitPos) >= 0.0 ? 1.0 : -1.0;
-    float3 origin = hitPos + side * n * SURF_BIAS;
-    float3 toL = s.pos - origin;
-    float dist = length(toL);
-    // Stop just short of the sample point so the ray doesn't self-occlude on the emitter's own face.
-    vis = visibility(origin, toL / dist, dist * 0.999);
-    return contrib * vis * s.W;
-}
-
 // TLAS instance-mask bits (set on the Java side, ANDed against these per-ray cull masks):
 //   bit 0 (0x01) — secondary rays: shadows, GI bounces, reflections.
 //   bit 1 (0x02) — the primary camera ray.
@@ -829,8 +536,7 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
 }
 
 // One Monte Carlo path from (ro, rd). Returns accumulated radiance along the path.
-float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint sampleIndex,
-                 inout uint seed) {
+float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed) {
     float3 L = float3(0.0, 0.0, 0.0);
     float3 throughput = float3(1.0, 1.0, 1.0);
     float rayConeWidth = 0.0;
@@ -838,14 +544,6 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     int maxBounces = int(worldPush.maxBounces);
     int rrStart = maxBounces <= 3 ? 1 : 2;
     bool pbr = (worldPush.flags & 2u) != 0u; // GGX BRDF + material guides, else Lambertian fallback
-    // RIS emitter NEE: direct lighting from block emitters is active when lights are published and the
-    // candidate count is non-zero. Off => emitters are gathered only on path hits (legacy behaviour).
-    bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
-    // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
-    // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
-    uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u
-            ^ worldPush.frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
-    proposalSeed = pcg(proposalSeed);
     // Start submerged if the camera is in water so the first segment gets the right medium orientation
     // and absorption when the eye is underwater.
     bool inWater = (worldPush.flags & 1u) != 0u;
@@ -977,18 +675,6 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
                 }
             }
 
-            // RIS direct lighting from block emitters (lava, glowstone, torches, ...) — same reservoir
-            // sampler as terrain/entities, but two-sided: a billboard has no back face, so light
-            // striking either side of the quad should still land (matches the sun/moon NEE above).
-            if (risOn) {
-                float3 v = -rd;
-                Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0, false,
-                        true, 0.0, seed, proposalSeed);
-                float3 risVis;
-                L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
-                        false, true, 0.0, risVis);
-            }
-
             if (bounce >= maxBounces) {
                 break;
             }
@@ -1088,18 +774,12 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         }
 
         // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly, colored by albedo.
-        // RIS emitter NEE: the direct-hit emission term is gated only for emitters RIS actually samples
-        // (payload emitter-in-list bit) — and then only off diffuse continuation rays (showCelestial
-        // false), which the previous vertex's RIS already accounted for; the primary ray and
-        // specular/dielectric bounces (showCelestial true) still add it, since no emitter NEE happened
-        // along those. Emitters NOT in the light buffer (sparse/sub-threshold footprints, entities) are
-        // never NEE-sampled, so they always gather — bit-identical to the no-NEE path, no energy lost.
-        // Emission is already the full HDR strength (EMISSIVE_STRENGTH baseline * any override
-        // multiplier baked in Java at material-compile time — see MaterialHeader.features packing).
+        // Block lights have no NEE, so emission is gathered by hitting emitters during the walk (counted
+        // at every vertex, no double counting). Small emitters are noisy, but temporal accumulation
+        // converges static views.
         float emission = payloadEmission();
-        bool gateEmitter = risOn && payloadEmitterInList();
-        if (emission > 0.0 && (!gateEmitter || showCelestial)) {
-            L += throughput * albedo * emission;
+        if (emission > 0.0) {
+            L += throughput * albedo * emission * EMISSIVE_STRENGTH;
         }
 
         // NEE: direct light from the dominant celestial body (sun by day, moon by night) — Lambert
@@ -1135,20 +815,6 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
                 }
                 L += throughput * brdf * worldPush.lightRadiance.xyz * ndl * vis;
             }
-        }
-
-        // RIS direct lighting from block emitters (single-frame only, no temporal reservoir reuse).
-        // Front lobe + SSS backlighting are resampled together and share ONE shadow ray — a light can
-        // only be in front of n or behind it, never both, so combining them into one target function is
-        // exact, not an approximation. The SSS term is gated off past MAX_SSS_BOUNCE by passing sss=0
-        // there (falls back to plain front-only RIS).
-        if (risOn) {
-            float activeSss = bounce <= MAX_SSS_BOUNCE ? sss : 0.0;
-            Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, pbr, false, activeSss,
-                    seed, proposalSeed);
-            float3 risVis;
-            L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, pbr, false,
-                    activeSss, risVis);
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the
@@ -1246,7 +912,7 @@ void main() {
     float3 frameRadiance = float3(0.0, 0.0, 0.0);
     for (uint s = 0u; s < spp; s++) {
         seed = pcg(seed); // decorrelate per-sample paths (shared camera ray, no AA jitter yet)
-        frameRadiance += tracePath(origin, dir, rayConeSpread, uint2(pix), s, seed);
+        frameRadiance += tracePath(origin, dir, rayConeSpread, seed);
     }
     frameRadiance /= float(spp);
 
@@ -1303,7 +969,8 @@ void main() {
         } else if (pc.debugView == 8u) {
             dbg = float3(gv_emission, gv_emission, gv_emission); // resolved emission mask/strength
         } else if (pc.debugView == 9u) {
-            float3 sourceColor = gv_emissionSource == EMISSION_SOURCE_LAB_PBR ? float3(0.15, 0.8, 1.0)
+            float3 sourceColor = gv_emissionSource == EMISSION_SOURCE_OVERRIDE ? float3(1.0, 0.2, 1.0)
+                    : gv_emissionSource == EMISSION_SOURCE_LAB_PBR ? float3(0.15, 0.8, 1.0)
                     : gv_emissionSource == EMISSION_SOURCE_HEURISTIC ? float3(1.0, 0.45, 0.05)
                     : gv_emissionSource == EMISSION_SOURCE_UNIFORM ? float3(1.0, 1.0, 1.0)
                     : float3(0.0, 0.0, 0.0);

@@ -27,6 +27,7 @@ void payloadSetPacked(inout Payload payload, uint material, float roughness, flo
 
 uint materialEmissionSource(MaterialHeader header, float emission) {
     if (emission <= 0.0) return EMISSION_SOURCE_NONE;
+    if ((header.features & MATERIAL_FEATURE_OVERRIDE_EMISSION) != 0u) return EMISSION_SOURCE_OVERRIDE;
     if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) return EMISSION_SOURCE_LAB_PBR;
     if ((header.features & MATERIAL_FEATURE_HEURISTIC_EMISSION) != 0u) return EMISSION_SOURCE_HEURISTIC;
     return EMISSION_SOURCE_UNIFORM;
@@ -143,10 +144,13 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
     float maxMaterialLod = float((header.features >> MATERIAL_MAX_LOD_SHIFT) & MATERIAL_MAX_LOD_MASK);
     float materialLod = min(lod, maxMaterialLod);
     uint page = header.texturePage;
-    if ((header.features & (MATERIAL_FEATURE_SPEC | MATERIAL_FEATURE_HEURISTIC_EMISSION)) != 0u) {
+    if ((header.features & (MATERIAL_FEATURE_SPEC | MATERIAL_FEATURE_HEURISTIC_EMISSION
+            | MATERIAL_FEATURE_OVERRIDE_EMISSION)) != 0u) {
         float4 surface0 = samplePageSurface0(page, pageUv, materialLod);
+        // surface1 feeds both the LabPBR F0 (rgb) and the override emission mask (a) — fetch it once.
+        float4 surface1 = (header.features & (MATERIAL_FEATURE_SPEC | MATERIAL_FEATURE_OVERRIDE_EMISSION)) != 0u
+                ? samplePageSurface1(page, pageUv, materialLod) : float4(0.0, 0.0, 0.0, 0.0);
         if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) {
-            float4 surface1 = samplePageSurface1(page, pageUv, materialLod); // LabPBR F0
             surface.roughness = surface0.r;
             surface.metalness = surface0.g;
             surface.emission = surface0.b;
@@ -157,14 +161,13 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
             // supplies strength, while the page supplies only the normalized spatial mask.
             surface.emission = surface0.b * fallbackEmission;
         }
+        if ((header.features & MATERIAL_FEATURE_OVERRIDE_EMISSION) != 0u) {
+            float strength = float((header.features >> MATERIAL_EMISSION_STRENGTH_SHIFT)
+                    & MATERIAL_EMISSION_STRENGTH_MASK)
+                    * (MATERIAL_MAX_OVERRIDE_EMISSION_STRENGTH / float(MATERIAL_EMISSION_STRENGTH_MASK));
+            surface.emission = surface1.a * strength;
+        }
     }
-    // Final HDR emission strength (EMISSIVE_STRENGTH baseline * any JSON multiplier), baked in Java at
-    // material-compile time and packed unconditionally — see MATERIAL_EMISSION_STRENGTH_SHIFT. 0 for
-    // non-emissive materials, so this multiply is always safe (and a no-op) when nothing above ran.
-    float strength = float((header.features >> MATERIAL_EMISSION_STRENGTH_SHIFT)
-            & MATERIAL_EMISSION_STRENGTH_MASK)
-            * (MATERIAL_MAX_EMISSION_STRENGTH / float(MATERIAL_EMISSION_STRENGTH_MASK));
-    surface.emission *= strength;
     if ((header.features & MATERIAL_FEATURE_NORMAL) != 0u) {
         float4 normalAo = samplePageNormalAo(page, pageUv, materialLod);
         surface.normal = perturbNormal(geometricNormal, p0, p1, p2, uv0, uv1, uv2,
@@ -419,9 +422,5 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             materialEmissionSource(materialHeader, surface.emission));
     if (material == MATERIAL_WATER && entering) {
         payload.flags |= PAYLOAD_WATER_ENTERING;
-    }
-    // RIS emitter-NEE membership: raygen gates this emitter's direct-hit emission term (RIS covers it).
-    if ((pr.flags & TERRAIN_PRIM_IN_LIGHT_BUFFER) != 0u) {
-        payload.flags |= PAYLOAD_EMITTER_IN_LIST;
     }
 }

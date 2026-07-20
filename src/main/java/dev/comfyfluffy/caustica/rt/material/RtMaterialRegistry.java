@@ -36,23 +36,19 @@ public final class RtMaterialRegistry {
     public static final RtMaterialRegistry INSTANCE = new RtMaterialRegistry();
 
     // Canonical MaterialHeader model/feature bits, mirrored by world_common.slang's MATERIAL_* constants.
-    // RtBlockMaterials.Entry.features uses the same bit values, so entry features flow into headers
-    // with a plain mask.
+    // RtBlockMaterials.Entry.features uses the same bit values (FEATURE_OVERRIDE_EMISSION there means the
+    // override mask was baked into surface1.a), so entry features flow into headers with a plain mask.
     public static final int MODEL_OPAQUE = 0;
     public static final int MODEL_WATER = 1;
     public static final int MODEL_GLASS = 3;
     public static final int FEATURE_SPEC = 1;
     public static final int FEATURE_NORMAL = 2;
     public static final int FEATURE_HEURISTIC_EMISSION = 4;
+    public static final int FEATURE_OVERRIDE_EMISSION = 8;
     public static final int FEATURE_STOCHASTIC_ALPHA = 16;
-    // HDR radiance of a full (level-15-equivalent) emitter, modulated by albedo — the single knob
-    // (formerly duplicated as a literal in world.rgen.slang and RtLightCollector). Baked into every
-    // emissive RtMaterialDesc.emissionStrength at compile time (compileDesc/compileEntityDesc), times
-    // any resource-pack emission.strength multiplier; see header()'s packing and RtMaterialOverrides.
-    private static final float EMISSIVE_STRENGTH = 5.0f;
     private static final int EMISSION_STRENGTH_SHIFT = 8;
-    private static final int EMISSION_STRENGTH_MASK = 65535;
-    private static final float MAX_EMISSION_STRENGTH = 32.0f;
+    private static final int EMISSION_STRENGTH_MASK = 255;
+    private static final float MAX_OVERRIDE_EMISSION_STRENGTH = 4.0f;
     private static final int MAX_LOD_SHIFT = 24;
 
     private static final int MODEL_VARIANTS = 2; // ordinary opaque/cutout and thin glass
@@ -117,9 +113,8 @@ public final class RtMaterialRegistry {
         List<MaterialHeaderData> headers = new ArrayList<>(3 + profileVariants
                 + sprites.size() * profileVariants);
         List<RtMaterialDesc> descriptions = new ArrayList<>(headers.size());
-        List<RtEmissionGrid> grids = new ArrayList<>(headers.size());
-        add(headers, descriptions, grids, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.DEFAULT,
-                false, true, RtMaterialDesc.EmissionSummary.NONE), transparentWhiteAverage(), fallbackEntry, null);
+        add(headers, descriptions, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.DEFAULT,
+                false, true, RtMaterialDesc.EmissionSummary.NONE), transparentWhiteAverage(), fallbackEntry);
         int[] fallbackVariants = new int[profileVariants];
         for (RtMaterials.Profile profile : SPRITE_PROFILES) {
             for (boolean glass : new boolean[]{false, true}) {
@@ -130,24 +125,21 @@ public final class RtMaterialRegistry {
                         continue;
                     }
                     fallbackVariants[variant] = headers.size();
-                    add(headers, descriptions, grids, compileDesc(glass ? MODEL_GLASS : MODEL_OPAQUE, 0,
+                    add(headers, descriptions, compileDesc(glass ? MODEL_GLASS : MODEL_OPAQUE, 0,
                                     profile, emitting, true, RtMaterialDesc.EmissionSummary.NONE),
-                            transparentWhiteAverage(), fallbackEntry, null);
+                            transparentWhiteAverage(), fallbackEntry);
                 }
             }
         }
         int waterId = headers.size();
-        add(headers, descriptions, grids, compileDesc(MODEL_WATER, 0, RtMaterials.Profile.WATER,
-                false, true, RtMaterialDesc.EmissionSummary.NONE), whiteAverage(), fallbackEntry, null);
+        add(headers, descriptions, compileDesc(MODEL_WATER, 0, RtMaterials.Profile.WATER,
+                false, true, RtMaterialDesc.EmissionSummary.NONE), whiteAverage(), fallbackEntry);
         int lavaId = headers.size();
-        // Lava's fluid mesher assigns this singleton id (no sprite resolve), so its light color comes from
-        // the lava_still albedo grid — a mean-color area light instead of the old branch's white lava.
-        add(headers, descriptions, grids, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.LAVA,
-                true, true, uniformWhiteSummary()), whiteAverage(), fallbackEntry,
-                albedoGridFor(sprites, spriteStats, "block/lava_still"));
+        add(headers, descriptions, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.LAVA,
+                true, true, uniformWhiteSummary()), whiteAverage(), fallbackEntry);
         int nextEntityFallbackId = headers.size();
-        add(headers, descriptions, grids, compileEntityDesc(0, true, RtMaterialDesc.EmissionSummary.NONE),
-                transparentWhiteAverage(), fallbackEntry, null);
+        add(headers, descriptions, compileEntityDesc(0, true, RtMaterialDesc.EmissionSummary.NONE),
+                transparentWhiteAverage(), fallbackEntry);
 
         IdentityHashMap<TextureAtlasSprite, int[]> ids = new IdentityHashMap<>();
         List<MutableCompiledOverride> compiledOverrides = new ArrayList<>();
@@ -180,10 +172,10 @@ public final class RtMaterialRegistry {
                                 profile, emitting, false,
                                 variantSummary(features, emitting, entry, stats.uniformSummary()));
                         if (spriteWide != null) {
-                            desc = spriteWide.rule.apply(desc);
+                            desc = spriteWide.rule.apply(desc, entry.overrideEmissionSummary());
                         }
                         variants[index(profile, glass, emitting)] = headers.size();
-                        add(headers, descriptions, grids, desc, stats.average(), entry, stats.albedoGrid());
+                        add(headers, descriptions, desc, stats.average(), entry);
                     }
                 }
             }
@@ -199,9 +191,9 @@ public final class RtMaterialRegistry {
                             RtMaterialDesc base = compileDesc(glass ? MODEL_GLASS : MODEL_OPAQUE,
                                     features, profile, emitting, false,
                                     variantSummary(features, emitting, entry, stats.uniformSummary()));
-                            RtMaterialDesc desc = compiled.rule.apply(base);
+                            RtMaterialDesc desc = compiled.rule.apply(base, entry.overrideEmissionSummary());
                             overrideVariants[index(profile, glass, emitting)] = headers.size();
-                            add(headers, descriptions, grids, desc, stats.average(), entry, stats.albedoGrid());
+                            add(headers, descriptions, desc, stats.average(), entry);
                         }
                     }
                 }
@@ -218,12 +210,12 @@ public final class RtMaterialRegistry {
             RtMaterialDesc desc = compileEntityDesc(features, false, entry.emissionSummary());
             for (RtMaterialOverrides.Rule rule : overrides.rules()) {
                 if (!rule.matchesEntity(name)) continue;
-                desc = rule.apply(desc);
+                desc = rule.apply(desc, entry.overrideEmissionSummary());
                 entityMatchedOverrides.add(rule);
                 break;
             }
             int id = headers.size();
-            add(headers, descriptions, grids, desc, transparentWhiteAverage(), entry, null);
+            add(headers, descriptions, desc, transparentWhiteAverage(), entry);
             nextEntityTextureIds.put(name, id);
             nextEntityTemplates.put(name, new EntityTemplate(desc, entry));
         }
@@ -270,7 +262,7 @@ public final class RtMaterialRegistry {
             }
         }
         Snapshot next = new Snapshot(epoch, Collections.unmodifiableMap(ids), fallbackVariants, waterId, lavaId,
-                List.copyOf(descriptions), Collections.unmodifiableList(new ArrayList<>(grids)), frozenOverrides);
+                List.copyOf(descriptions), frozenOverrides);
         entityTextureIds = Collections.unmodifiableMap(nextEntityTextureIds);
         entityTemplates = Collections.unmodifiableMap(nextEntityTemplates);
         entitySpriteIds.clear();
@@ -289,12 +281,14 @@ public final class RtMaterialRegistry {
                 == RtMaterialDesc.EmissionSource.LAB_PBR).count();
         long uniformEmission = descriptions.stream().filter(desc -> desc.emissionSource()
                 == RtMaterialDesc.EmissionSource.STATE_UNIFORM).count();
+        long overrideEmission = descriptions.stream().filter(desc -> desc.emissionSource()
+                == RtMaterialDesc.EmissionSource.OVERRIDE).count();
         double averageCoverage = descriptions.stream().filter(desc -> desc.emissionSummary().emissive())
                 .mapToDouble(desc -> desc.emissionSummary().coverage()).average().orElse(0.0);
-        CausticaMod.LOGGER.info("RT materials: epoch={}, records={}, capacity={}, blockSprites={}, entityResources={}, overrideRules={}, matchedOverrides={}, emissive={}, labPbrEmission={}, heuristicMasks={}, uniformEmission={}, avgEmissionCoverage={}, tableKiB={}",
+        CausticaMod.LOGGER.info("RT materials: epoch={}, records={}, capacity={}, blockSprites={}, entityResources={}, overrideRules={}, matchedOverrides={}, emissive={}, labPbrEmission={}, heuristicMasks={}, uniformEmission={}, overrideEmission={}, avgEmissionCoverage={}, tableKiB={}",
                 epoch, headers.size(), recordCapacity, sprites.size(), entityResources.size(), overrides.rules().size(),
                 matchedOverrideRules, emissive,
-                authoredEmission, inferred, uniformEmission,
+                authoredEmission, inferred, uniformEmission, overrideEmission,
                 String.format(java.util.Locale.ROOT, "%.3f", averageCoverage), byteSize / 1024);
     }
 
@@ -441,7 +435,7 @@ public final class RtMaterialRegistry {
         } else {
             emissionSource = RtMaterialDesc.EmissionSource.NONE;
         }
-        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : EMISSIVE_STRENGTH;
+        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : 1.0f;
         return new RtMaterialDesc(model, source, features, roughness, metalness, ior, transmission,
                 emissionSource, emissionStrength, emissionSummary);
     }
@@ -453,56 +447,27 @@ public final class RtMaterialRegistry {
                 : (authored ? RtMaterialDesc.Source.LAB_PBR : RtMaterialDesc.Source.HEURISTIC);
         RtMaterialDesc.EmissionSource emissionSource = (features & FEATURE_SPEC) != 0
                 ? RtMaterialDesc.EmissionSource.LAB_PBR : RtMaterialDesc.EmissionSource.NONE;
-        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : EMISSIVE_STRENGTH;
         return new RtMaterialDesc(MODEL_OPAQUE, source, features, RtMaterials.ENTITY_ROUGH, 0.0f,
-                1.0f, 0.0f, emissionSource, emissionStrength, emissionSummary);
+                1.0f, 0.0f, emissionSource, emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : 1.0f,
+                emissionSummary);
     }
 
     private static void add(List<MaterialHeaderData> headers, List<RtMaterialDesc> descriptions,
-                            List<RtEmissionGrid> grids, RtMaterialDesc desc, float[] average,
-                            RtBlockMaterials.Entry entry, RtEmissionGrid uniformGrid) {
+                            RtMaterialDesc desc, float[] average, RtBlockMaterials.Entry entry) {
         headers.add(header(desc, average, entry, entry.albedoU(), entry.albedoV(),
                 entry.albedoInvDu(), entry.albedoInvDv()));
         descriptions.add(desc);
-        grids.add(gridFor(desc, entry, uniformGrid));
-    }
-
-    /**
-     * The emission grid whose per-texel source matches what {@code world.rchit} shades for this
-     * description — the same selection {@link #variantSummary}/override application made for the summary.
-     */
-    private static RtEmissionGrid gridFor(RtMaterialDesc desc, RtBlockMaterials.Entry entry,
-                                          RtEmissionGrid uniformGrid) {
-        return switch (desc.emissionSource()) {
-            case LAB_PBR, HEURISTIC_MASK -> entry.emissionGrid();
-            case STATE_UNIFORM -> uniformGrid;
-            case NONE -> null;
-        };
-    }
-
-    /** The whole-sprite albedo grid of a named block sprite (uniform-emitter light color), or null. */
-    private static RtEmissionGrid albedoGridFor(List<TextureAtlasSprite> sprites,
-                                                Map<TextureAtlasSprite, SpriteStats> spriteStats,
-                                                String name) {
-        Identifier id = Identifier.withDefaultNamespace(name);
-        for (TextureAtlasSprite sprite : sprites) {
-            if (sprite.contents().name().equals(id)) {
-                SpriteStats stats = spriteStats.get(sprite);
-                return stats != null ? stats.albedoGrid() : null;
-            }
-        }
-        return null;
     }
 
     private static MaterialHeaderData header(RtMaterialDesc desc, float[] average,
                                              RtBlockMaterials.Entry entry, float albedoU, float albedoV,
                                              float albedoInvDu, float albedoInvDv) {
         int packedFeatures = desc.features() | (entry.maxLod() << MAX_LOD_SHIFT);
-        // Packed unconditionally (0 for non-emissive materials): the shader multiplies surface.emission
-        // by this every time, regardless of source, so EMISSIVE_STRENGTH never needs its own copy there.
-        int strength = Math.round(Math.min(MAX_EMISSION_STRENGTH, desc.emissionStrength())
-                * (EMISSION_STRENGTH_MASK / MAX_EMISSION_STRENGTH));
-        packedFeatures |= strength << EMISSION_STRENGTH_SHIFT;
+        if ((desc.features() & FEATURE_OVERRIDE_EMISSION) != 0) {
+            int strength = Math.round(Math.min(MAX_OVERRIDE_EMISSION_STRENGTH, desc.emissionStrength())
+                    * (EMISSION_STRENGTH_MASK / MAX_OVERRIDE_EMISSION_STRENGTH));
+            packedFeatures |= strength << EMISSION_STRENGTH_SHIFT;
+        }
         return new MaterialHeaderData(desc.model(), packedFeatures, entry.pageIndex(), 0,
                 new Float4(entry.materialU(), entry.materialV(), entry.materialDu(), entry.materialDv()),
                 new Float4(albedoU, albedoV, albedoInvDu, albedoInvDv),
@@ -527,10 +492,9 @@ public final class RtMaterialRegistry {
      * previous translucent shadow-filter input) and the premultiplied-linear uniform emission summary
      * used when a state emits light but no per-texel mask was compiled.
      */
-    private record SpriteStats(float[] average, RtMaterialDesc.EmissionSummary uniformSummary,
-                               RtEmissionGrid albedoGrid) {
+    private record SpriteStats(float[] average, RtMaterialDesc.EmissionSummary uniformSummary) {
         static final SpriteStats NEUTRAL = new SpriteStats(transparentWhiteAverage(),
-                RtMaterialDesc.EmissionSummary.NONE, null);
+                RtMaterialDesc.EmissionSummary.NONE);
     }
 
     private static SpriteStats computeSpriteStats(TextureAtlasSprite sprite) {
@@ -542,9 +506,6 @@ public final class RtMaterialRegistry {
         long sr = 0L, sg = 0L, sb = 0L, sa = 0L;
         double lr = 0.0, lg = 0.0, lb = 0.0;
         int covered = 0;
-        // A uniform (state-gated) emitter radiates alpha-weighted albedo per texel; its grid mirrors that
-        // so the light collector's footprint math is one code path across all emission sources.
-        RtEmissionGrid.Builder gridBuilder = new RtEmissionGrid.Builder(width, height);
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 int pixel = image.getPixel(x, y); // frame 0 always occupies the image's top-left tile
@@ -554,13 +515,9 @@ public final class RtMaterialRegistry {
                 sb += ARGB.blue(pixel);
                 sa += a;
                 float alpha = a / 255.0f;
-                float plr = RtMaterialTextureData.srgbToLinear(ARGB.red(pixel)) * alpha;
-                float plg = RtMaterialTextureData.srgbToLinear(ARGB.green(pixel)) * alpha;
-                float plb = RtMaterialTextureData.srgbToLinear(ARGB.blue(pixel)) * alpha;
-                lr += plr;
-                lg += plg;
-                lb += plb;
-                gridBuilder.add(x, y, plr, plg, plb, alpha);
+                lr += RtMaterialTextureData.srgbToLinear(ARGB.red(pixel)) * alpha;
+                lg += RtMaterialTextureData.srgbToLinear(ARGB.green(pixel)) * alpha;
+                lb += RtMaterialTextureData.srgbToLinear(ARGB.blue(pixel)) * alpha;
                 if (a > 1) covered++;
             }
         }
@@ -572,7 +529,7 @@ public final class RtMaterialRegistry {
                 ? RtMaterialDesc.EmissionSummary.NONE
                 : new RtMaterialDesc.EmissionSummary((float) (lr * inv), (float) (lg * inv),
                         (float) (lb * inv), (float) (luminance * inv), covered * inv);
-        return new SpriteStats(average, uniform, gridBuilder.build());
+        return new SpriteStats(average, uniform);
     }
 
     private static final class MutableCompiledOverride {
@@ -601,19 +558,17 @@ public final class RtMaterialRegistry {
         private final int waterId;
         private final int lavaId;
         private final List<RtMaterialDesc> descriptions;
-        private final List<RtEmissionGrid> grids;
         private final List<CompiledOverride> overrides;
 
         private Snapshot(long epoch, Map<TextureAtlasSprite, int[]> ids, int[] fallbackVariants,
                          int waterId, int lavaId, List<RtMaterialDesc> descriptions,
-                         List<RtEmissionGrid> grids, List<CompiledOverride> overrides) {
+                         List<CompiledOverride> overrides) {
             this.epoch = epoch;
             this.ids = ids;
             this.fallbackVariants = fallbackVariants;
             this.waterId = waterId;
             this.lavaId = lavaId;
             this.descriptions = descriptions;
-            this.grids = grids;
             this.overrides = overrides;
         }
 
@@ -635,11 +590,6 @@ public final class RtMaterialRegistry {
 
         public RtMaterialDesc material(int materialId) {
             return descriptions.get(materialId);
-        }
-
-        /** Emission summary grid matching this material's shaded emission source, or null when none. */
-        public RtEmissionGrid emissionGrid(int materialId) {
-            return grids.get(materialId);
         }
 
         public int resolve(TextureAtlasSprite sprite, BlockState state, boolean glass) {
