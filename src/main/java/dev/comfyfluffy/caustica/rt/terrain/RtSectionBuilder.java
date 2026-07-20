@@ -131,7 +131,7 @@ final class RtSectionBuilder {
     }
 
     /** Worker-owned native section state paired with its prepared BLAS. {@code lights} = packed
-     *  section-local ReSTIR light records (CPU-side, flattened into the global buffer at publish). */
+     *  section-local RIS light records (CPU-side, flattened into the global buffer at publish). */
     record PreparedSection(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs,
                            RtBuffer material, RtBuffer upload, RtAccel.PreparedBlas blas, int[] triBase,
                            int sx, int sy, int sz, float[] lights) {

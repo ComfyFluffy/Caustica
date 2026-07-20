@@ -103,7 +103,7 @@ final class RtTerrainMesher {
         if (mesh.isEmpty()) {
             return new CpuSection(null, null);
         }
-        // ReSTIR DI light collection — BEFORE packing: it also stamps NEE membership into the prim
+        // RIS emitter-NEE light collection — BEFORE packing: it also stamps NEE membership into the prim
         // records, which packSection then copies out. Only opaque + cutout can emit (glass is shaded
         // emission-free, water never emits; lava lives in the opaque bucket).
         float[] lights = EMPTY_LIGHTS;
@@ -237,7 +237,7 @@ final class RtTerrainMesher {
     }
 
     /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays.
-     *  {@code lights} = packed section-local ReSTIR light records (possibly empty), CPU-side only. */
+     *  {@code lights} = packed section-local RIS light records (possibly empty), CPU-side only. */
     record PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
                          int[] bucketTris, int[] triBase, float[] lights) {
     }

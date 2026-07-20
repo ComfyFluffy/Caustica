@@ -203,7 +203,7 @@ final class RtSectionTable {
         final int sx;
         final int sy;
         final int sz;
-        /** Packed section-local ReSTIR light records (possibly empty); flattened at publish. */
+        /** Packed section-local RIS light records (possibly empty); flattened at publish. */
         final float[] lights;
         int slot = -1;
         int instanceIndex = -1;

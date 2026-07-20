@@ -52,7 +52,7 @@ public struct WorldPush {
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
-    public uint64_t lightBufAddr;     // ReSTIR DI global light buffer (0 = none published)
+    public uint64_t lightBufAddr;     // RIS emitter-NEE global light buffer (0 = none published)
     public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
     public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
     public float4   lightRebase;      // xyz hierarchy-to-current rebase, w inverse total light power

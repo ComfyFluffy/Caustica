@@ -860,8 +860,8 @@ public final class RtComposite {
                     mvCurProjView,
                     breaking.length,
                     breaking,
-                    // ReSTIR DI: published light buffer + RIS candidate count (0 = emitter NEE off; the
-                    // shader also requires lightCount > 0, so an empty buffer degrades to legacy gather).
+                    // RIS emitter NEE: published light buffer + RIS candidate count (0 = emitter NEE off;
+                    // the shader also requires lightCount > 0, so an empty buffer degrades to legacy gather).
                     terrain.lightBufferAddress(),
                     CausticaConfig.Rt.Lights.POWER_SAMPLING.value()
                             ? terrain.lightAliasBufferAddress() : 0L,

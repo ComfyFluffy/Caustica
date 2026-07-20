@@ -811,7 +811,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     int maxBounces = int(worldPush.maxBounces);
     int rrStart = maxBounces <= 3 ? 1 : 2;
     bool pbr = (worldPush.flags & 2u) != 0u; // GGX BRDF + material guides, else Lambertian fallback
-    // ReSTIR DI: RIS direct lighting from block emitters is active when lights are published and the
+    // RIS emitter NEE: direct lighting from block emitters is active when lights are published and the
     // candidate count is non-zero. Off => emitters are gathered only on path hits (legacy behaviour).
     bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
     // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
@@ -1049,7 +1049,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         }
 
         // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly, colored by albedo.
-        // ReSTIR DI: the direct-hit emission term is gated only for emitters RIS actually samples
+        // RIS emitter NEE: the direct-hit emission term is gated only for emitters RIS actually samples
         // (payload emitter-in-list bit) — and then only off diffuse continuation rays (showCelestial
         // false), which the previous vertex's RIS already accounted for; the primary ray and
         // specular/dielectric bounces (showCelestial true) still add it, since no emitter NEE happened

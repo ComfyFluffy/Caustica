@@ -564,7 +564,7 @@ public final class CausticaConfig {
             }
         }
 
-        /** ReSTIR DI block-emitter lights (RESTIR_PLAN.md). {@code ris-candidates = 0} disables everything. */
+        /** RIS block-emitter lights (RESTIR_PLAN.md). {@code ris-candidates = 0} disables everything. */
         public static final class Lights {
             public static final IntSetting RIS_CANDIDATES =
                     intAtLeast("caustica.rt.risCandidates", "lights.ris-candidates", 8, 0);

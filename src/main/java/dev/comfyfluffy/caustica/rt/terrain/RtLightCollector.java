@@ -7,7 +7,7 @@ import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 
 /**
- * ReSTIR DI light collection (RESTIR_PLAN.md S0). Enumerates a section's emissive terrain quads into a
+ * RIS emitter-NEE light collection (RESTIR_PLAN.md S0). Enumerates a section's emissive terrain quads into a
  * samplable light list, in <b>section-local</b> coordinates (flattened into rebased world space at
  * publish, see {@code RtTerrain.applyBuildChanges}). Runs on the meshing worker over the transient
  * per-bucket arrays, before packing — pure CPU + material-snapshot reads only.
