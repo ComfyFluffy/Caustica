@@ -176,6 +176,16 @@ vertices keep single-frame RIS.
    section-level power CDF (total Le·area per section, distance-attenuated per frame or per
    rebuild), sample section then light-within-section. Evaluate before reaching for a full
    light BVH.
+   **Hierarchy refactor started 2026-07-19.** ReGIR cells now reference stable section slots;
+   section headers own contiguous light ranges and power-weighted local aliases. Global light packing,
+   global alias construction, local aliases, and the ReGIR grid are prepared by one coalescing worker
+   and uploaded/published as one immutable generation. The previous complete generation remains active
+   until its replacement is GPU-complete—normal light edits no longer clear ReGIR or alternate through
+   a global-only fallback. A retained generation carries its own rebase origin; light centers and its
+   ReGIR grid origin are translated by `hierarchyRebase-currentRebase` while a rebased replacement is
+   pending. This first generation deliberately retains compact shared `Light[]` storage;
+   replacing those ranges with independently updateable section pages is the next hierarchy step and
+   does not require another shader sampling-contract change.
 2. **Exact texel Le at shade time (pixel-accurate light color).** RTXDI-style split: the RIS
    candidate loop keeps the cheap per-quad mean (no texture fetch × M candidates), but the ONE
    selected sample fetches the true emission texel at its (s,t) → UV point from the canonical
