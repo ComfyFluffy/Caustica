@@ -17,10 +17,6 @@ final class RtLightGrid {
     private RtLightGrid() {
     }
 
-    static Data build(List<SectionLights> sections, int rebaseX, int rebaseY, int rebaseZ) {
-        return build(sections, rebaseX, rebaseY, rebaseZ, () -> false);
-    }
-
     static Data build(List<SectionLights> sections, int rebaseX, int rebaseY, int rebaseZ,
                       BooleanSupplier cancelled) {
         if (sections.isEmpty()) return null;
@@ -124,47 +120,21 @@ final class RtLightGrid {
             }
         }
 
-        double[] scaled = new double[maxCellSpans];
-        int[] small = new int[maxCellSpans];
-        int[] large = new int[maxCellSpans];
-        int[] aliases = new int[maxCellSpans];
+        // Vose alias-table construction (weights, small/large scratch, accept/alias write-back) is
+        // identical to the section-local aliases RtLightHierarchy builds; share that implementation
+        // instead of a second copy of the same 40-odd lines.
+        int[] spanAliasIndex = new int[prefix];
+        RtLightHierarchy.AliasScratch scratch = new RtLightHierarchy.AliasScratch(maxCellSpans);
         for (int cell = 0; cell < volume; cell++) {
             if ((cell & 4095) == 0) checkCancelled(cancelled);
             int first = cellOffsets[cell];
             int count = cellCounts[cell];
             if (count == 0) continue;
-            double totalWeight = 0.0;
-            for (int i = 0; i < count; i++) totalWeight += spanWeights[first + i];
+            double totalWeight = RtLightHierarchy.buildAliasInto(spanWeights, first, count,
+                    spanAliasIndex, spanAccept, first, scratch, cancelled);
             cellInvWeightSums[cell] = (float) (1.0 / totalWeight);
-
-            int smallCount = 0;
-            int largeCount = 0;
             for (int i = 0; i < count; i++) {
-                scaled[i] = spanWeights[first + i] * count / totalWeight;
-                if (scaled[i] < 1.0) small[smallCount++] = i;
-                else large[largeCount++] = i;
-            }
-            while (smallCount > 0 && largeCount > 0) {
-                int s = small[--smallCount];
-                int l = large[--largeCount];
-                spanAccept[first + s] = (float) scaled[s];
-                aliases[s] = l;
-                scaled[l] = scaled[l] + scaled[s] - 1.0;
-                if (scaled[l] < 1.0) small[smallCount++] = l;
-                else large[largeCount++] = l;
-            }
-            while (largeCount > 0) {
-                int i = large[--largeCount];
-                spanAccept[first + i] = 1.0f;
-                aliases[i] = i;
-            }
-            while (smallCount > 0) {
-                int i = small[--smallCount];
-                spanAccept[first + i] = 1.0f;
-                aliases[i] = i;
-            }
-            for (int i = 0; i < count; i++) {
-                int aliasSpan = first + aliases[i];
+                int aliasSpan = first + spanAliasIndex[first + i];
                 spanAliasFirstLights[first + i] = spanFirstLights[aliasSpan];
                 spanAliasLightCounts[first + i] = spanLightCounts[aliasSpan];
             }

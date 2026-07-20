@@ -311,23 +311,15 @@ final class RtLightGridManager {
             if (dx * dx + dy * dy + dz * dz > radiusSq) continue;
             float area = lights[record + 3];
             int packedLe = Float.floatToRawIntBits(lights[record + 7]);
-            float leR = unpackUnsignedFloat(packedLe & 0x7ff, 6);
-            float leG = unpackUnsignedFloat((packedLe >>> 11) & 0x7ff, 6);
-            float leB = unpackUnsignedFloat((packedLe >>> 22) & 0x3ff, 5);
+            float leR = RtLightHierarchy.unpackUnsignedFloat(packedLe & 0x7ff, 6);
+            float leG = RtLightHierarchy.unpackUnsignedFloat((packedLe >>> 11) & 0x7ff, 6);
+            float leB = RtLightHierarchy.unpackUnsignedFloat((packedLe >>> 22) & 0x3ff, 5);
             CausticaMod.LOGGER.info("RT light[{}] world=({}, {}, {}) area={} Le=({}, {}, {})",
                     light, x + data.rebaseX(), y + data.rebaseY(), z + data.rebaseZ(),
                     area, leR, leG, leB);
             dumped++;
         }
         CausticaMod.LOGGER.info("RT light dump: {} lights within {} blocks", dumped, (int) radius);
-    }
-
-    private static float unpackUnsignedFloat(int bits, int mantissaBits) {
-        int mantissaMask = (1 << mantissaBits) - 1;
-        int mantissa = bits & mantissaMask;
-        int exponent = (bits >>> mantissaBits) & 31;
-        if (exponent == 0) return Math.scalb((float) mantissa, 1 - 15 - mantissaBits);
-        return Math.scalb(1.0f + (float) mantissa / (1 << mantissaBits), exponent - 15);
     }
 
     private void publishEmpty(RtContext ctx, long requestId) {

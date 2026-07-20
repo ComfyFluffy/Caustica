@@ -17,7 +17,7 @@ final class RtLightHierarchyTest {
         RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
                 new RtLightHierarchy.SectionInput(5, 4, 2, 1, other),
                 new RtLightHierarchy.SectionInput(2, 1, 0, 0, strongAndWeak)
-        ), 16, 0, 0);
+        ), 16, 0, 0, () -> false);
 
         assertEquals(3, data.lightCount());
         assertEquals(0, data.sectionFirstLights()[2]);
@@ -44,7 +44,7 @@ final class RtLightHierarchyTest {
         RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
                 new RtLightHierarchy.SectionInput(9, 0, 0, 0, light(1f, 1f)),
                 new RtLightHierarchy.SectionInput(3, 1, 0, 0, light(1f, 1f))
-        ), 0, 0, 0);
+        ), 0, 0, 0, () -> false);
 
         RtLightGrid.Data grid = data.grid();
         int cellX = -grid.originX() / 16;
@@ -66,7 +66,7 @@ final class RtLightHierarchyTest {
     void mortonOrderOverridesUnrelatedStableSlotOrder() {
         RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
                 new RtLightHierarchy.SectionInput(0, 8, 0, 0, light(1f, 1f)),
-                new RtLightHierarchy.SectionInput(9, 0, 0, 0, light(1f, 1f))), 0, 0, 0);
+                new RtLightHierarchy.SectionInput(9, 0, 0, 0, light(1f, 1f))), 0, 0, 0, () -> false);
 
         assertEquals(0, data.sectionFirstLights()[9]);
         assertEquals(1, data.sectionFirstLights()[0]);
@@ -84,8 +84,8 @@ final class RtLightHierarchyTest {
     void retainedGenerationCanBeTranslatedAcrossARebase() {
         List<RtLightHierarchy.SectionInput> sections = List.of(
                 new RtLightHierarchy.SectionInput(0, 3, 0, 0, light(1f, 1f)));
-        RtLightHierarchy.Data oldGeneration = RtLightHierarchy.build(sections, 16, 0, 0);
-        RtLightHierarchy.Data rebuiltGeneration = RtLightHierarchy.build(sections, 32, 0, 0);
+        RtLightHierarchy.Data oldGeneration = RtLightHierarchy.build(sections, 16, 0, 0, () -> false);
+        RtLightHierarchy.Data rebuiltGeneration = RtLightHierarchy.build(sections, 32, 0, 0, () -> false);
 
         float oldToCurrent = oldGeneration.rebaseX() - rebuiltGeneration.rebaseX();
         assertEquals(rebuiltGeneration.packedLights()[0],

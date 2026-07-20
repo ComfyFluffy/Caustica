@@ -20,10 +20,6 @@ final class RtLightHierarchy {
     private RtLightHierarchy() {
     }
 
-    static Data build(List<SectionInput> sections, int rebaseX, int rebaseY, int rebaseZ) {
-        return build(sections, rebaseX, rebaseY, rebaseZ, () -> false);
-    }
-
     static Data build(List<SectionInput> sections, int rebaseX, int rebaseY, int rebaseZ,
                       BooleanSupplier cancelled) {
         List<SectionInput> orderedSections = orderedSections(sections, cancelled);
@@ -198,16 +194,25 @@ final class RtLightHierarchy {
         return new AliasData(alias, accept);
     }
 
-    private static void buildAliasInto(double[] powers, int powerOffset, int count,
-                                       int[] alias, float[] accept, int destinationOffset,
-                                       AliasScratch scratch, BooleanSupplier cancelled) {
-        if (count == 0) return;
+    /**
+     * Vose alias-method table over {@code weights[weightOffset, weightOffset+count)}. Writes
+     * {@code accept[destinationOffset+i]} and a LOCAL (0-based) alias index into
+     * {@code alias[destinationOffset+i]} for {@code i} in {@code [0, count)}. No-op (both arrays
+     * untouched) if the window is empty or its total weight is not positive. Returns the total
+     * weight (0.0 in both those cases) so callers that also need it (e.g. a per-cell inverse-weight
+     * normalizer) don't have to recompute it. Shared by {@link RtLightGrid}'s per-cell section
+     * distributions, which follow the same offset convention.
+     */
+    static double buildAliasInto(double[] weights, int weightOffset, int count,
+                                 int[] alias, float[] accept, int destinationOffset,
+                                 AliasScratch scratch, BooleanSupplier cancelled) {
+        if (count == 0) return 0.0;
         double total = 0.0;
         for (int i = 0; i < count; i++) {
             if ((i & 1023) == 0) checkCancelled(cancelled);
-            total += powers[powerOffset + i];
+            total += weights[weightOffset + i];
         }
-        if (!(total > 0.0)) return;
+        if (!(total > 0.0)) return 0.0;
 
         double[] scaled = scratch.scaled;
         int[] small = scratch.small;
@@ -215,8 +220,8 @@ final class RtLightHierarchy {
         int smallCount = 0;
         int largeCount = 0;
         for (int i = 0; i < count; i++) {
-            double power = powers[powerOffset + i];
-            scaled[i] = power * count / total;
+            double weight = weights[weightOffset + i];
+            scaled[i] = weight * count / total;
             if (scaled[i] < 1.0) small[smallCount++] = i;
             else large[largeCount++] = i;
         }
@@ -239,6 +244,7 @@ final class RtLightHierarchy {
             accept[destinationOffset + i] = 1.0f;
             alias[destinationOffset + i] = i;
         }
+        return total;
     }
 
     static int packR11G11B10(float r, float g, float b) {
@@ -279,7 +285,7 @@ final class RtLightHierarchy {
         }
     }
 
-    private static final class AliasScratch {
+    static final class AliasScratch {
         final double[] scaled;
         final int[] small;
         final int[] large;

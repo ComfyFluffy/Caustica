@@ -14,7 +14,7 @@ final class RtLightGridTest {
         List<RtLightGrid.SectionLights> sections = List.of(
                 new RtLightGrid.SectionLights(7, 2, 0, 0, 0, 3.0));
 
-        RtLightGrid.Data data = RtLightGrid.build(sections, 0, 0, 0);
+        RtLightGrid.Data data = RtLightGrid.build(sections, 0, 0, 0, () -> false);
 
         assertEquals(125, data.populatedCells());
         assertEquals(-32, data.originX());
@@ -31,7 +31,7 @@ final class RtLightGridTest {
     @Test
     void retainsEveryCandidateBeyondTheOldLimit() {
         RtLightGrid.Data data = RtLightGrid.build(
-                List.of(new RtLightGrid.SectionLights(7, 1, 0, 0, 0, 96.0)), 0, 0, 0);
+                List.of(new RtLightGrid.SectionLights(7, 1, 0, 0, 0, 96.0)), 0, 0, 0, () -> false);
 
         assertEquals(1, data.cellCounts()[0]);
         assertEquals(125, data.spanFirstLights().length);
@@ -43,7 +43,7 @@ final class RtLightGridTest {
     void aliasColumnsReconstructExactSectionAndGlobalProbabilities() {
         RtLightGrid.Data data = RtLightGrid.build(List.of(
                 new RtLightGrid.SectionLights(4, 1, 0, 0, 0, 1.0),
-                new RtLightGrid.SectionLights(8, 1, 1, 0, 0, 3.0)), 0, 0, 0);
+                new RtLightGrid.SectionLights(8, 1, 1, 0, 0, 3.0)), 0, 0, 0, () -> false);
         int x = -data.originX() / 16;
         int y = -data.originY() / 16;
         int z = -data.originZ() / 16;
@@ -60,7 +60,7 @@ final class RtLightGridTest {
     @Test
     void skipsGridWhenThereAreNoLights() {
         assertNull(RtLightGrid.build(List.of(new RtLightGrid.SectionLights(0, 1, 0, 0, 0, 0.0)),
-                0, 0, 0));
+                0, 0, 0, () -> false));
     }
 
     private static double aliasProbability(RtLightGrid.Data data, int first, int count,
