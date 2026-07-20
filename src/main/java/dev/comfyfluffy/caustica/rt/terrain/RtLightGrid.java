@@ -5,15 +5,16 @@ import java.util.concurrent.CancellationException;
 import java.util.function.BooleanSupplier;
 
 /**
- * CPU builder for the section-sized ReGIR proposal grid. Every nearby light remains eligible, but a
- * cell stores one weighted contiguous range per lit section instead of duplicating every light index.
- * The span count is naturally bounded by the spatial neighborhood, not by an arbitrary light cap.
+ * CPU builder for the section-sized light candidate-proposal grid. Every nearby light remains
+ * eligible, but a cell stores one weighted contiguous range per lit section instead of duplicating
+ * every light index. The span count is naturally bounded by the spatial neighborhood, not by an
+ * arbitrary light cap.
  */
-final class RtReGIR {
+final class RtLightGrid {
     private static final int NEIGHBOR_RADIUS = 2;
     private static final int MAX_DENSE_GRID_CELLS = 4_000_000;
 
-    private RtReGIR() {
+    private RtLightGrid() {
     }
 
     static Data build(List<SectionLights> sections, int rebaseX, int rebaseY, int rebaseZ) {
@@ -77,7 +78,7 @@ final class RtReGIR {
             }
         }
         if (spanCountLong > Integer.MAX_VALUE) {
-            throw new IllegalStateException("ReGIR span count exceeds Java array capacity: " + spanCountLong);
+            throw new IllegalStateException("Light grid span count exceeds Java array capacity: " + spanCountLong);
         }
 
         int populatedCells = 0;
@@ -176,7 +177,7 @@ final class RtReGIR {
     }
 
     private static void checkCancelled(BooleanSupplier cancelled) {
-        if (cancelled.getAsBoolean()) throw new CancellationException("Superseded ReGIR build");
+        if (cancelled.getAsBoolean()) throw new CancellationException("Superseded light grid build");
     }
 
     record SectionLights(int firstLight, int lightCount, int x, int y, int z, double power) {

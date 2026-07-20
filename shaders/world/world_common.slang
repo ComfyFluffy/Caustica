@@ -56,10 +56,10 @@ public struct WorldPush {
     public uint64_t lightAliasAddr;   // power-weighted O(1) alias table (0 = uniform fallback)
     public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
     public float4   lightRebase;      // xyz hierarchy-to-current rebase, w inverse total light power
-    public uint64_t regirCellAddr;    // dense ReGIR cell headers (0 = global proposals only)
-    public uint64_t regirSpanAddr;      // packed weighted section spans referenced by cell headers
-    public float4   regirOrigin;      // xyz minimum cell origin in rebased blocks, w cell size
-    public int4     regirGrid;        // xyz dense grid dimensions, w reserved
+    public uint64_t lightGridCellAddr;   // dense light grid cell headers (0 = global proposals only)
+    public uint64_t lightGridSpanAddr;   // packed weighted section spans referenced by cell headers
+    public float4   lightGridOrigin;     // xyz minimum cell origin in rebased blocks, w cell size
+    public int4     lightGridDims;       // xyz dense grid dimensions, w reserved
     public uint     lightCount;       // packed Light records in lightBufAddr
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
 };
@@ -78,16 +78,16 @@ public struct LightAlias {
     public float accept;
 };
 
-// Dense ReGIR grid entry. Empty coordinates have spanCount=0; populated section cells point into an
-// immutable list of weighted section light ranges built and published alongside this grid.
-public struct ReGIRCell {
+// Dense light grid cell entry. Empty coordinates have spanCount=0; populated section cells point into
+// an immutable list of weighted section light ranges built and published alongside this grid.
+public struct LightGridCell {
     public uint spanOffset;
     public uint spanCount;
     public float invWeightSum;
 };
 
 // One 16-byte Vose alias column for a cell's section distribution. The two light counts are uint16s.
-public struct ReGIRSpan {
+public struct LightGridSpan {
     public uint firstLight;
     public uint aliasFirstLight;
     public uint packedLightCounts; // low16 self, high16 alias

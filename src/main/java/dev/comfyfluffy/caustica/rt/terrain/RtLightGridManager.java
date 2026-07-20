@@ -18,12 +18,12 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Coalesced asynchronous lifecycle for one coherent light-hierarchy generation. CPU packing, global
- * and section-local alias construction, and ReGIR construction all run on a worker. The render thread
- * only atomically publishes GPU-complete buffers; the worker also allocates/fills staging and device
- * buffers and enqueues the copy on {@link RtGpuExecutor}. The previous complete generation remains
- * shader-visible until that point.
+ * and section-local alias construction, and light grid construction all run on a worker. The render
+ * thread only atomically publishes GPU-complete buffers; the worker also allocates/fills staging and
+ * device buffers and enqueues the copy on {@link RtGpuExecutor}. The previous complete generation
+ * remains shader-visible until that point.
  */
-final class RtReGIRManager {
+final class RtLightGridManager {
     private final Object buildLock = new Object();
     private final Object taskLock = new Object();
     private final ConcurrentLinkedQueue<Completion> completions = new ConcurrentLinkedQueue<>();
@@ -202,7 +202,7 @@ final class RtReGIRManager {
             MemoryUtil.memFloatBuffer(cursor, data.packedLights().length).put(data.packedLights());
             cursor = upload.mapped + layout.globalAliasOffset;
             writeAliases(cursor, data.globalAliases());
-            RtReGIR.Data grid = layout.hasGrid ? data.grid() : null;
+            RtLightGrid.Data grid = layout.hasGrid ? data.grid() : null;
             if (grid != null) {
                 cursor = upload.mapped + layout.localAliasOffset;
                 writeAliases(cursor, data.localAliases());
@@ -276,7 +276,7 @@ final class RtReGIRManager {
     }
 
     private void publish(RtContext ctx, Uploaded uploaded) {
-        RtReGIR.Data grid = uploaded.layout.hasGrid ? uploaded.data.grid() : null;
+        RtLightGrid.Data grid = uploaded.layout.hasGrid ? uploaded.data.grid() : null;
         PublishedState next = new PublishedState(uploaded.arena, uploaded.layout,
                 uploaded.data.lightCount(), uploaded.data.invGlobalPowerSum(),
                 grid != null ? grid.originX() : 0, grid != null ? grid.originY() : 0,
@@ -296,7 +296,7 @@ final class RtReGIRManager {
         if (CausticaConfig.Rt.Lights.DUMP.value()) dumpNearbyLights(uploaded.data);
 
         if (CausticaConfig.Rt.Lights.STATS.value()) {
-            CausticaMod.LOGGER.info("RT light hierarchy {}: {} lights / {} section slots / {} ReGIR spans / {} KiB",
+            CausticaMod.LOGGER.info("RT light hierarchy {}: {} lights / {} section slots / {} light grid spans / {} KiB",
                     uploaded.requestId, uploaded.data.lightCount(), uploaded.data.sectionFirstLights().length,
                     grid != null ? grid.spanFirstLights().length : 0,
                     (uploaded.layout.totalBytes + 1023L) >> 10);

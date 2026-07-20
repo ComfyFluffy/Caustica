@@ -21,7 +21,7 @@ lava, lanterns…) contribute **only when a path ray happens to land on them** (
 - **Stage 0** — enumerate emissive quads into a samplable light list (one area light per quad).
 - **Stage 1** — RIS NEE at each diffuse vertex: M candidates → weighted-reservoir select 1 by
   unshadowed p̂ = luminance(f·Le·G·area) → ONE shadow ray. `W = (wSum/M)/p̂`.
-- **Stage 3** — power/nearby-weighted candidate sampling (ReGIR grid, done). Spatial reuse remains
+- **Stage 3** — power/nearby-weighted candidate sampling (light grid, done). Spatial reuse remains
   open work.
 
 Sun/moon NEE stays separate and additive. `risCandidates = 0` ⇒ everything off, bit-identical to
@@ -30,7 +30,7 @@ today's always-gather behaviour.
 **Stage 2 (temporal reservoir reuse) was implemented and then removed (2026-07-20).** Persistent
 per-pixel reservoirs (64 B ping-pong buffers, MV reprojection, permutation sampling) worked and were
 GPU-verified, but temporal reuse fights DLSS-RR's own history/AA rather than complementing it, and
-single-frame RIS over the ReGIR grid is already sufficient noise-wise. The removed machinery is
+single-frame RIS over the light grid is already sufficient noise-wise. The removed machinery is
 recoverable from git history (`d1b22e3` "temporal reuse" and neighboring commits on this branch) if
 temporal reuse is revisited later; it is intentionally not kept around dark in the shipping path.
 
@@ -159,7 +159,7 @@ values wired in RtComposite. GPU verify list below still open.
 Was implemented 1:1 per the old branch's validated design: 64 B ping-pong reservoirs, MV
 reprojection, RTXDI permutation sampling, rebase correction, disocclusion reject, M cap, visibility
 reuse. GPU-verified working. **Removed 2026-07-20**: temporal reuse fights DLSS-RR's own
-history/AA rather than complementing it, and single-frame RIS over the ReGIR grid (S3) is already
+history/AA rather than complementing it, and single-frame RIS over the light grid (S3) is already
 sufficient. Recoverable from git history (`d1b22e3` "temporal reuse" on this branch) if revisited.
 
 ### S3 — candidate sampling + spatial reuse (new work, in this order)
@@ -169,13 +169,13 @@ sufficient. Recoverable from git history (`d1b22e3` "temporal reuse" on this bra
    section-level power CDF (total Le·area per section, distance-attenuated per frame or per
    rebuild), sample section then light-within-section. Evaluate before reaching for a full
    light BVH.
-   **Hierarchy refactor started 2026-07-19.** ReGIR cells now reference stable section slots;
+   **Hierarchy refactor started 2026-07-19.** Light grid cells now reference stable section slots;
    section headers own contiguous light ranges and power-weighted local aliases. Global light packing,
-   global alias construction, local aliases, and the ReGIR grid are prepared by one coalescing worker
+   global alias construction, local aliases, and the light grid are prepared by one coalescing worker
    and uploaded/published as one immutable generation. The previous complete generation remains active
-   until its replacement is GPU-complete—normal light edits no longer clear ReGIR or alternate through
+   until its replacement is GPU-complete—normal light edits no longer clear the light grid or alternate through
    a global-only fallback. A retained generation carries its own rebase origin; light centers and its
-   ReGIR grid origin are translated by `hierarchyRebase-currentRebase` while a rebased replacement is
+   light grid origin are translated by `hierarchyRebase-currentRebase` while a rebased replacement is
    pending. This first generation deliberately retains compact shared `Light[]` storage;
    replacing those ranges with independently updateable section pages is the next hierarchy step and
    does not require another shader sampling-contract change.
@@ -188,7 +188,7 @@ sufficient. Recoverable from git history (`d1b22e3` "temporal reuse" on this bra
    mean is visibly wrong; an at-shade fetch of live albedo × emission mask tracks the animation.
 3. **Spatial reuse** — no longer planned; spatial reservoir merging has the same
    fights-DLSS-RR issue that got temporal reuse removed (see S2). Revisit only if single-frame RIS
-   over a wider/cascaded ReGIR grid turns out insufficient.
+   over a wider/cascaded light grid turns out insufficient.
 
 ## Known deferred issues (unchanged from the old branch)
 - **Redstone-torch self-occlusion**: the emitter's own solid two-layer mesh shadows its lights

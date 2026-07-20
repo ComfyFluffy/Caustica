@@ -570,8 +570,8 @@ public final class CausticaConfig {
                     intAtLeast("caustica.rt.risCandidates", "lights.ris-candidates", 8, 0);
             public static final BooleanSetting POWER_SAMPLING =
                     bool("caustica.rt.lightPowerSampling", "lights.power-sampling", true);
-            public static final BooleanSetting REGIR_ENABLED =
-                    bool("caustica.rt.regir", "lights.regir.enabled", true);
+            public static final BooleanSetting LIGHT_GRID_ENABLED =
+                    bool("caustica.rt.lightGrid", "lights.light-grid.enabled", true);
             public static final FloatSetting MIN_FILL_RATIO =
                     finiteFloat("caustica.rt.lightMinFillRatio", "lights.min-fill-ratio", 0.25f);
             public static final IntSetting HIERARCHY_BUDGET_MIB =

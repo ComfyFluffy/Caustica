@@ -44,7 +44,7 @@ final class RtLightHierarchy {
         float[] packedLights = new float[Math.multiplyExact(totalLights, GPU_FLOATS_PER_LIGHT)];
         int[] lightSectionCoords = new int[Math.multiplyExact(totalLights, 3)];
         double[] powers = new double[totalLights];
-        ArrayList<RtReGIR.SectionLights> regirSections = new ArrayList<>(orderedSections.size());
+        ArrayList<RtLightGrid.SectionLights> gridSections = new ArrayList<>(orderedSections.size());
 
         int lightIndex = 0;
         double globalPower = 0.0;
@@ -100,7 +100,7 @@ final class RtLightHierarchy {
             sectionFirstLights[section.sectionSlot] = first;
             sectionLightCounts[section.sectionSlot] = count;
             if (sectionPower > 0.0) {
-                regirSections.add(new RtReGIR.SectionLights(first, count,
+                gridSections.add(new RtLightGrid.SectionLights(first, count,
                         section.sectionX, section.sectionY, section.sectionZ, sectionPower));
             }
         }
@@ -121,8 +121,8 @@ final class RtLightHierarchy {
                     first, localScratch, cancelled);
         }
 
-        RtReGIR.Data grid = totalLights > 0
-                ? RtReGIR.build(regirSections, rebaseX, rebaseY, rebaseZ, cancelled) : null;
+        RtLightGrid.Data grid = totalLights > 0
+                ? RtLightGrid.build(gridSections, rebaseX, rebaseY, rebaseZ, cancelled) : null;
         if (grid != null && (grid.dimX() > MAX_PACKED_GRID_DIM || grid.dimY() > MAX_PACKED_GRID_DIM
                 || grid.dimZ() > MAX_PACKED_GRID_DIM)) {
             grid = null;
@@ -138,7 +138,7 @@ final class RtLightHierarchy {
                 int z = lightSectionCoords[source + 2] - gridSectionZ;
                 if ((x | y | z) < 0 || x >= MAX_PACKED_GRID_DIM || y >= MAX_PACKED_GRID_DIM
                         || z >= MAX_PACKED_GRID_DIM) {
-                    throw new IllegalStateException("Light section is outside packed ReGIR grid");
+                    throw new IllegalStateException("Light section is outside packed light grid");
                 }
                 int destination = i * GPU_FLOATS_PER_LIGHT + 11;
                 int flags = Float.floatToRawIntBits(packedLights[destination]) & NORMAL_FLIP_BIT;
@@ -305,7 +305,7 @@ final class RtLightHierarchy {
 
     record Data(float[] packedLights, AliasData globalAliases,
                 int[] sectionFirstLights, int[] sectionLightCounts,
-                AliasData localAliases, RtReGIR.Data grid, int lightCount,
+                AliasData localAliases, RtLightGrid.Data grid, int lightCount,
                 float invGlobalPowerSum,
                 int rebaseX, int rebaseY, int rebaseZ) {
         long lightBytes() {

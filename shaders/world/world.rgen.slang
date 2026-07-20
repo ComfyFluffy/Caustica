@@ -465,20 +465,20 @@ void selectGlobalLight(inout uint proposalSeed, out uint lightIndex) {
     }
 }
 
-bool findReGIRCell(float3 p, out ReGIRCell cell, out int3 cellCoord) {
+bool findLightGridCell(float3 p, out LightGridCell cell, out int3 cellCoord) {
     cell.spanOffset = 0u;
     cell.spanCount = 0u;
     cell.invWeightSum = 0.0;
     cellCoord = int3(0, 0, 0);
-    if (worldPush.regirCellAddr == 0 || worldPush.regirSpanAddr == 0) return false;
-    int3 coord = int3(floor((p - worldPush.regirOrigin.xyz) / worldPush.regirOrigin.w));
+    if (worldPush.lightGridCellAddr == 0 || worldPush.lightGridSpanAddr == 0) return false;
+    int3 coord = int3(floor((p - worldPush.lightGridOrigin.xyz) / worldPush.lightGridOrigin.w));
     if (coord.x < 0 || coord.y < 0 || coord.z < 0
-            || coord.x >= worldPush.regirGrid.x
-            || coord.y >= worldPush.regirGrid.y
-            || coord.z >= worldPush.regirGrid.z) return false;
-    uint linear = (uint(coord.z) * uint(worldPush.regirGrid.y) + uint(coord.y))
-            * uint(worldPush.regirGrid.x) + uint(coord.x);
-    cell = ConstPtr<ReGIRCell>(worldPush.regirCellAddr)[linear];
+            || coord.x >= worldPush.lightGridDims.x
+            || coord.y >= worldPush.lightGridDims.y
+            || coord.z >= worldPush.lightGridDims.z) return false;
+    uint linear = (uint(coord.z) * uint(worldPush.lightGridDims.y) + uint(coord.y))
+            * uint(worldPush.lightGridDims.x) + uint(coord.x);
+    cell = ConstPtr<LightGridCell>(worldPush.lightGridCellAddr)[linear];
     cellCoord = coord;
     return cell.spanCount > 0u;
 }
@@ -522,7 +522,7 @@ float3 lightGeometricNormal(Light light) {
     return (asuint(light.halfVSection.w) & 0x40000000u) != 0u ? -normal : normal;
 }
 
-float proposalPdf(Light light, float3 le, ReGIRCell cell, int3 cellCoord,
+float proposalPdf(Light light, float3 le, LightGridCell cell, int3 cellCoord,
                   float localProbability) {
     float power = max(0.0, light.posArea.w * luminance(le));
     float globalPdf = worldPush.lightAliasAddr != 0
@@ -538,12 +538,12 @@ float proposalPdf(Light light, float3 le, ReGIRCell cell, int3 cellCoord,
     return localProbability * localPdf + (1.0 - localProbability) * globalPdf;
 }
 
-void selectReGIRSpanLight(ReGIRCell cell, inout uint proposalSeed,
-                          out uint lightIndex) {
-    ConstPtr<ReGIRSpan> spans = ConstPtr<ReGIRSpan>(worldPush.regirSpanAddr);
+void selectLightGridSpanLight(LightGridCell cell, inout uint proposalSeed,
+                              out uint lightIndex) {
+    ConstPtr<LightGridSpan> spans = ConstPtr<LightGridSpan>(worldPush.lightGridSpanAddr);
     float aliasSample = rndf(proposalSeed) * float(cell.spanCount);
     uint column = min(uint(aliasSample), cell.spanCount - 1u);
-    ReGIRSpan span = spans[cell.spanOffset + column];
+    LightGridSpan span = spans[cell.spanOffset + column];
     bool self = aliasSample - float(column) < span.accept;
     uint firstLight = self ? span.firstLight : span.aliasFirstLight;
     uint lightCount = self ? (span.packedLightCounts & 0xffffu)
@@ -556,10 +556,10 @@ void selectReGIRSpanLight(ReGIRCell cell, inout uint proposalSeed,
 // the neighborhood is represented without a fixed cap; qGlobal gives distant lights full support.
 // Alias spans make weighted local selection O(1). The mixture PDF is reconstructed after the single
 // Light48 load: section power cancels with the section-local light PDF.
-void selectReGIRLight(ReGIRCell cell, bool useLocal, inout uint proposalSeed,
-                      out uint lightIndex) {
+void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposalSeed,
+                          out uint lightIndex) {
     if (useLocal) {
-        selectReGIRSpanLight(cell, proposalSeed, lightIndex);
+        selectLightGridSpanLight(cell, proposalSeed, lightIndex);
     } else {
         selectGlobalLight(proposalSeed, lightIndex);
     }
@@ -570,22 +570,22 @@ void selectReGIRLight(ReGIRCell cell, bool useLocal, inout uint proposalSeed,
 Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough, bool pbr,
                      inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
-    ReGIRCell regirCell;
-    int3 regirCellCoord;
-    float3 regirLookup = p;
-    if (worldPush.regirCellAddr != 0) {
+    LightGridCell gridCell;
+    int3 gridCellCoord;
+    float3 gridLookup = p;
+    if (worldPush.lightGridCellAddr != 0) {
         // Stochastically blend across hard section boundaries. Every cell proposal retains full global
         // support, so conditioning on this independently jittered lookup remains unbiased.
-        regirLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
-                * worldPush.regirOrigin.w;
+        gridLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
+                * worldPush.lightGridOrigin.w;
     }
-    bool hasRegirCell = findReGIRCell(regirLookup, regirCell, regirCellCoord);
+    bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
     uint candidateCount = worldPush.risCandidates;
     // Deterministically stratify the proposal mixture. At the default M=8 this schedules exactly six
     // local and two global candidates, with every lane taking the same branch for a given candidate.
     // Counts that are not divisible by four use the nearest practical split with at least one global
     // candidate; M=1 is global-only so the estimator retains full support.
-    uint globalCandidateCount = hasRegirCell
+    uint globalCandidateCount = hasGridCell
             ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
     uint localCandidateCount = candidateCount - globalCandidateCount;
     float localProbability = float(localCandidateCount) / float(candidateCount);
@@ -594,8 +594,8 @@ Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, fl
         uint li;
         uint globalsBefore = (c * globalCandidateCount) / candidateCount;
         uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
-        bool useLocal = hasRegirCell && globalsAfter == globalsBefore;
-        selectReGIRLight(regirCell, useLocal, proposalSeed, li);
+        bool useLocal = hasGridCell && globalsAfter == globalsBefore;
+        selectLightGridLight(gridCell, useLocal, proposalSeed, li);
         Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
@@ -610,7 +610,7 @@ Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, fl
         if (phat <= 0.0) {
             continue;
         }
-        float sourcePdf = proposalPdf(lg, le, regirCell, regirCellCoord, localProbability);
+        float sourcePdf = proposalPdf(lg, le, gridCell, gridCellCoord, localProbability);
         float w = phat / max(sourcePdf, 1.0e-20);
         r.wSum += w;
         if (rndf(seed) * r.wSum < w) { // weighted reservoir update

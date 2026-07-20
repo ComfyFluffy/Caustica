@@ -40,13 +40,13 @@ final class RtLightHierarchyTest {
     }
 
     @Test
-    void regirAliasSpansEmbedSortedFlatLightRanges() {
+    void lightGridAliasSpansEmbedSortedFlatLightRanges() {
         RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
                 new RtLightHierarchy.SectionInput(9, 0, 0, 0, light(1f, 1f)),
                 new RtLightHierarchy.SectionInput(3, 1, 0, 0, light(1f, 1f))
         ), 0, 0, 0);
 
-        RtReGIR.Data grid = data.grid();
+        RtLightGrid.Data grid = data.grid();
         int cellX = -grid.originX() / 16;
         int cellY = -grid.originY() / 16;
         int cellZ = -grid.originZ() / 16;
@@ -132,7 +132,7 @@ final class RtLightHierarchyTest {
         return probability;
     }
 
-    private static double spanAliasProbability(RtReGIR.Data data, int first, int count,
+    private static double spanAliasProbability(RtLightGrid.Data data, int first, int count,
                                                int targetFirstLight) {
         double probability = 0.0;
         for (int column = 0; column < count; column++) {
