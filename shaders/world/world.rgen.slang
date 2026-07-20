@@ -387,6 +387,9 @@ float3 sampleGGXVNDF(float3 n, float3 ve, float rough, inout uint s) {
 // uniformly over the rectangle has pdf 1/area, so `area` rides the contribution like any area light.
 // Single-frame RIS only (no temporal reservoir reuse): DLSS-RR's own history already denoises this well
 // enough that a persistent per-pixel reservoir wasn't worth the added complexity and VRAM.
+// One resample serves three mutually exclusive receiver terms (see evalSampleContrib): front BRDF,
+// two-sided particle billboards, and LabPBR SSS backscatter from lights BEHIND the surface — all share
+// the reservoir and its single shadow ray, whose origin follows the survivor's side of the surface.
 
 // A reservoir in registers. pos/lnrm/le/area describe the chosen emitter sample; W is its unbiased
 // contribution weight, M the effective sample count. wSum/phat are streaming scratch (not persisted).
@@ -414,42 +417,54 @@ Reservoir resEmpty() {
     return r;
 }
 
-// Unshadowed contribution f*Le*G*area of a fixed light sample point at surface (p,n,v); out p-hat = its
-// luminance (the resampling target). Same BRDF split the sun NEE uses.
-float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 p, float3 n, float3 v,
-                         float3 diffAlb, float3 F0, float rough, bool pbr, bool twoSided, out float phat) {
+// Unshadowed contribution of a fixed light sample point at surface (hitPos,n,v); out p-hat = its
+// luminance (the resampling target). Evaluated from the UNBIASED hitPos — SURF_BIAS is applied only to
+// the shadow-ray origin in shadeReservoir, on whichever side the survivor sample lands. Three receiver
+// modes share one target function because they are mutually exclusive per candidate:
+//   - front hemisphere (ndl>0): the same Lambert(+GGX) BRDF split the sun NEE uses;
+//   - twoSided (particles): billboards have no back face, ndl=abs(ndl) folds both sides into the front;
+//   - back hemisphere with sss>0 (LabPBR leaves/grass): HG transmission phase — cosT = dot(wi,rd) peaks
+//     when the ray points from the light through the slab toward the camera (same as the sun SSS term).
+float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 hitPos, float3 n,
+                         float3 v, float3 rd, float3 diffAlb, float3 F0, float rough, bool pbr,
+                         bool twoSided, float sss, out float phat) {
     phat = 0.0;
-    float3 toL = sp - p;
+    float3 toL = sp - hitPos;
     float dist2 = dot(toL, toL);
     if (dist2 < 1.0e-6) {
         return float3(0.0, 0.0, 0.0);
     }
     float dist = sqrt(dist2);
     float3 wi = toL / dist;
-    float ndl = dot(n, wi);
-    if (twoSided) {
-        // Billboards have no back face: light striking either side illuminates the same texel.
-        ndl = abs(ndl);
-    } else if (ndl <= 0.0) {
-        return float3(0.0, 0.0, 0.0); // light below the surface horizon
-    }
     float cosL = max(0.0, dot(lnrm, -wi));
     if (cosL <= 0.0) {
         return float3(0.0, 0.0, 0.0); // receiver behind the emitter face
     }
-    float G = ndl * cosL / dist2; // area-light geometry term (x area)
-    float3 brdf = diffAlb * INV_PI;
-    if (pbr) {
-        float3 h = normalize(wi + v);
-        float ndh = max(0.0, dot(n, h));
-        float ndv = max(1.0e-4, dot(n, v));
-        float vdh = max(0.0, dot(v, h));
-        float D = ggxD(ndh, rough);
-        float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
-        float3 Fs = fresnelSchlick(vdh, F0);
-        brdf += (D * Gs) * Fs / (4.0 * ndv * ndl);
+    float ndl = dot(n, wi);
+    if (twoSided) {
+        ndl = abs(ndl);
     }
-    float3 contrib = brdf * le * (G * area);
+    float3 contrib = float3(0.0, 0.0, 0.0);
+    if (ndl > 0.0) {
+        float G = ndl * cosL / dist2; // area-light geometry term (x area)
+        float3 brdf = diffAlb * INV_PI;
+        if (pbr) {
+            float3 h = normalize(wi + v);
+            float ndh = max(0.0, dot(n, h));
+            float ndv = max(1.0e-4, dot(n, v));
+            float vdh = max(0.0, dot(v, h));
+            float D = ggxD(ndh, rough);
+            float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
+            float3 Fs = fresnelSchlick(vdh, F0);
+            brdf += (D * Gs) * Fs / (4.0 * ndv * ndl);
+        }
+        contrib = brdf * le * (G * area);
+    } else if (sss > 0.0) {
+        float backNdl = -ndl;
+        float G = backNdl * cosL / dist2;
+        float cosT = dot(wi, rd);
+        contrib = diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * le * (G * area);
+    }
     phat = luminance(contrib);
     return contrib;
 }
@@ -569,12 +584,13 @@ void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposal
 
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
 // sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
-Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough, bool pbr,
-                     inout uint seed, inout uint proposalSeed, bool twoSided) {
+Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
+                     float rough, bool pbr, bool twoSided, float sss,
+                     inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
     LightGridCell gridCell;
     int3 gridCellCoord;
-    float3 gridLookup = p;
+    float3 gridLookup = hitPos;
     if (worldPush.lightGridCellAddr != 0) {
         // Stochastically blend across hard section boundaries. Every cell proposal retains full global
         // support, so conditioning on this independently jittered lookup remains unbiased.
@@ -607,8 +623,8 @@ Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, fl
         float3 le = lightRadiance(lg);
         float3 lightNormal = lightGeometricNormal(lg);
         float phat;
-        evalSampleContrib(sp, lightNormal, le, lg.posArea.w, p, n, v,
-                diffAlb, F0, rough, pbr, twoSided, phat);
+        evalSampleContrib(sp, lightNormal, le, lg.posArea.w, hitPos, n, v, rd,
+                diffAlb, F0, rough, pbr, twoSided, sss, phat);
         if (phat <= 0.0) {
             continue;
         }
@@ -627,23 +643,32 @@ Reservoir risInitial(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, fl
     return r;
 }
 
-// Shade a finalized reservoir: recompute the survivor's contribution at (p,n,v), cast ONE shadow ray,
-// and return throughput-free radiance contrib*vis*W.
-float3 shadeReservoir(Reservoir s, float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough,
-                      bool pbr, out float3 vis, bool twoSided) {
+// Shade a finalized reservoir: recompute the survivor's contribution at (hitPos,n,v), cast ONE shadow
+// ray, and return throughput-free radiance contrib*vis*W. The one ray serves whichever term fired for
+// the survivor (front BRDF, twoSided billboard, or SSS backscatter) — the origin is biased toward the
+// sample's side of the surface.
+float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
+                      float3 F0, float rough, bool pbr, bool twoSided, float sss, out float3 vis) {
     vis = float3(0.0, 0.0, 0.0);
     if (s.W <= 0.0 || s.phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
     float phat;
-    float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, p, n, v, diffAlb, F0, rough, pbr, twoSided, phat);
+    float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, hitPos, n, v, rd,
+            diffAlb, F0, rough, pbr, twoSided, sss, phat);
     if (phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
-    float3 toL = s.pos - p;
+    // Pick the shadow-ray origin on the sample's side of the surface FIRST, then measure the ray from
+    // that origin — measuring dist from hitPos while tracing from the biased origin shifts the ray tip
+    // up to SURF_BIAS*ndl toward the emitter plane, beating the 0.001*dist stop-short margin for lights
+    // closer than ~SURF_BIAS/0.001 blocks -> shadow ray hits the emitter's own face -> per-texel black.
+    float side = dot(n, s.pos - hitPos) >= 0.0 ? 1.0 : -1.0;
+    float3 origin = hitPos + side * n * SURF_BIAS;
+    float3 toL = s.pos - origin;
     float dist = length(toL);
     // Stop just short of the sample point so the ray doesn't self-occlude on the emitter's own face.
-    vis = visibility(p, toL / dist, dist * 0.999);
+    vis = visibility(origin, toL / dist, dist * 0.999);
     return contrib * vis * s.W;
 }
 
@@ -953,14 +978,15 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
             }
 
             // RIS direct lighting from block emitters (lava, glowstone, torches, ...) — same reservoir
-            // sampler as terrain/entities above, but two-sided: a billboard has no back face, so light
+            // sampler as terrain/entities, but two-sided: a billboard has no back face, so light
             // striking either side of the quad should still land (matches the sun/moon NEE above).
             if (risOn) {
                 float3 v = -rd;
-                float3 p = hitPos + n * SURF_BIAS;
-                Reservoir r = risInitial(p, n, v, albedo, float3(0.0, 0.0, 0.0), 1.0, false, seed, proposalSeed, true);
+                Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0, false,
+                        true, 0.0, seed, proposalSeed);
                 float3 risVis;
-                L += throughput * shadeReservoir(r, p, n, v, albedo, float3(0.0, 0.0, 0.0), 1.0, false, risVis, true);
+                L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
+                        false, true, 0.0, risVis);
             }
 
             if (bounce >= maxBounces) {
@@ -1112,10 +1138,17 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         }
 
         // RIS direct lighting from block emitters (single-frame only, no temporal reservoir reuse).
+        // Front lobe + SSS backlighting are resampled together and share ONE shadow ray — a light can
+        // only be in front of n or behind it, never both, so combining them into one target function is
+        // exact, not an approximation. The SSS term is gated off past MAX_SSS_BOUNCE by passing sss=0
+        // there (falls back to plain front-only RIS).
         if (risOn) {
-            Reservoir r = risInitial(p, n, v, diffAlb, F0, rough, pbr, seed, proposalSeed, false);
+            float activeSss = bounce <= MAX_SSS_BOUNCE ? sss : 0.0;
+            Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, pbr, false, activeSss,
+                    seed, proposalSeed);
             float3 risVis;
-            L += throughput * shadeReservoir(r, p, n, v, diffAlb, F0, rough, pbr, risVis, false);
+            L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, pbr, false,
+                    activeSss, risVis);
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the
