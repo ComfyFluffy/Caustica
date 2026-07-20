@@ -1,0 +1,9 @@
+{
+  "format": 1,
+  "match": {
+    "sprite": "minecraft:block/soul_torch"
+  },
+  "emission": {
+    "strength": 3.0
+  }
+}
