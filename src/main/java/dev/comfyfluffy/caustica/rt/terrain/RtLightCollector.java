@@ -19,9 +19,11 @@ import net.minecraft.client.renderer.texture.TextureAtlasSprite;
  * record): it doesn't overshoot the emitter shape, and its (s,t) parameterization <i>is</i> the affine
  * sprite-local UV map that the S3 exact-Le fetch needs.
  *
- * <p><b>Radiance matches the closest-hit.</b> Per-texel shaded emission is {@code albedo * mask}, where
- * the mask source (LabPBR {@code _s} blue channel / heuristic x block light / override x quantized
- * strength / uniform block light) is exactly what {@code world.rchit.evaluateMaterial} resolves; the
+ * <p><b>Radiance matches the closest-hit.</b> Per-texel shaded emission is {@code albedo * mask *
+ * emissionStrength}, where the mask source (LabPBR {@code _s} blue channel / heuristic mask x block
+ * light / uniform block light) is exactly what {@code world.rchit.evaluateMaterial} resolves, and
+ * {@code emissionStrength} is {@link RtMaterialDesc#emissionStrength()} — the material-compile-time
+ * baseline times any resource-pack multiplier, the single strength knob shared with the shader. The
  * per-material {@link RtEmissionGrid} was premultiplied from the same canonical decode. The light's
  * radiance is the mean over its bounding rectangle (dark texels included — a uniform-rectangle
  * approximation), so total power equals the quad's true emissive integral: the rectangle contains every
@@ -34,12 +36,6 @@ import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 final class RtLightCollector {
     private RtLightCollector() {
     }
-
-    /**
-     * HDR radiance scale of a full (emission=1) emitter. MUST equal {@code world.rgen.slang}'s
-     * {@code EMISSIVE_STRENGTH} so the NEE estimate and the direct-hit emission agree (no seam).
-     */
-    static final float EMISSIVE_STRENGTH = 5.0f;
 
     /** Floats per packed light record — see {@link #append} for the 5-vec4 layout. */
     static final int FLOATS_PER_LIGHT = 20;
@@ -64,11 +60,6 @@ final class RtLightCollector {
 
     /** Samples per axis over the quad's (a,b) parameter square; matches the emission grid resolution. */
     private static final int SCAN = RtEmissionGrid.SIZE;
-
-    // Header emission-strength quantization, mirrored from RtMaterialRegistry.header() so the collected
-    // Le and the shaded override emission agree bit-for-bit in intent (8-bit strength, 4.0 max).
-    private static final float MAX_OVERRIDE_EMISSION_STRENGTH = 4.0f;
-    private static final int EMISSION_STRENGTH_MASK = 255;
 
     private static final int PRIM_FLOATS = 12; // TerrainPrim lanes per triangle
     private static final int PRIM_FLAGS_LANE = 9;
@@ -101,9 +92,6 @@ final class RtLightCollector {
             float factor = switch (source) {
                 case LAB_PBR -> 1.0f; // authored _s emission REPLACES block light
                 case HEURISTIC_MASK, STATE_UNIFORM -> stateEmission;
-                case OVERRIDE -> Math.round(Math.min(MAX_OVERRIDE_EMISSION_STRENGTH, desc.emissionStrength())
-                        * (EMISSION_STRENGTH_MASK / MAX_OVERRIDE_EMISSION_STRENGTH))
-                        * (MAX_OVERRIDE_EMISSION_STRENGTH / EMISSION_STRENGTH_MASK);
                 case NONE -> 0.0f;
             };
             if (factor <= EMISSION_EPS) {
@@ -212,9 +200,11 @@ final class RtLightCollector {
             }
 
             // Rectangle-mean radiance: every emissive sample lies inside the rectangle, so
-            // sum/rectSamples preserves the quad's total emissive power at rectArea.
+            // sum/rectSamples preserves the quad's total emissive power at rectArea. emissionStrength()
+            // is the material's final HDR strength (EMISSIVE_STRENGTH baseline * any JSON multiplier,
+            // baked in RtMaterialRegistry) — the single knob shared with world.rchit's direct-hit shading.
             float tintR = p[pb + 4], tintG = p[pb + 5], tintB = p[pb + 6];
-            float scale = factor * EMISSIVE_STRENGTH / rectSamples;
+            float scale = factor * desc.emissionStrength() / rectSamples;
             float leR = sumR * scale * tintR;
             float leG = sumG * scale * tintG;
             float leB = sumB * scale * tintB;

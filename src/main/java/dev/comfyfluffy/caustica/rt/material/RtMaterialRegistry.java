@@ -36,19 +36,23 @@ public final class RtMaterialRegistry {
     public static final RtMaterialRegistry INSTANCE = new RtMaterialRegistry();
 
     // Canonical MaterialHeader model/feature bits, mirrored by world_common.slang's MATERIAL_* constants.
-    // RtBlockMaterials.Entry.features uses the same bit values (FEATURE_OVERRIDE_EMISSION there means the
-    // override mask was baked into surface1.a), so entry features flow into headers with a plain mask.
+    // RtBlockMaterials.Entry.features uses the same bit values, so entry features flow into headers
+    // with a plain mask.
     public static final int MODEL_OPAQUE = 0;
     public static final int MODEL_WATER = 1;
     public static final int MODEL_GLASS = 3;
     public static final int FEATURE_SPEC = 1;
     public static final int FEATURE_NORMAL = 2;
     public static final int FEATURE_HEURISTIC_EMISSION = 4;
-    public static final int FEATURE_OVERRIDE_EMISSION = 8;
     public static final int FEATURE_STOCHASTIC_ALPHA = 16;
+    // HDR radiance of a full (level-15-equivalent) emitter, modulated by albedo — the single knob
+    // (formerly duplicated as a literal in world.rgen.slang and RtLightCollector). Baked into every
+    // emissive RtMaterialDesc.emissionStrength at compile time (compileDesc/compileEntityDesc), times
+    // any resource-pack emission.strength multiplier; see header()'s packing and RtMaterialOverrides.
+    private static final float EMISSIVE_STRENGTH = 5.0f;
     private static final int EMISSION_STRENGTH_SHIFT = 8;
-    private static final int EMISSION_STRENGTH_MASK = 255;
-    private static final float MAX_OVERRIDE_EMISSION_STRENGTH = 4.0f;
+    private static final int EMISSION_STRENGTH_MASK = 65535;
+    private static final float MAX_EMISSION_STRENGTH = 32.0f;
     private static final int MAX_LOD_SHIFT = 24;
 
     private static final int MODEL_VARIANTS = 2; // ordinary opaque/cutout and thin glass
@@ -176,7 +180,7 @@ public final class RtMaterialRegistry {
                                 profile, emitting, false,
                                 variantSummary(features, emitting, entry, stats.uniformSummary()));
                         if (spriteWide != null) {
-                            desc = spriteWide.rule.apply(desc, entry.overrideEmissionSummary());
+                            desc = spriteWide.rule.apply(desc);
                         }
                         variants[index(profile, glass, emitting)] = headers.size();
                         add(headers, descriptions, grids, desc, stats.average(), entry, stats.albedoGrid());
@@ -195,7 +199,7 @@ public final class RtMaterialRegistry {
                             RtMaterialDesc base = compileDesc(glass ? MODEL_GLASS : MODEL_OPAQUE,
                                     features, profile, emitting, false,
                                     variantSummary(features, emitting, entry, stats.uniformSummary()));
-                            RtMaterialDesc desc = compiled.rule.apply(base, entry.overrideEmissionSummary());
+                            RtMaterialDesc desc = compiled.rule.apply(base);
                             overrideVariants[index(profile, glass, emitting)] = headers.size();
                             add(headers, descriptions, grids, desc, stats.average(), entry, stats.albedoGrid());
                         }
@@ -214,7 +218,7 @@ public final class RtMaterialRegistry {
             RtMaterialDesc desc = compileEntityDesc(features, false, entry.emissionSummary());
             for (RtMaterialOverrides.Rule rule : overrides.rules()) {
                 if (!rule.matchesEntity(name)) continue;
-                desc = rule.apply(desc, entry.overrideEmissionSummary());
+                desc = rule.apply(desc);
                 entityMatchedOverrides.add(rule);
                 break;
             }
@@ -285,14 +289,12 @@ public final class RtMaterialRegistry {
                 == RtMaterialDesc.EmissionSource.LAB_PBR).count();
         long uniformEmission = descriptions.stream().filter(desc -> desc.emissionSource()
                 == RtMaterialDesc.EmissionSource.STATE_UNIFORM).count();
-        long overrideEmission = descriptions.stream().filter(desc -> desc.emissionSource()
-                == RtMaterialDesc.EmissionSource.OVERRIDE).count();
         double averageCoverage = descriptions.stream().filter(desc -> desc.emissionSummary().emissive())
                 .mapToDouble(desc -> desc.emissionSummary().coverage()).average().orElse(0.0);
-        CausticaMod.LOGGER.info("RT materials: epoch={}, records={}, capacity={}, blockSprites={}, entityResources={}, overrideRules={}, matchedOverrides={}, emissive={}, labPbrEmission={}, heuristicMasks={}, uniformEmission={}, overrideEmission={}, avgEmissionCoverage={}, tableKiB={}",
+        CausticaMod.LOGGER.info("RT materials: epoch={}, records={}, capacity={}, blockSprites={}, entityResources={}, overrideRules={}, matchedOverrides={}, emissive={}, labPbrEmission={}, heuristicMasks={}, uniformEmission={}, avgEmissionCoverage={}, tableKiB={}",
                 epoch, headers.size(), recordCapacity, sprites.size(), entityResources.size(), overrides.rules().size(),
                 matchedOverrideRules, emissive,
-                authoredEmission, inferred, uniformEmission, overrideEmission,
+                authoredEmission, inferred, uniformEmission,
                 String.format(java.util.Locale.ROOT, "%.3f", averageCoverage), byteSize / 1024);
     }
 
@@ -439,7 +441,7 @@ public final class RtMaterialRegistry {
         } else {
             emissionSource = RtMaterialDesc.EmissionSource.NONE;
         }
-        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : 1.0f;
+        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : EMISSIVE_STRENGTH;
         return new RtMaterialDesc(model, source, features, roughness, metalness, ior, transmission,
                 emissionSource, emissionStrength, emissionSummary);
     }
@@ -451,9 +453,9 @@ public final class RtMaterialRegistry {
                 : (authored ? RtMaterialDesc.Source.LAB_PBR : RtMaterialDesc.Source.HEURISTIC);
         RtMaterialDesc.EmissionSource emissionSource = (features & FEATURE_SPEC) != 0
                 ? RtMaterialDesc.EmissionSource.LAB_PBR : RtMaterialDesc.EmissionSource.NONE;
+        float emissionStrength = emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : EMISSIVE_STRENGTH;
         return new RtMaterialDesc(MODEL_OPAQUE, source, features, RtMaterials.ENTITY_ROUGH, 0.0f,
-                1.0f, 0.0f, emissionSource, emissionSource == RtMaterialDesc.EmissionSource.NONE ? 0.0f : 1.0f,
-                emissionSummary);
+                1.0f, 0.0f, emissionSource, emissionStrength, emissionSummary);
     }
 
     private static void add(List<MaterialHeaderData> headers, List<RtMaterialDesc> descriptions,
@@ -473,7 +475,6 @@ public final class RtMaterialRegistry {
                                           RtEmissionGrid uniformGrid) {
         return switch (desc.emissionSource()) {
             case LAB_PBR, HEURISTIC_MASK -> entry.emissionGrid();
-            case OVERRIDE -> entry.overrideEmissionGrid();
             case STATE_UNIFORM -> uniformGrid;
             case NONE -> null;
         };
@@ -497,11 +498,11 @@ public final class RtMaterialRegistry {
                                              RtBlockMaterials.Entry entry, float albedoU, float albedoV,
                                              float albedoInvDu, float albedoInvDv) {
         int packedFeatures = desc.features() | (entry.maxLod() << MAX_LOD_SHIFT);
-        if ((desc.features() & FEATURE_OVERRIDE_EMISSION) != 0) {
-            int strength = Math.round(Math.min(MAX_OVERRIDE_EMISSION_STRENGTH, desc.emissionStrength())
-                    * (EMISSION_STRENGTH_MASK / MAX_OVERRIDE_EMISSION_STRENGTH));
-            packedFeatures |= strength << EMISSION_STRENGTH_SHIFT;
-        }
+        // Packed unconditionally (0 for non-emissive materials): the shader multiplies surface.emission
+        // by this every time, regardless of source, so EMISSIVE_STRENGTH never needs its own copy there.
+        int strength = Math.round(Math.min(MAX_EMISSION_STRENGTH, desc.emissionStrength())
+                * (EMISSION_STRENGTH_MASK / MAX_EMISSION_STRENGTH));
+        packedFeatures |= strength << EMISSION_STRENGTH_SHIFT;
         return new MaterialHeaderData(desc.model(), packedFeatures, entry.pageIndex(), 0,
                 new Float4(entry.materialU(), entry.materialV(), entry.materialDu(), entry.materialDv()),
                 new Float4(albedoU, albedoV, albedoInvDu, albedoInvDv),

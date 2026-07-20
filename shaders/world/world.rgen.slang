@@ -85,7 +85,6 @@ static const float INV_PI = 0.31830988618;
 // The analytic sky (gradient + sun/moon discs + stars) is computed in world.rmiss. On a miss, raygen
 // reads payload.albedo and accumulates that sky radiance. The directional NEE light is pushed separately
 // as worldPush.lightDir / worldPush.lightRadiance / worldPush.sunDir.
-static const float EMISSIVE_STRENGTH = 5.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
 static const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 static const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
 
@@ -1055,10 +1054,12 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // specular/dielectric bounces (showCelestial true) still add it, since no emitter NEE happened
         // along those. Emitters NOT in the light buffer (sparse/sub-threshold footprints, entities) are
         // never NEE-sampled, so they always gather — bit-identical to the no-NEE path, no energy lost.
+        // Emission is already the full HDR strength (EMISSIVE_STRENGTH baseline * any override
+        // multiplier baked in Java at material-compile time — see MaterialHeader.features packing).
         float emission = payloadEmission();
         bool gateEmitter = risOn && payloadEmitterInList();
         if (emission > 0.0 && (!gateEmitter || showCelestial)) {
-            L += throughput * albedo * emission * EMISSIVE_STRENGTH;
+            L += throughput * albedo * emission;
         }
 
         // NEE: direct light from the dominant celestial body (sun by day, moon by night) — Lambert
@@ -1255,8 +1256,7 @@ void main() {
         } else if (pc.debugView == 8u) {
             dbg = float3(gv_emission, gv_emission, gv_emission); // resolved emission mask/strength
         } else if (pc.debugView == 9u) {
-            float3 sourceColor = gv_emissionSource == EMISSION_SOURCE_OVERRIDE ? float3(1.0, 0.2, 1.0)
-                    : gv_emissionSource == EMISSION_SOURCE_LAB_PBR ? float3(0.15, 0.8, 1.0)
+            float3 sourceColor = gv_emissionSource == EMISSION_SOURCE_LAB_PBR ? float3(0.15, 0.8, 1.0)
                     : gv_emissionSource == EMISSION_SOURCE_HEURISTIC ? float3(1.0, 0.45, 0.05)
                     : gv_emissionSource == EMISSION_SOURCE_UNIFORM ? float3(1.0, 1.0, 1.0)
                     : float3(0.0, 0.0, 0.0);

@@ -94,8 +94,8 @@ public final class RtMaterialOverrides {
             throw new IllegalArgumentException("transmission.ior must be positive");
         }
         if (emissionStrength != null && (!Float.isFinite(emissionStrength)
-                || emissionStrength < 0.0f || emissionStrength > 4.0f)) {
-            throw new IllegalArgumentException("emission.strength must be in [0,4]");
+                || emissionStrength < 0.0f || emissionStrength > 5.0f)) {
+            throw new IllegalArgumentException("emission.strength must be in [0,5]");
         }
         return new Rule(source, sprite, block, model, roughness, metalness, ior, transmission,
                 emissionStrength);
@@ -105,17 +105,14 @@ public final class RtMaterialOverrides {
         return rules;
     }
 
-    public boolean requestsEmissionMask(TextureAtlasSprite sprite) {
-        for (Rule rule : rules) {
-            if (rule.matchesSprite(sprite) && rule.emissionStrength != null && rule.emissionStrength > 0.0f) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     public record Rule(Identifier source, Identifier sprite, Identifier block, Integer model,
                        Float roughness, Float metalness, Float ior, Float transmission,
+                       /**
+                        * Multiplier on whatever emission the material naturally resolves to (LabPBR
+                        * {@code _s}, heuristic mask, or state-uniform block light) — NOT a replacement.
+                        * A material with no natural emission stays unlit no matter this value; this
+                        * cannot make a block glow that wasn't already emissive.
+                        */
                        Float emissionStrength) {
         boolean matchesSprite(TextureAtlasSprite value) {
             return value != null && sprite.equals(value.contents().name());
@@ -130,7 +127,7 @@ public final class RtMaterialOverrides {
             return block == null || state != null && block.equals(BuiltInRegistries.BLOCK.getKey(state.getBlock()));
         }
 
-        RtMaterialDesc apply(RtMaterialDesc base, RtMaterialDesc.EmissionSummary availableSummary) {
+        RtMaterialDesc apply(RtMaterialDesc base) {
             int nextModel = model != null ? model : base.model();
             float nextRoughness = roughness != null ? roughness : base.roughness();
             float nextMetalness = metalness != null ? metalness : base.metalness();
@@ -138,20 +135,13 @@ public final class RtMaterialOverrides {
                     : (model != null ? defaultIor(nextModel) : base.ior());
             float nextTransmission = transmission != null ? transmission
                     : (model != null ? defaultTransmission(nextModel) : base.transmission());
-            int features = base.features();
-            RtMaterialDesc.EmissionSource nextEmissionSource = base.emissionSource();
-            float nextEmissionStrength = base.emissionStrength();
-            RtMaterialDesc.EmissionSummary summary = base.emissionSummary();
-            if (emissionStrength != null) {
-                features |= RtMaterialRegistry.FEATURE_OVERRIDE_EMISSION;
-                nextEmissionStrength = emissionStrength;
-                nextEmissionSource = emissionStrength > 0.0f
-                        ? RtMaterialDesc.EmissionSource.OVERRIDE : RtMaterialDesc.EmissionSource.NONE;
-                summary = emissionStrength > 0.0f ? availableSummary : RtMaterialDesc.EmissionSummary.NONE;
-            }
-            return new RtMaterialDesc(nextModel, RtMaterialDesc.Source.OVERRIDE, features,
+            // A multiplier on the base's already-resolved strength (0 when emissionSource is NONE):
+            // this can brighten/dim an existing emitter but never light up a genuinely non-emissive one.
+            float nextEmissionStrength = emissionStrength != null
+                    ? base.emissionStrength() * emissionStrength : base.emissionStrength();
+            return new RtMaterialDesc(nextModel, RtMaterialDesc.Source.OVERRIDE, base.features(),
                     nextRoughness, nextMetalness, nextIor, nextTransmission,
-                    nextEmissionSource, nextEmissionStrength, summary);
+                    base.emissionSource(), nextEmissionStrength, base.emissionSummary());
         }
 
         private static float defaultIor(int model) {

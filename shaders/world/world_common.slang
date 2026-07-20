@@ -126,7 +126,6 @@ public static const uint EMISSION_SOURCE_NONE = 0u;
 public static const uint EMISSION_SOURCE_UNIFORM = 1u;
 public static const uint EMISSION_SOURCE_HEURISTIC = 2u;
 public static const uint EMISSION_SOURCE_LAB_PBR = 3u;
-public static const uint EMISSION_SOURCE_OVERRIDE = 4u;
 
 public static const uint PAYLOAD_MATERIAL_MASK = 3u;
 public static const uint MATERIAL_OPAQUE = 0u;
@@ -172,11 +171,14 @@ public struct MaterialHeader {
 public static const uint MATERIAL_FEATURE_SPEC = 1u;
 public static const uint MATERIAL_FEATURE_NORMAL = 2u;
 public static const uint MATERIAL_FEATURE_HEURISTIC_EMISSION = 4u;
-public static const uint MATERIAL_FEATURE_OVERRIDE_EMISSION = 8u;
 public static const uint MATERIAL_FEATURE_STOCHASTIC_ALPHA = 16u;
+// Final HDR emission strength (EMISSIVE_STRENGTH baseline * any JSON override multiplier), baked in Java
+// at material-compile time (RtMaterialRegistry) and packed here as a 16-bit fraction of the max — every
+// emissive material carries a value (0 for non-emissive), not just resource-pack-overridden ones, so the
+// full features word's spare 16 bits (8..23) go to it instead of the 8 bits the old override-only field used.
 public static const uint MATERIAL_EMISSION_STRENGTH_SHIFT = 8u;
-public static const uint MATERIAL_EMISSION_STRENGTH_MASK = 255u;
-public static const float MATERIAL_MAX_OVERRIDE_EMISSION_STRENGTH = 4.0;
+public static const uint MATERIAL_EMISSION_STRENGTH_MASK = 65535u;
+public static const float MATERIAL_MAX_EMISSION_STRENGTH = 32.0;
 public static const uint MATERIAL_MAX_LOD_SHIFT = 24u;
 public static const uint MATERIAL_MAX_LOD_MASK = 255u;
 
