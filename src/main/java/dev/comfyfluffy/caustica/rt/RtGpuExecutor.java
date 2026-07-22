@@ -130,6 +130,14 @@ public final class RtGpuExecutor {
         return queryTimeline(graphicsTimeline);
     }
 
+    /** Wait for a graphics-use reservation before reusing completion-owned frame resources. */
+    public void waitForGraphicsValue(long graphicsValue) {
+        checkExecutorFailure();
+        if (graphicsValue != 0L) {
+            waitTimeline(graphicsTimeline, graphicsValue);
+        }
+    }
+
     /** Latest recorded graphics submission that can reference the currently published terrain state. */
     public long latestGraphicsUseValue() {
         return latestGraphicsUseValue.get();

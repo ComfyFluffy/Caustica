@@ -761,6 +761,12 @@ public final class RtComposite {
     private void recordFrame(RtContext ctx, RtPipeline active, GpuTexture nativeColor) {
         long dstImage = vkImage(nativeColor);
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).caustica$getBackend();
+        RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
+        // Reserve this frame's graphics-use value up front: prepareTlas/entity resource reuse below need
+        // it to gate their ring slots on actual GPU completion instead of assuming frame age is enough.
+        long graphicsUse = gpuExecutor.beginGraphicsTerrainUse(encoder);
+        pendingTerrainGraphicsUse = graphicsUse;
+        RtEntities.FrameEntities frameEntities = null;
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
         int debugView = debugView();
@@ -829,6 +835,7 @@ public final class RtComposite {
             // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
             RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
                     terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
+            frameEntities = fe;
             // Block-breaking overlay: resolves each destroy-stage RenderType's texture into the
             // SAME bindless entity-texture array (destroy_stage_N.png is a standalone Sampler0 texture,
             // not a block-atlas sprite — see ModelBakery.BREAKING_LOCATIONS/DESTROY_TYPES), so any newly
@@ -878,8 +885,9 @@ public final class RtComposite {
             // Upload any entity textures registered this frame into the bindless set before the trace.
             RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
             // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
-            // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
-            // KEEP_FRAMES later (entity meshes/BLAS are retired by RtEntities on the same horizon).
+            // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS slot (and entity
+            // meshes/BLAS retired by RtEntities) is reused once this frame's graphics-use value has actually
+            // completed on the GPU, not merely after KEEP_FRAMES have elapsed on the CPU.
             if (!fe.blas().isEmpty()) {
                 try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blasRecord")) {
                     RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());
@@ -888,8 +896,10 @@ public final class RtComposite {
             }
             RtAccel.PreparedTlas frameTlas;
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
-                frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), fe.dynamicInstances(), tlasRing);
+                frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), fe.dynamicInstances(), tlasRing,
+                        graphicsUse);
             }
+            RtAccel.markTlasUsed(frameTlas, graphicsUse);
             active.setTlas(frameTlas.accel.handle);
             currentTlasHandle = frameTlas.accel.handle;
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
@@ -961,10 +971,10 @@ public final class RtComposite {
         if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
             throw new IllegalStateException("vkEndCommandBuffer(rt composite) failed");
         }
-        RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
-        long graphicsUse = gpuExecutor.beginGraphicsTerrainUse(encoder);
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
-        pendingTerrainGraphicsUse = graphicsUse;
+        // Do not attach a merely reserved token: failed recording may never signal it. Once execute succeeds,
+        // every owner in this frame's manifest is protected through the final overlay consumer.
+        RtEntities.INSTANCE.markGraphicsUse(frameEntities, graphicsUse);
     }
 
     /**

@@ -42,6 +42,7 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -137,8 +138,8 @@ public final class RtEntities {
 
     // EntityGeom: four addresses + rigid displacement + three geometry triangle bases + padding = 64 B.
     private static final int TABLE_ENTRY_BYTES = 64;
-    // Ring of fixed-size geometry tables: each frame fills the next slot so the GPU read of this frame's
-    // trace never races a later frame's host write. > frames-in-flight (mirrors RtPipeline RING).
+    // Ring of fixed-size geometry tables. Reuse is guarded by the graphics-use timeline; ring depth avoids
+    // routine waits but is not treated as proof of GPU completion.
     private static final int TABLE_RING = 6;
     // Frames a superseded cache or per-frame entity resource must outlive before it is freed.
     private static final int KEEP_FRAMES = 4;
@@ -155,8 +156,8 @@ public final class RtEntities {
     // Well below a texel (1/16 block) and DLSS-RR jitter; float pose math noise is ~1e-5.
     private static final float RIGID_FIT_EPS = 2.0e-3f;
 
-    // Per-entity ring depth: a slot is reused every REFIT_RING frames, so it must be off all queues by
-    // then. = KEEP_FRAMES (the established frames-in-flight-safe horizon). Each slot holds one persistent AS.
+    // Per-entity ring depth. Each slot holds one persistent AS; the graphics-use timeline, not frame age,
+    // gates mapped writes, refits, rebuilds, and destruction when the cursor wraps.
     private static final int REFIT_RING = KEEP_FRAMES;
     // Force a periodic full rebuild of a slot's AS to bound BVH-quality degradation from repeated refits
     // (an entity that deforms a lot would otherwise refit the same BVH topology forever). Per-slot count.
@@ -206,7 +207,7 @@ public final class RtEntities {
         }
     }
 
-    private RtBuffer[] tableRing;
+    private TableSlot[] tableRing;
     private int tableCapacity;
     private int tableSlot;
 
@@ -264,8 +265,6 @@ public final class RtEntities {
         float anchorX, anchorY, anchorZ;
     }
 
-    // Per-frame entity GPU resources awaiting a frames-in-flight-safe free.
-    private final List<Deferred> deferred = new ArrayList<>();
     private long retainedGeometryBytes;
 
     // Persistent per-entity acceleration structures, keyed by entity id, for refit.
@@ -302,6 +301,7 @@ public final class RtEntities {
         long meshHash;                           // hash of the captured mesh — rebuild only when it changes
         long lastSeen;                           // last frame this BE was in the scan window — for eviction
         float[] prevVerts;                       // block-local verts at this build, for the per-vertex MV diff
+        long lastGraphicsUse;
     }
 
     /** One persistent updatable AS in an entity's ring: its own backing buffer + the topology it
@@ -320,6 +320,7 @@ public final class RtEntities {
         int indexCount;
         long updateScratchSize;
         int updatesSinceBuild;
+        long lastGraphicsUse;
     }
 
     /** A per-entity ring of {@link EntitySlot}s, cycled one-per-frame so a refit never writes an AS still
@@ -335,6 +336,7 @@ public final class RtEntities {
         // reuses the AS via the TLAS instance transform instead of re-uploading + refitting. Reuse frames
         // only READ the AS, so referencing the last-written ring slot while it is in flight is safe.
         RtAccel refAccel;
+        EntitySlot refSlot;
         float[] refVerts;
         int refVertCount = -1;
         int refIdxCount = -1;
@@ -346,7 +348,19 @@ public final class RtEntities {
 
     /** This frame's terrain and dynamic instance segments, entity BLAS builds, and geometry-table address. */
     public record FrameEntities(List<RtAccel.Instance> baseInstances, List<RtAccel.Instance> dynamicInstances,
-                                List<RtAccel.PreparedBlas> blas, long geomTableAddr) {
+                                List<RtAccel.PreparedBlas> blas, long geomTableAddr, FrameUse use) {
+    }
+
+    private record FrameUse(FrameLists lists, TableSlot table) {
+    }
+
+    private static final class TableSlot {
+        final RtBuffer buffer;
+        long lastGraphicsUse;
+
+        TableSlot(RtBuffer buffer) {
+            this.buffer = buffer;
+        }
     }
 
     /** One glowing entity's body mesh (rebased-space positions, copied out of {@link #capture} before the
@@ -359,9 +373,6 @@ public final class RtEntities {
      *  convention as entity capture — see {@link RtEntities#glowCamOffsetX()} for the camera-relative
      *  offset needed to finish the transform to camera-relative space). */
     public record NameTagEntity(Component text, float x, float y, float z) {
-    }
-
-    private record Deferred(long freeFrame, Runnable free) {
     }
 
     private record Motion(long dispAddr, float rigidX, float rigidY, float rigidZ) {
@@ -382,16 +393,13 @@ public final class RtEntities {
             this.size = size;
             return this;
         }
-
-        void flush() {
-            buffer.flush(offset, size);
-        }
     }
 
-    /** Host-visible storage pages owned by one frames-in-flight slot and reused when that slot retires. */
+    /** Host-visible storage pages owned by one frame-list slot and reused after its graphics token completes. */
     private static final class MotionArena {
         private final ArrayList<RtBuffer> pages = new ArrayList<>();
         private final IntArrayList lastUsedCycles = new IntArrayList();
+        private final LongArrayList dirtyEnds = new LongArrayList();
         private final MotionSlice slice = new MotionSlice();
         private int pageIndex;
         private long offset;
@@ -403,10 +411,14 @@ public final class RtEntities {
                 if (cycle - lastUsedCycles.getInt(i) >= MOTION_UNUSED_RETIRE_CYCLES) {
                     pages.remove(i).destroy();
                     lastUsedCycles.removeInt(i);
+                    dirtyEnds.removeLong(i);
                 }
             }
             pageIndex = 0;
             offset = 0L;
+            for (int i = 0; i < dirtyEnds.size(); i++) {
+                dirtyEnds.set(i, 0L);
+            }
         }
 
         MotionSlice allocate(RtContext ctx, long bytes) {
@@ -418,6 +430,7 @@ public final class RtEntities {
                             org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true,
                             "entity motion arena"));
                     lastUsedCycles.add(cycle);
+                    dirtyEnds.add(0L);
                     RtFrameStats.FRAME.count("vmaBufferCreates", 1);
                     RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
                 }
@@ -426,10 +439,23 @@ public final class RtEntities {
                 if (size <= page.size - aligned) {
                     lastUsedCycles.set(pageIndex, cycle);
                     offset = Math.addExact(aligned, size);
+                    dirtyEnds.set(pageIndex, Math.max(dirtyEnds.getLong(pageIndex), offset));
                     return slice.set(page, aligned, size);
                 }
                 pageIndex++;
                 offset = 0L;
+            }
+        }
+
+        /** Publish all sequential displacement writes with one VMA flush per used page. */
+        void flushWrites() {
+            for (int i = 0; i < dirtyEnds.size(); i++) {
+                long bytes = dirtyEnds.getLong(i);
+                if (bytes == 0L) {
+                    continue;
+                }
+                pages.get(i).flush(0L, bytes);
+                RtFrameStats.FRAME.count("entityMotionFlushes", 1);
             }
         }
 
@@ -439,6 +465,7 @@ public final class RtEntities {
             }
             pages.clear();
             lastUsedCycles.clear();
+            dirtyEnds.clear();
         }
     }
 
@@ -506,6 +533,9 @@ public final class RtEntities {
         final ArrayList<RtBuffer> refitScratch = new ArrayList<>(entityListCapacity());
         final ArrayList<RtBuffer> buffers = new ArrayList<>(TRANSIENT_BUFFER_LIST_CAPACITY);
         final MotionArena motion = new MotionArena();
+        final ArrayList<EntitySlot> usedEntitySlots = new ArrayList<>(entityListCapacity());
+        final ArrayList<BeEntry> usedBlockEntities = new ArrayList<>();
+        long lastGraphicsUse;
 
         void reset() {
             instances.clear();
@@ -513,6 +543,8 @@ public final class RtEntities {
             pooledBlas.clear();
             refitScratch.clear();
             buffers.clear();
+            usedEntitySlots.clear();
+            usedBlockEntities.clear();
             motion.reset();
         }
 
@@ -531,6 +563,8 @@ public final class RtEntities {
             pooledBlas.clear();
             refitScratch.clear();
             buffers.clear();
+            usedEntitySlots.clear();
+            usedBlockEntities.clear();
         }
 
         void destroyPersistent() {
@@ -550,11 +584,15 @@ public final class RtEntities {
         MotionArena motion;                     // suballocated entity/BE/particle displacement uploads
         long tableBase;
         long geomTableAddr;
+        TableSlot table;
         int count;        // geometry-table entries / TLAS instances
         int logicalCount; // ordinary entities + block entities + individual particles
 
-        FrameBuild(List<RtAccel.Instance> base) {
+        long completedGraphicsUse;
+
+        FrameBuild(List<RtAccel.Instance> base, long completedGraphicsUse) {
             this.base = base;
+            this.completedGraphicsUse = completedGraphicsUse;
         }
 
         boolean full() {
@@ -571,19 +609,18 @@ public final class RtEntities {
      */
     public FrameEntities beginFrame(RtContext ctx, List<RtAccel.Instance> base, int rbx, int rby, int rbz,
                                     double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
-        processDeferred();
         if (!enabled()) {
-            return new FrameEntities(base, List.of(), List.of(), 0L);
+            return new FrameEntities(base, List.of(), List.of(), 0L, null);
         }
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
         if (level == null) {
-            return new FrameEntities(base, List.of(), List.of(), 0L);
+            return new FrameEntities(base, List.of(), List.of(), 0L, null);
         }
         float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
         setCamera(camX, camY, camZ, projection, viewRotation);
 
-        FrameBuild build = new FrameBuild(base);
+        FrameBuild build = new FrameBuild(base, ctx.gpuExecutor().completedGraphicsValue());
         try {
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.capture")) {
                 captureEntities(ctx, build, mc, level, partial, rbx, rby, rbz);
@@ -601,23 +638,38 @@ public final class RtEntities {
             shutdown();
             throw t;
         }
-        evictStaleAccels();
-        evictStaleBes();
+        evictStaleAccels(ctx);
+        evictStaleBes(ctx);
         RtFrameStats.FRAME.count("entityRetainedGeometryBytes", retainedGeometryBytes);
 
         if (build.instances == null) {
-            return new FrameEntities(base, List.of(), List.of(), 0L);
+            return new FrameEntities(base, List.of(), List.of(), 0L, null);
         }
-        // Retire this frame's transient meshes + scratch + pooled-BUILD BLAS once it is no longer in flight
-        // (their build + the trace that reads them must complete first). Refit AS persist in entityAccels.
-        long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-        FrameLists listsForFree = build.lists;
-        deferred.add(new Deferred(freeAt, () -> {
-            // The deferred horizon guarantees these are off all queues, so destroying them now is safe.
-            listsForFree.releaseDeferred();
-        }));
-        tableRing[tableSlot].flush(0L, (long) build.count * TABLE_ENTRY_BYTES);
-        return new FrameEntities(base, build.instances, build.blas, build.geomTableAddr);
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.uploadFlush")) {
+            build.motion.flushWrites();
+            if (build.count > 0) {
+                build.table.buffer.flush(0L, (long) build.count * TABLE_ENTRY_BYTES);
+                RtFrameStats.FRAME.count("entityTableFlushes", 1);
+            }
+        }
+        return new FrameEntities(base, build.instances, build.blas, build.geomTableAddr,
+                new FrameUse(build.lists, build.table));
+    }
+
+    /** Associate every resource returned for a successfully enqueued frame with its graphics completion. */
+    public void markGraphicsUse(FrameEntities frame, long graphicsUse) {
+        if (frame == null || frame.use == null || graphicsUse == 0L) {
+            return;
+        }
+        FrameLists lists = frame.use.lists;
+        lists.lastGraphicsUse = Math.max(lists.lastGraphicsUse, graphicsUse);
+        frame.use.table.lastGraphicsUse = Math.max(frame.use.table.lastGraphicsUse, graphicsUse);
+        for (EntitySlot slot : lists.usedEntitySlots) {
+            slot.lastGraphicsUse = Math.max(slot.lastGraphicsUse, graphicsUse);
+        }
+        for (BeEntry entry : lists.usedBlockEntities) {
+            entry.lastGraphicsUse = Math.max(entry.lastGraphicsUse, graphicsUse);
+        }
     }
 
     /** Capture animated entities (mobs, items, falling blocks) with per-object motion-vector displacement. */
@@ -843,7 +895,6 @@ public final class RtEntities {
             MemoryUtil.memPutFloat(out + 12, 0f);
             out += 16;
         }
-        disp.flush();
         RtFrameStats.FRAME.count("entityMotionUploadBytes", bytes);
         return new Motion(disp.deviceAddress, 0f, 0f, 0f);
     }
@@ -1120,7 +1171,7 @@ public final class RtEntities {
             BeEntry rebuilt = buildBe(ctx, build, be, hash);
             rebuilt.lastSeen = now;
             if (entry != null) {
-                deferDestroyBe(entry); // retire the superseded geometry off-queue
+                retireBe(ctx, entry);
             }
             beCache.put(key, rebuilt);
             entry = rebuilt;
@@ -1178,6 +1229,7 @@ public final class RtEntities {
         e.meshHash = hash;
         // Retain this build's block-local verts so the next rebuild can diff against them for the MV.
         e.prevVerts = java.util.Arrays.copyOf(capture.verts.elements(), capture.verts.size());
+        build.lists.usedBlockEntities.add(e);
         return e;
     }
 
@@ -1222,21 +1274,25 @@ public final class RtEntities {
         build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress,
                 ENTITY_BIT | (build.count & 0x7FFFFF), 0xFF, RtAccel.SBT_ENTITY_OFFSET));
         build.count++;
+        build.lists.usedBlockEntities.add(e);
         build.logicalCount++;
         RtFrameStats.FRAME.count("blockEntitiesCaptured", 1);
     }
 
-    /** Retire a cached block entity's persistent AS + mesh buffers once off all in-flight queues. */
-    private void deferDestroyBe(BeEntry e) {
-        long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-        deferred.add(new Deferred(freeAt, () -> {
-            RtAccel.destroyEntityAccel(e.accel, e.backing);
-            e.geometry.destroy();
-        }));
+    /** Retire a cached block entity's persistent AS + mesh buffers once its exact last graphics use completes. */
+    private static void retireBe(RtContext ctx, BeEntry e) {
+        RtAccel accel = e.accel;
+        RtBuffer backing = e.backing;
+        RtBuffer geometry = e.geometry;
+        ctx.gpuExecutor().enqueueDestroyAfterGraphics(e.lastGraphicsUse, () -> {
+            RtAccel.destroyEntityAccel(accel, backing);
+            geometry.destroy();
+        });
+        RtFrameStats.FRAME.count("entityBlockEntityRetirements", 1);
     }
 
     /** Drop cached block entities not seen (in window) within the last KEEP_FRAMES frames — unloaded/out of view. */
-    private void evictStaleBes() {
+    private void evictStaleBes(RtContext ctx) {
         if (beCache.isEmpty()) {
             return;
         }
@@ -1247,7 +1303,7 @@ public final class RtEntities {
             if (now - e.lastSeen < KEEP_FRAMES) {
                 continue;
             }
-            deferDestroyBe(e);
+            retireBe(ctx, e);
             it.remove();
         }
     }
@@ -1275,6 +1331,8 @@ public final class RtEntities {
             return;
         }
         FrameLists lists = frameLists[(int) (RtComposite.frameCounter() % frameLists.length)];
+        awaitGraphicsUse(ctx, build, lists.lastGraphicsUse, "entityFrameListsWaits");
+        lists.releaseDeferred();
         lists.reset();
         build.lists = lists;
         build.instances = lists.instances;
@@ -1285,8 +1343,21 @@ public final class RtEntities {
         build.motion = lists.motion;
         ensureResources(ctx);
         tableSlot = (tableSlot + 1) % TABLE_RING;
-        build.tableBase = tableRing[tableSlot].mapped;
-        build.geomTableAddr = tableRing[tableSlot].deviceAddress;
+        build.table = tableRing[tableSlot];
+        awaitGraphicsUse(ctx, build, build.table.lastGraphicsUse, "entityTableWaits");
+        build.tableBase = build.table.buffer.mapped;
+        build.geomTableAddr = build.table.buffer.deviceAddress;
+    }
+
+    private static void awaitGraphicsUse(RtContext ctx, FrameBuild build, long lastUse, String counter) {
+        if (lastUse <= build.completedGraphicsUse) {
+            return;
+        }
+        long started = System.nanoTime();
+        ctx.gpuExecutor().waitForGraphicsValue(lastUse);
+        build.completedGraphicsUse = lastUse;
+        RtFrameStats.FRAME.count(counter, 1);
+        RtFrameStats.FRAME.count("entityGraphicsWaitNanos", System.nanoTime() - started);
     }
 
     /**
@@ -1346,6 +1417,10 @@ public final class RtEntities {
         }
         beginBuildIfNeeded(ctx, build);
         ea.lastSeen = RtComposite.frameCounter();
+        if (ea.refSlot == null) {
+            throw new IllegalStateException("Rigid entity reuse lost its owning slot");
+        }
+        build.lists.usedEntitySlots.add(ea.refSlot);
         writeTableEntry(build, ea.refPrimAddr, ea.refIndexAddr, ea.refUvAddr,
                 motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ, ea.refBucketTris);
         build.instances.add(new RtAccel.Instance(placeTransform(localTransform, placeX, placeY, placeZ),
@@ -1524,7 +1599,8 @@ public final class RtEntities {
         RtBuffer geometry;
         long allocStart = RtFrameStats.FRAME.startStage();
         try {
-            slot = selectEntityBuildSlot(entityId);
+            slot = selectEntityBuildSlot(ctx, build, entityId);
+            build.lists.usedEntitySlots.add(slot);
             long required = Math.addExact(layout.totalBytes, EntityGeometryLayout.REGION_ALIGNMENT - 1L);
             geometry = slot.geometry;
             if (geometry == null || geometry.size < required) {
@@ -1585,6 +1661,7 @@ public final class RtEntities {
         EntityAccel ea = slot.owner;
         clearRefGeometry(ea);
         ea.refAccel = accel;
+        ea.refSlot = slot;
         ea.refIndexAddr = indexAddr;
         ea.refUvAddr = uvAddr;
         ea.refPrimAddr = primAddr;
@@ -1603,6 +1680,7 @@ public final class RtEntities {
     /** Clear the latest rigid-reuse view; the backing remains owned by its retired ring slot. */
     private void clearRefGeometry(EntityAccel ea) {
         ea.refAccel = null;
+        ea.refSlot = null;
         ea.refIndexAddr = 0L;
         ea.refUvAddr = 0L;
         ea.refPrimAddr = 0L;
@@ -1622,7 +1700,6 @@ public final class RtEntities {
         beginBuildIfNeeded(ctx, build);
         MotionSlice slice = build.motion.allocate(ctx, (long) disp.length * Float.BYTES);
         MemoryUtil.memFloatBuffer(slice.mapped, disp.length).put(disp, 0, disp.length);
-        slice.flush();
         return slice.deviceAddress;
     }
 
@@ -1635,7 +1712,6 @@ public final class RtEntities {
         beginBuildIfNeeded(ctx, build);
         MotionSlice slice = build.motion.allocate(ctx, (long) size * Float.BYTES);
         MemoryUtil.memFloatBuffer(slice.mapped, size).put(disp.elements(), 0, size);
-        slice.flush();
         return slice.deviceAddress;
     }
 
@@ -1660,11 +1736,8 @@ public final class RtEntities {
         MemoryUtil.memPutInt(entry + 60, 0);
     }
 
-    /**
-     * Select the next per-entity slot. One entity contributes at most one changed capture per frame, so a
-     * wrapped slot is at least {@link #REFIT_RING} frames old and off all queues.
-     */
-    private EntitySlot selectEntityBuildSlot(int entityId) {
+    /** Select the next per-entity slot, waiting on its exact last graphics use before mutable reuse. */
+    private EntitySlot selectEntityBuildSlot(RtContext ctx, FrameBuild build, int entityId) {
         EntityAccel ea = entityAccels.get(entityId);
         if (ea == null) {
             ea = new EntityAccel();
@@ -1678,6 +1751,8 @@ public final class RtEntities {
             slot = new EntitySlot();
             slot.owner = ea;
             ea.ring[s] = slot;
+        } else {
+            awaitGraphicsUse(ctx, build, slot.lastGraphicsUse, "entitySlotWaits");
         }
         return slot;
     }
@@ -1783,7 +1858,7 @@ public final class RtEntities {
     }
 
     /** Drop persistent AS for entities not captured within the last KEEP_FRAMES frames (off all queues). */
-    private void evictStaleAccels() {
+    private void evictStaleAccels(RtContext ctx) {
         if (entityAccels.isEmpty()) {
             return;
         }
@@ -1796,7 +1871,7 @@ public final class RtEntities {
             }
             for (EntitySlot slot : ea.ring) {
                 if (slot != null) {
-                    destroyEntitySlot(slot);
+                    retireEntitySlot(ctx, slot);
                 }
             }
             clearRefGeometry(ea);
@@ -1823,6 +1898,28 @@ public final class RtEntities {
         slot.indexCount = 0;
     }
 
+    /** Detach a stale slot immediately and destroy its GPU owners after their exact last use completes. */
+    private void retireEntitySlot(RtContext ctx, EntitySlot slot) {
+        RtAccel accel = slot.accel;
+        RtBuffer backing = slot.backing;
+        RtBuffer geometry = slot.geometry;
+        RtBuffer scratch = slot.refitScratch;
+        long geometryBytes = geometry == null ? 0L : geometry.size;
+        retainedGeometryBytes = Math.subtractExact(retainedGeometryBytes, geometryBytes);
+        slot.accel = null;
+        slot.backing = null;
+        slot.geometry = null;
+        slot.refitScratch = null;
+        slot.indices = null;
+        slot.indexCount = 0;
+        ctx.gpuExecutor().enqueueDestroyAfterGraphics(slot.lastGraphicsUse, () -> {
+            if (accel != null) RtAccel.destroyEntityAccel(accel, backing);
+            if (geometry != null) geometry.destroy();
+            if (scratch != null) scratch.destroy();
+        });
+        RtFrameStats.FRAME.count("entitySlotRetirements", 1);
+    }
+
     private void setCamera(double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
         if (cameraState == null) {
             cameraState = new CameraRenderState();
@@ -1846,20 +1943,18 @@ public final class RtEntities {
             return;
         }
         if (tableRing != null) {
-            RtBuffer[] oldRing = tableRing;
-            deferred.add(new Deferred(RtComposite.frameCounter() + KEEP_FRAMES, () -> {
-                for (RtBuffer b : oldRing) {
-                    b.destroy();
-                }
-            }));
+            for (TableSlot old : tableRing) {
+                ctx.gpuExecutor().enqueueDestroyAfterGraphics(old.lastGraphicsUse, old.buffer::destroy);
+                RtFrameStats.FRAME.count("entityTableRetirements", 1);
+            }
             tableRing = null;
             tableCapacity = 0;
         }
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        tableRing = new RtBuffer[TABLE_RING];
+        tableRing = new TableSlot[TABLE_RING];
         for (int i = 0; i < TABLE_RING; i++) {
-            tableRing[i] = ctx.createBuffer((long) requiredCapacity * TABLE_ENTRY_BYTES, storage, true,
-                    "entity geometry table ring " + i);
+            tableRing[i] = new TableSlot(ctx.createBuffer((long) requiredCapacity * TABLE_ENTRY_BYTES,
+                    storage, true, "entity geometry table ring " + i));
         }
         tableCapacity = requiredCapacity;
     }
@@ -1869,29 +1964,8 @@ public final class RtEntities {
         collector.clearCaches();
     }
 
-    private void processDeferred() {
-        if (deferred.isEmpty()) {
-            return;
-        }
-        long now = RtComposite.frameCounter();
-        Iterator<Deferred> it = deferred.iterator();
-        while (it.hasNext()) {
-            Deferred d = it.next();
-            if (d.freeFrame() <= now) {
-                d.free().run();
-                it.remove();
-            }
-        }
-    }
-
-    /** Free the geometry-table ring + any outstanding per-frame entity resources (teardown; GPU idle). */
+    /** Free the geometry-table ring and entity resources (teardown; caller has idled the device). */
     public void shutdown() {
-        // Drain outstanding deferred releases first (they destroy buffers/AS), then destroy the persistent
-        // per-entity AS. Runs after waitIdle, so immediate destruction is safe.
-        for (Deferred d : deferred) {
-            d.free().run();
-        }
-        deferred.clear();
         for (FrameLists lists : frameLists) {
             lists.releaseDeferred();
             lists.destroyPersistent();
@@ -1911,8 +1985,8 @@ public final class RtEntities {
         }
         beCache.clear();
         if (tableRing != null) {
-            for (RtBuffer b : tableRing) {
-                b.destroy();
+            for (TableSlot slot : tableRing) {
+                slot.buffer.destroy();
             }
             tableRing = null;
             tableCapacity = 0;
