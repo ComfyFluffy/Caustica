@@ -95,11 +95,6 @@ public final class RtComposite {
     // Hot addresses/frameIndex and raygen's debugView avoid unnecessary global-memory dereferences;
     // WorldPushConstantsData is generated from the same Slang module and owns this second ABI as well.
     private static final int GUIDE_COUNT = 6; // RR guide buffers bound at world-pipeline bindings 3..8
-    // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
-    // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
-    // the composite frame counter has advanced this far past it (so no in-flight frame still reads it).
-    private static final int KEEP_FRAMES = 4;
-
     private static int debugView() {
         return CausticaConfig.Rt.Composite.DEBUG_VIEW.value();
     }
@@ -762,8 +757,7 @@ public final class RtComposite {
         long dstImage = vkImage(nativeColor);
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).caustica$getBackend();
         RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
-        // Reserve this frame's graphics-use value up front: prepareTlas/entity resource reuse below need
-        // it to gate their ring slots on actual GPU completion instead of assuming frame age is enough.
+        // Reserve the graphics-use value that guards this frame's reusable TLAS and entity resources.
         long graphicsUse = gpuExecutor.beginGraphicsTerrainUse(encoder);
         pendingTerrainGraphicsUse = graphicsUse;
         RtEntities.FrameEntities frameEntities = null;
@@ -884,10 +878,8 @@ public final class RtComposite {
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.
             RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
-            // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
-            // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS slot (and entity
-            // meshes/BLAS retired by RtEntities) is reused once this frame's graphics-use value has actually
-            // completed on the GPU, not merely after KEEP_FRAMES have elapsed on the CPU.
+            // Build the entity BLAS, the TLAS that references it and the terrain BLAS, then the trace.
+            // Barriers separate each stage; the graphics-use timeline guards resource reuse.
             if (!fe.blas().isEmpty()) {
                 try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blasRecord")) {
                     RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());

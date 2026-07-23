@@ -138,10 +138,10 @@ public final class RtEntities {
 
     // EntityGeom: four addresses + rigid displacement + three geometry triangle bases + padding = 64 B.
     private static final int TABLE_ENTRY_BYTES = 64;
-    // Ring of fixed-size geometry tables. Reuse is guarded by the graphics-use timeline; ring depth avoids
-    // routine waits but is not treated as proof of GPU completion.
+    // Fixed-size geometry-table ring. Timeline completion guards host writes; ring depth avoids routine waits.
     private static final int TABLE_RING = 6;
-    // Frames a superseded cache or per-frame entity resource must outlive before it is freed.
+    // Stale-cache eviction horizon and default reusable-resource ring depth.
+    // Graphics timeline completion guards GPU reuse and destruction.
     private static final int KEEP_FRAMES = 4;
     private static final int FRAME_LIST_RING = KEEP_FRAMES;
     // Refit (UPDATE-mode) BLAS: persistent per-entity AS, refit in place each frame (cheap) while
@@ -156,8 +156,8 @@ public final class RtEntities {
     // Well below a texel (1/16 block) and DLSS-RR jitter; float pose math noise is ~1e-5.
     private static final float RIGID_FIT_EPS = 2.0e-3f;
 
-    // Per-entity ring depth. Each slot holds one persistent AS; the graphics-use timeline, not frame age,
-    // gates mapped writes, refits, rebuilds, and destruction when the cursor wraps.
+    // Each per-entity ring slot owns one persistent AS. Timeline completion guards cursor reuse,
+    // mapped writes, refits, rebuilds, and destruction.
     private static final int REFIT_RING = KEEP_FRAMES;
     // Force a periodic full rebuild of a slot's AS to bound BVH-quality degradation from repeated refits
     // (an entity that deforms a lot would otherwise refit the same BVH topology forever). Per-slot count.
@@ -333,8 +333,8 @@ public final class RtEntities {
         long lastSeen;
         // Rigid-reuse reference (refAccel == null → no reusable build yet). refVerts are the exact
         // positions the AS was last built/refit from; a frame whose capture is a rigid transform of them
-        // reuses the AS via the TLAS instance transform instead of re-uploading + refitting. Reuse frames
-        // only READ the AS, so referencing the last-written ring slot while it is in flight is safe.
+        // reuses the AS through the TLAS instance transform. Reuse frames only READ the AS, so referencing
+        // the last-written ring slot while it is in flight is safe.
         RtAccel refAccel;
         EntitySlot refSlot;
         float[] refVerts;
@@ -379,18 +379,12 @@ public final class RtEntities {
     }
 
     private static final class MotionSlice {
-        RtBuffer buffer;
-        long offset;
         long mapped;
         long deviceAddress;
-        long size;
 
-        MotionSlice set(RtBuffer buffer, long offset, long size) {
-            this.buffer = buffer;
-            this.offset = offset;
+        MotionSlice set(RtBuffer buffer, long offset) {
             this.mapped = buffer.mapped + offset;
             this.deviceAddress = buffer.deviceAddress + offset;
-            this.size = size;
             return this;
         }
     }
@@ -440,7 +434,7 @@ public final class RtEntities {
                     lastUsedCycles.set(pageIndex, cycle);
                     offset = Math.addExact(aligned, size);
                     dirtyEnds.set(pageIndex, Math.max(dirtyEnds.getLong(pageIndex), offset));
-                    return slice.set(page, aligned, size);
+                    return slice.set(page, aligned);
                 }
                 pageIndex++;
                 offset = 0L;
@@ -1229,7 +1223,6 @@ public final class RtEntities {
         e.meshHash = hash;
         // Retain this build's block-local verts so the next rebuild can diff against them for the MV.
         e.prevVerts = java.util.Arrays.copyOf(capture.verts.elements(), capture.verts.size());
-        build.lists.usedBlockEntities.add(e);
         return e;
     }
 
@@ -1857,7 +1850,7 @@ public final class RtEntities {
         slot.indexCount = count;
     }
 
-    /** Drop persistent AS for entities not captured within the last KEEP_FRAMES frames (off all queues). */
+    /** Retire persistent AS for entities not captured within the last KEEP_FRAMES frames. */
     private void evictStaleAccels(RtContext ctx) {
         if (entityAccels.isEmpty()) {
             return;

@@ -940,15 +940,12 @@ public final class RtAccel {
     }
 
     /**
-     * Reusable per-frame TLAS resources. Allocating the instance buffer + AS backing + scratch fresh every
-     * frame (and defer-destroying them 4 frames later) occasionally hit VMA's slow path — a fresh
-     * VkDeviceMemory block allocation + map — observed as rare 20–50ms prepareTlas spikes. The ring keeps
-     * {@value #RING} slots, each sized for a capacity instance count, and rebuilds the same AS in place.
-     * Reuse is guarded by the graphics-use timeline rather than frame age, so startup backlog cannot race
-     * an older build/trace. A slot is recreated only when the instance count outgrows its capacity.
+     * Owns {@value #RING} reusable per-frame TLAS slots. Each slot contains a capacity-sized instance
+     * buffer, acceleration structure, and scratch buffer. Graphics timeline completion guards reuse;
+     * instance-count growth recreates the selected slot with a larger capacity.
      */
     public static final class TlasRing {
-        private static final int RING = 4;           // = the frames-in-flight KEEP_FRAMES horizon
+        private static final int RING = 4;           // depth avoids routine reuse waits
         private static final float GROWTH = 1.25f;   // capacity headroom on (re)size
         private static final int MIN_CAPACITY = 1024;
         private final Slot[] slots = new Slot[RING];
@@ -984,19 +981,13 @@ public final class RtAccel {
      * rebuilt in place — BUILD mode overwrites). Do NOT call {@link PreparedTlas#destroyAll} on the
      * result: the ring owns the resources.
      */
-    public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> instances, TlasRing ring,
-                                           long graphicsUse) {
-        return prepareTlas(ctx, instances, List.of(), ring, graphicsUse);
-    }
-
     /** Pack terrain and dynamic instances as two contiguous ranges without a composite-list get per item. */
     public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> baseInstances,
                                            List<Instance> dynamicInstances, TlasRing ring, long graphicsUse) {
         int baseCount = baseInstances.size();
         int count = Math.addExact(baseCount, dynamicInstances.size());
         TlasRing.Slot slot = ring.slots[ring.cursor];
-        // Frame age is not GPU completion. Startup can leave more than RING submissions in flight; wait
-        // before rewriting this instance buffer, rebuilding its AS, or destroying it during a resize.
+        // Complete the slot's prior graphics use before rewriting, rebuilding, or resizing it.
         if (slot != null) {
             ctx.gpuExecutor().waitForGraphicsValue(slot.lastGraphicsUse);
         }
