@@ -191,10 +191,13 @@ public final class RtGpuExecutor {
     /** Caller has made the device idle; all queued destruction is now unconditionally safe. */
     public void flushDestroysAfterDeviceIdle() {
         Throwable failure = executorFailure;
+        boolean leak = CausticaConfig.Rt.Safe.leak();
         synchronized (destroyJobs) {
             for (DestroyJob job : destroyJobs) {
                 try {
-                    job.destroy.run();
+                    if (!leak) {
+                        job.destroy.run();
+                    }
                 } catch (Throwable t) {
                     if (failure == null) {
                         failure = t;
@@ -418,13 +421,20 @@ public final class RtGpuExecutor {
             return;
         }
         long completed = completedGraphicsValue();
+        // Safe-mode diagnostics: a margin>0 that hides corruption points at a last-use value recorded
+        // too early somewhere; leak (never actually free) additionally rules out the freed memory's
+        // *contents* as the cause, since the resource is never reused or unmapped. See CausticaConfig.
+        long margin = CausticaConfig.Rt.Safe.destroyMarginFrames();
+        boolean leak = CausticaConfig.Rt.Safe.leak();
         synchronized (destroyJobs) {
             Iterator<DestroyJob> it = destroyJobs.iterator();
             while (it.hasNext()) {
                 DestroyJob job = it.next();
-                if (job.lastUseValue <= completed) {
+                if (job.lastUseValue + margin <= completed) {
                     it.remove();
-                    job.destroy.run();
+                    if (!leak) {
+                        job.destroy.run();
+                    }
                 }
             }
         }

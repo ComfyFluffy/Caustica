@@ -572,10 +572,11 @@ public final class CausticaConfig {
             }
         }
 
-        /** Diagnostic levers that trade performance for a smaller, easier-to-bisect UB surface. Each
-         *  is a startup-frozen switch (like {@link Hdr#ENABLED}): the resource/thread architecture they
-         *  pick between is fixed at RtContext/executor construction, so a live toggle only takes effect
-         *  after restart. */
+        /** Diagnostic levers that trade performance for a smaller, easier-to-bisect UB surface. Some
+         *  (architecture-level, e.g. {@link #SINGLE_QUEUE}) are startup-frozen switches like
+         *  {@link Hdr#ENABLED}: the resource/thread architecture they pick between is fixed at
+         *  RtContext/executor construction, so a live toggle only takes effect after restart. Others
+         *  (simple runtime gates, e.g. {@link #DESTROY_MARGIN_FRAMES}, {@link #LEAK}) are read live. */
         public static final class Safe {
             /** Route terrain/entity BLAS builds through the render thread onto the graphics queue
              *  instead of the dedicated async-compute queue + background executor thread. Removes
@@ -583,6 +584,23 @@ public final class CausticaConfig {
              *  cost of the render thread blocking on each build. */
             public static final BooleanSetting SINGLE_QUEUE =
                     bool("caustica.rt.safe.singleQueue", "safe.single-queue", false);
+
+            /** Extra completed-graphics-timeline-value margin required before a deferred destroy
+             *  ({@code RtGpuExecutor.enqueueDestroyAfterGraphics}) is allowed to run, on top of the
+             *  resource's recorded last-use value. Since one value is issued per RT terrain use (see
+             *  {@code beginGraphicsTerrainUse}), this is approximately N extra frames of safety margin.
+             *  A retire/destroy that only reproduces corruption with margin == 0 and disappears at
+             *  margin > 0 points at a last-use value that's recorded too early somewhere (a race or an
+             *  off-by-one), not at the resource's contents. */
+            public static final IntSetting DESTROY_MARGIN_FRAMES =
+                    intAtLeast("caustica.rt.safe.destroyMarginFrames", "safe.destroy-margin-frames", 0, 0);
+
+            /** Never actually run a deferred destroy's cleanup — just drop it from tracking once its
+             *  margin-adjusted last-use value completes. Intentionally leaks GPU/host memory; for
+             *  diagnosis only. If this makes corruption disappear where {@link #DESTROY_MARGIN_FRAMES}
+             *  alone did not, the destroy is running at a correct-looking but still too-early time (the
+             *  resource is read again after the value the destroy was gated on), not merely close. */
+            public static final BooleanSetting LEAK = bool("caustica.rt.safe.leak", "safe.leak", false);
 
             private static final boolean SINGLE_QUEUE_AT_STARTUP = SINGLE_QUEUE.value();
 
@@ -595,6 +613,14 @@ public final class CausticaConfig {
 
             public static boolean singleQueuePendingRestart() {
                 return SINGLE_QUEUE.value() != SINGLE_QUEUE_AT_STARTUP;
+            }
+
+            public static long destroyMarginFrames() {
+                return DESTROY_MARGIN_FRAMES.value();
+            }
+
+            public static boolean leak() {
+                return LEAK.value();
             }
         }
 
