@@ -768,12 +768,17 @@ public final class RtEntities {
             curVerts.put(id, storeEntityPrev(prev, capture.verts, ix, iy, iz));
             // Rigid reuse first: a pose that is a rigid transform of the entity's last-built mesh
             // re-references that AS through the instance transform — no upload, no refit.
+            // rt.safe.noEntityRigidReuse forces the full rebuild path below every frame instead.
             boolean reused;
-            long reuseStart = RtFrameStats.FRAME.startStage();
-            try {
-                reused = appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
-            } finally {
-                RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
+            if (CausticaConfig.Rt.Safe.noEntityRigidReuse()) {
+                reused = false;
+            } else {
+                long reuseStart = RtFrameStats.FRAME.startStage();
+                try {
+                    reused = appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
+                } finally {
+                    RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
+                }
             }
             if (!reused) {
                 appendCapture(ctx, build, motion, id, ENTITY_BIT, mask,

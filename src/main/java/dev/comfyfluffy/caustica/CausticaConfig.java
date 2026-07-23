@@ -632,6 +632,17 @@ public final class CausticaConfig {
             public static final BooleanSetting NO_NULL_BDA =
                     bool("caustica.rt.safe.noNullBda", "safe.no-null-bda", false);
 
+            /** Skip {@code RtEntities}' rigid-reuse fast path (re-referencing a previously built entity
+             *  BLAS through just an instance transform, with no rebuild, whenever this frame's pose is a
+             *  rigid transform of the reference mesh) and always take the full rebuild path instead. This
+             *  is the cross-frame "reuse an AS built N frames ago with no fresh write this frame" case --
+             *  the cheapest and least-verified of the entity reuse layers. NOTE: the "full rebuild" path
+             *  this falls back to (RtEntities#appendPackedEntity) still writes into a per-entity ring
+             *  slot's retired backing buffer, not a fresh allocation -- that deeper ring layer is NOT
+             *  covered by this flag and needs its own pass (see docs/SAFE_MODE_BISECT.md). */
+            public static final BooleanSetting NO_ENTITY_RIGID_REUSE =
+                    bool("caustica.rt.safe.noEntityRigidReuse", "safe.no-entity-rigid-reuse", false);
+
             private static final boolean SINGLE_QUEUE_AT_STARTUP = SINGLE_QUEUE.value();
 
             private Safe() {
@@ -663,6 +674,10 @@ public final class CausticaConfig {
 
             public static boolean noNullBda() {
                 return NO_NULL_BDA.value();
+            }
+
+            public static boolean noEntityRigidReuse() {
+                return NO_ENTITY_RIGID_REUSE.value();
             }
         }
 
