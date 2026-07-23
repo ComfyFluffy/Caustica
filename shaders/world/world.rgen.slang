@@ -14,7 +14,8 @@
 // Russian roulette terminates deep paths. Output is HDR (R16G16B16A16_SFLOAT); the HDR -> LDR tonemap
 // happens later at the display.comp seam.
 //
-// SER: the build emits EXT and NV shader-invocation-reorder variants from this source.
+// SER: the build emits an EXT shader-invocation-reorder variant from this source, plus a NO_SER
+// fallback (plain TraceRay, no HitObject/ReorderThread) for devices without the EXT feature.
 //
 // Each frame emits a single SPP-averaged (still noisy) estimate; temporal convergence is the denoiser's
 // job. With RR disabled the output is the raw noisy path trace — a reference view, not a converged image.
@@ -693,26 +694,44 @@ RayDesc makeRay(float3 origin, float tmin, float3 dir, float tmax) {
     return r;
 }
 
+#ifdef NO_SER
+// NO_SER fallback: no EXT rayTracingInvocationReorder support, so trace with plain TraceRay (invokes
+// the hit/miss shader directly, no reordering).
+void traceRadiance(uint cullMask, float3 ro, float tmin, float3 rd, float tmax) {
+    TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask,
+            SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, makeRay(ro, tmin, rd, tmax), payload);
+}
+#else
 // SER radiance trace: trace into a hit object, reorder threads by hit coherence, THEN invoke the
 // hit/miss shader — this is where the divergent Section/Prim shading work (world.rchit/world.rahit)
 // actually happens, so reordering before it is what pays for the reorder's own cost.
-void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 rd, float tmax) {
+void traceRadiance(uint cullMask, float3 ro, float tmin, float3 rd, float tmax) {
     HitObject hObj = HitObject::TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask,
             SBT_RADIANCE, SBT_STRIDE_BUCKET, 0u, makeRay(ro, tmin, rd, tmax), payload);
     ReorderThread(hObj);
     HitObject::Invoke(topLevelAS, hObj, payload);
 }
+#endif
 
 float3 visibility(float3 origin, float3 dir, float tmax) {
     shadowVis = float4(1.0, 1.0, 1.0, -1.0); // a = water-crossing sentinel, filled by the water any-hit
     // Shadow SBT records run any-hit only for cutout/translucent/water. Cutout alpha-tests; translucent
     // and water tint shadowVis.rgb and pass through. Solid blocks terminate traversal. There is no closest
-    // or miss shader worth executing, so use a hit object only as the traversal result.
+    // shader worth executing (SKIP_CLOSEST_HIT_SHADER), so a==1.0 (only ever written by shadow.rmiss)
+    // is the traversal-missed signal — an accepted opaque hit never touches shadowVis.a at all.
+#ifdef NO_SER
+    TraceRay(topLevelAS,
+            RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+            CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 0u,
+            makeRay(origin, RAY_TMIN, dir, tmax), shadowVis);
+    return shadowVis.a == 1.0 ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
+#else
     HitObject hObj = HitObject::TraceRay(topLevelAS,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
             CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 0u,
             makeRay(origin, RAY_TMIN, dir, tmax), shadowVis);
     return hObj.IsMiss() ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
+#endif
 }
 
 float2 projectPrevNdc(float3 worldPos) {
@@ -757,7 +776,7 @@ float2 specularReflectionMotion(float3 surfacePos, float3 primaryDir, float2 cur
     payloadSetTraceState(false,
             max(length(surfacePos - worldPush.camOffset) * primaryConeSpread, RAY_CONE_MIN_WIDTH),
             max(primaryConeSpread, RAY_CONE_MIN_SPREAD));
-    traceRadianceReordered(CULL_SECONDARY, surfacePos + n * SURF_BIAS, RAY_TMIN, specDir, 10000.0);
+    traceRadiance(CULL_SECONDARY, surfacePos + n * SURF_BIAS, RAY_TMIN, specDir, 10000.0);
 
     float3 reflectedHit;
     float3 reflectedMotionPrev;
@@ -803,7 +822,7 @@ void refractedGuideHit(float3 surfacePos, float3 incidentDir, float3 surfaceNorm
     float3 ro = surfacePos - surfaceNormal * SURF_BIAS;
     payload.hitT = -1.0;
     payloadSetTraceState(false, rayConeWidth, rayConeSpread);
-    traceRadianceReordered(CULL_SECONDARY, ro, RAY_TMIN, refractedDir, 10000.0);
+    traceRadiance(CULL_SECONDARY, ro, RAY_TMIN, refractedDir, 10000.0);
     if (payload.hitT < 0.0) {
         hitCamRel = (ro + refractedDir * 1.0e6) - worldPush.camOffset; // sky through the surface, at infinity
         motionPrev = float3(0.0, 0.0, 0.0);
@@ -865,7 +884,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
         // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the first-person
         // player. Bounce rays are secondary (CULL_SECONDARY): exclude particles, include the player.
-        traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0);
+        traceRadiance(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0);
 
         if (payload.hitT < 0.0) {
             // world.rmiss writes sky radiance (gradient + sun/moon disc + stars) into payload.albedo. The

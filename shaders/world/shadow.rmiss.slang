@@ -1,7 +1,7 @@
-// Shadow / sky-visibility miss (SBT miss index 1). Note this shader does not actually RUN in the
-// current pipeline: visibility() uses a hit object purely as the traversal result and never invokes
-// the miss shader — it fills the SBT slot. Kept behavior-identical to the GLSL original in case a
-// future caller does invoke it (marks the ray escaped without touching the accumulated transmittance).
+// Shadow / sky-visibility miss (SBT miss index 1). Under the SER (EXT) raygen variant this shader
+// does not actually run: visibility() uses a hit object purely as the traversal result and never
+// invokes the miss shader — it just fills the SBT slot. The NO_SER raygen fallback (plain TraceRay,
+// no HitObject) does invoke it: shadowVis.a == 1.0 is that variant's "ray escaped" signal.
 [shader("miss")]
 void main(inout float4 shadowVis) {
     shadowVis.a = 1.0;
