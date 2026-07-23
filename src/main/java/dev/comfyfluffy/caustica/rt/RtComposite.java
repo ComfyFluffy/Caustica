@@ -1697,7 +1697,9 @@ public final class RtComposite {
      */
     public RtImage fgInterpolate(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
             int swapW, int swapH, int index, int count, boolean hdrBackbuffer) {
-        if (failed || gDepth == null || gMotion == null || !frameCaptured) {
+        // Defense-in-depth: today's only caller (RtFramePresenter) already gates on RtFramePresenter's own
+        // isActive()/enabled() check, so this is redundant in practice, not a behavior change.
+        if (!RtDlssFg.enabled() || failed || gDepth == null || gMotion == null || !frameCaptured) {
             return null;
         }
         RtContext ctx = RtContext.currentOrNull();

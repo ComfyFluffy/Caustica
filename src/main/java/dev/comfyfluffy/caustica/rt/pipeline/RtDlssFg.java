@@ -78,7 +78,10 @@ public final class RtDlssFg {
      * when FG is enabled; no-op after the first successful probe. Needs no command buffer (capability query).
      */
     public void probeAvailabilityOnce() {
-        if (probed || failed) {
+        // Defense-in-depth: today's only caller (CausticaClient) already gates on enabled(), but every
+        // other entry point into NGX/GPU-touching work on this class (ensureFeature, evaluate) self-gates
+        // the same way, so this shouldn't be the one exception a future caller could trip over.
+        if (!enabled() || probed || failed) {
             return;
         }
         if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
