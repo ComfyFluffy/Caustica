@@ -617,6 +617,21 @@ public final class CausticaConfig {
             public static final BooleanSetting NO_TLAS_RING =
                     bool("caustica.rt.safe.noTlasRing", "safe.no-tlas-ring", false);
 
+            /** Back every "0 = not published" light-buffer BDA sentinel (lightBufAddr, lightAliasAddr,
+             *  lightLocalAliasAddr, lightGridCellAddr, lightGridSpanAddr) with a small zeroed dummy
+             *  buffer instead of the literal address 0 whenever no light data is published this frame.
+             *  Diagnostic only, NOT a permanent hardening: the shader's real "is this present" gate stays
+             *  on lightCount/hasGrid at the source level (unaffected by this), so with this on those
+             *  branches are still logically skipped in ordinary (non-speculative) execution -- this only
+             *  removes address 0 as the base of any load a driver's ISA compiler might still speculate
+             *  past those branches. If corruption survives every ring-removal lever above but disappears
+             *  with this on, the driver is speculating a load through a stale/null light-buffer address
+             *  on the RIS path specifically. Leave off by default: it changes what a mispredicted/
+             *  speculated load actually reads, which is exactly the point, but that's a real (if
+             *  extremely unlikely to matter) behavior change worth keeping opt-in. */
+            public static final BooleanSetting NO_NULL_BDA =
+                    bool("caustica.rt.safe.noNullBda", "safe.no-null-bda", false);
+
             private static final boolean SINGLE_QUEUE_AT_STARTUP = SINGLE_QUEUE.value();
 
             private Safe() {
@@ -644,6 +659,10 @@ public final class CausticaConfig {
 
             public static boolean noTlasRing() {
                 return NO_TLAS_RING.value();
+            }
+
+            public static boolean noNullBda() {
+                return NO_NULL_BDA.value();
             }
         }
 

@@ -177,6 +177,12 @@ public final class RtComposite {
     private static final int PUSH_RING = 6;
     private RtBuffer[] pushRing;
     private int pushSlot;
+    // rt.safe.noNullBda: lazily-created zeroed placeholder backing every "0 = not published" light-BDA
+    // sentinel, so a driver speculating a load past the shader's lightCount/hasGrid gate reads defined
+    // zeros from a real allocation instead of dereferencing address 0. See CausticaConfig for why this is
+    // diagnostic-only. Small enough (see safeAddr) for every struct type read through these fields.
+    private static final long SAFE_MODE_DUMMY_BDA_SIZE = 256L;
+    private RtBuffer safeModeDummyBda;
     private RtDisplayPipeline displayPipeline;
     private RtImage output;
     private RtImage displayImage;
@@ -850,6 +856,11 @@ public final class RtComposite {
             // resolved slot rides along with the uploadPending() call right below.
             BreakEntry[] breaking = breakingEntries(terrain);
             SkyPush sky = skyPush();
+            long safeLightBuf = safeBdaAddr(ctx, terrain.lightBufferAddress());
+            long safeLightAlias = safeBdaAddr(ctx, terrain.lightAliasBufferAddress());
+            long safeLightLocalAlias = safeBdaAddr(ctx, terrain.lightLocalAliasBufferAddress());
+            long safeLightGridCell = safeBdaAddr(ctx, terrain.lightGridCellBufferAddress());
+            long safeLightGridSpan = safeBdaAddr(ctx, terrain.lightGridSpanBufferAddress());
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -877,13 +888,13 @@ public final class RtComposite {
                     breaking,
                     // RIS emitter NEE: published light buffer + RIS candidate count (0 = emitter NEE off;
                     // the shader also requires lightCount > 0, so an empty buffer degrades to legacy gather).
-                    terrain.lightBufferAddress(),
-                    terrain.lightAliasBufferAddress(),
-                    terrain.lightLocalAliasBufferAddress(),
+                    safeLightBuf,
+                    safeLightAlias,
+                    safeLightLocalAlias,
                     new Float4(terrain.lightRebaseOffsetX(), terrain.lightRebaseOffsetY(),
                             terrain.lightRebaseOffsetZ(), terrain.lightInvGlobalPowerSum()),
-                    terrain.lightGridCellBufferAddress(),
-                    terrain.lightGridSpanBufferAddress(),
+                    safeLightGridCell,
+                    safeLightGridSpan,
                     new Float4(terrain.lightGridOriginX(), terrain.lightGridOriginY(), terrain.lightGridOriginZ(), 16f),
                     new Int4(terrain.lightGridDimX(), terrain.lightGridDimY(), terrain.lightGridDimZ(), 0),
                     terrain.lightCount(),
@@ -992,6 +1003,22 @@ public final class RtComposite {
      * {@link ModelBakery#DESTROY_TYPES}) is a standalone {@code Sampler0} texture, not a block-atlas sprite,
      * so it rides the same bindless entity-texture array as entity textures ({@link RtEntityTextures}).
      */
+    /** rt.safe.noNullBda: substitute a small zeroed dummy allocation's address for a "0 = not published"
+     *  light-BDA sentinel. See the field comment on {@link #safeModeDummyBda} for why. No-op (returns
+     *  {@code addr} unchanged) unless the flag is set or {@code addr} is already non-zero. */
+    private long safeBdaAddr(RtContext ctx, long addr) {
+        if (addr != 0L || !CausticaConfig.Rt.Safe.noNullBda()) {
+            return addr;
+        }
+        if (safeModeDummyBda == null) {
+            safeModeDummyBda = ctx.createBuffer(SAFE_MODE_DUMMY_BDA_SIZE,
+                    VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt safe-mode dummy light BDA (zeroed)");
+            MemoryUtil.memSet(safeModeDummyBda.mapped, 0, SAFE_MODE_DUMMY_BDA_SIZE);
+            safeModeDummyBda.flush(0L, SAFE_MODE_DUMMY_BDA_SIZE);
+        }
+        return safeModeDummyBda.deviceAddress;
+    }
+
     private BreakEntry[] breakingEntries(RtTerrain terrain) {
         BreakEntry[] result = new BreakEntry[WorldPushData.BREAKING_CAPACITY];
         int count = 0;
@@ -1252,6 +1279,10 @@ public final class RtComposite {
                 }
             }
             pushRing = null;
+        }
+        if (safeModeDummyBda != null) {
+            safeModeDummyBda.destroy();
+            safeModeDummyBda = null;
         }
         if (atlasSampler != 0L) {
             RtContext ctx = RtContext.currentOrNull();
