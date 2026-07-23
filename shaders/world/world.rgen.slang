@@ -860,6 +860,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     // RIS emitter NEE: direct lighting from block emitters is active when lights are published and the
     // candidate count is non-zero. Off => emitters are gathered only on path hits (legacy behaviour).
     bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
+    if (risOn) {
+        printf("RIS enabled: lightCount=%u, risCandidates=%u, lightBufAddr=%u\n",
+                worldPush.lightCount, worldPush.risCandidates, worldPush.lightBufAddr);
+    }
+    // risOn = false;
     // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
     // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
     uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u

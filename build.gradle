@@ -132,9 +132,10 @@ abstract class CompileShaders extends DefaultTask {
 		def compileOneSlang = { File src, File spv, List<String> extra ->
 			execOps.exec {
 				// Embed Slang source and line mappings in SPIR-V for RenderDoc/Nsight source debugging.
+				// -O0 disables slangc's optimizer so the debugged SPIR-V matches source control flow 1:1.
 				commandLine([slangc.get(), src.absolutePath, "-target", "spirv",
 						"-profile", "spirv_1_5", "-matrix-layout-column-major",
-						"-warnings-as-errors", "all", "-warnings-disable", "41012", "-g"] + extra
+						"-warnings-as-errors", "all", "-warnings-disable", "41012", "-g", "-O0"] + extra
 						+ ["-o", spv.absolutePath])
 			}
 			validate(spv)
@@ -160,12 +161,12 @@ abstract class CompileShaders extends DefaultTask {
 			def base = outBase(src)
 			def spv = new File(scratchDir, "${base}.spv")
 			if (src.name.endsWith(".slang")) {
-				// Build both SER encodings from one source; RtDeviceBringup selects the supported variant.
+				// Build both the SER (EXT) and NO_SER (plain TraceRay) variants from one source;
+				// RtDeviceBringup selects the supported variant.
 				compileOneSlang(src, spv, base == "world.rgen"
 						? ["-capability", "spvShaderInvocationReorderEXT"] : [])
 				if (base == "world.rgen") {
-					compileOneSlang(src, new File(scratchDir, "world_nv.rgen.spv"),
-							["-capability", "spvShaderInvocationReorderNV"])
+					compileOneSlang(src, new File(scratchDir, "world_noser.rgen.spv"), ["-D", "NO_SER"])
 				}
 			} else {
 				compileOne(src, spv, [])
