@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.rt.accel;
 
+import dev.comfyfluffy.caustica.CausticaConfig;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -986,6 +987,20 @@ public final class RtAccel {
                                            List<Instance> dynamicInstances, TlasRing ring, long graphicsUse) {
         int baseCount = baseInstances.size();
         int count = Math.addExact(baseCount, dynamicInstances.size());
+        if (CausticaConfig.Rt.Safe.noTlasRing()) {
+            // Safe mode: a brand-new AS/instance-buffer/scratch every frame instead of the ring's
+            // rebuild-in-place reuse, destroyed through the timeline-gated destroy queue instead of the
+            // ring's explicit waitForGraphicsValue-before-reuse. No ringSlot to extend via markTlasUsed.
+            TlasRing.Slot fresh = createTlasSlot(ctx, Math.max(TlasRing.MIN_CAPACITY, count));
+            writeTlasInstances(baseInstances, fresh.instanceBuffer.mapped, 0);
+            writeTlasInstances(dynamicInstances, fresh.instanceBuffer.mapped, baseCount);
+            if (count > 0) {
+                fresh.instanceBuffer.flush(0L, (long) count * VkAccelerationStructureInstanceKHR.SIZEOF);
+            }
+            ctx.gpuExecutor().enqueueDestroyAfterGraphics(graphicsUse, fresh::destroy);
+            return new PreparedTlas(fresh.accel, fresh.instanceBuffer, fresh.scratch, count,
+                    "frame TLAS " + count + " instances (safe mode fresh)", null);
+        }
         TlasRing.Slot slot = ring.slots[ring.cursor];
         // Complete the slot's prior graphics use before rewriting, rebuilding, or resizing it.
         if (slot != null) {

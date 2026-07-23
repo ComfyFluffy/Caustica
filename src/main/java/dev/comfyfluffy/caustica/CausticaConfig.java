@@ -609,6 +609,14 @@ public final class CausticaConfig {
             public static final BooleanSetting NO_PUSH_RING =
                     bool("caustica.rt.safe.noPushRing", "safe.no-push-ring", false);
 
+            /** Build a brand-new TLAS (instance buffer + AS + scratch) every frame instead of rebuilding
+             *  {@code RtAccel.TlasRing}'s 4-deep ring of slots in place, destroying the previous frame's
+             *  through the timeline-gated destroy queue instead of the ring's explicit
+             *  {@code waitForGraphicsValue} before reuse. Isolates whether rebuild-in-place aliasing on a
+             *  reused AS/backing buffer is implicated, at the cost of a fresh AS build every frame. */
+            public static final BooleanSetting NO_TLAS_RING =
+                    bool("caustica.rt.safe.noTlasRing", "safe.no-tlas-ring", false);
+
             private static final boolean SINGLE_QUEUE_AT_STARTUP = SINGLE_QUEUE.value();
 
             private Safe() {
@@ -632,6 +640,10 @@ public final class CausticaConfig {
 
             public static boolean noPushRing() {
                 return NO_PUSH_RING.value();
+            }
+
+            public static boolean noTlasRing() {
+                return NO_TLAS_RING.value();
             }
         }
 
