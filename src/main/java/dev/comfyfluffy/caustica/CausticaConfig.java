@@ -602,6 +602,13 @@ public final class CausticaConfig {
              *  resource is read again after the value the destroy was gated on), not merely close. */
             public static final BooleanSetting LEAK = bool("caustica.rt.safe.leak", "safe.leak", false);
 
+            /** Allocate a fresh WorldPush buffer every frame instead of cycling {@code RtComposite}'s
+             *  6-deep ring, destroying the previous one through the timeline-gated destroy queue (see
+             *  {@link #DESTROY_MARGIN_FRAMES}/{@link #LEAK}) instead of relying on ring depth alone to
+             *  keep a slot's prior GPU read complete before it's overwritten. */
+            public static final BooleanSetting NO_PUSH_RING =
+                    bool("caustica.rt.safe.noPushRing", "safe.no-push-ring", false);
+
             private static final boolean SINGLE_QUEUE_AT_STARTUP = SINGLE_QUEUE.value();
 
             private Safe() {
@@ -621,6 +628,10 @@ public final class CausticaConfig {
 
             public static boolean leak() {
                 return LEAK.value();
+            }
+
+            public static boolean noPushRing() {
+                return NO_PUSH_RING.value();
             }
         }
 

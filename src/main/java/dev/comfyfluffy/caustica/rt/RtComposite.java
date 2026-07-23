@@ -512,7 +512,8 @@ public final class RtComposite {
                     new String[]{"world.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
                     WorldPushConstantsData.BYTE_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true);
             // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.
-            if (pushRing == null) {
+            // Safe mode (rt.safe.noPushRing) allocates a fresh buffer per frame instead, so skip the ring.
+            if (pushRing == null && !CausticaConfig.Rt.Safe.noPushRing()) {
                 pushRing = new RtBuffer[PUSH_RING];
                 for (int i = 0; i < PUSH_RING; i++) {
                     pushRing[i] = ctx.createBuffer(WORLD_PUSH_SIZE,
@@ -782,10 +783,19 @@ public final class RtComposite {
             }
 
             boolean rrDone = false;
-            // Select the next BDA ring slot; the generated WorldPushData serializer fills it once all
-            // frame-derived values (including entity addresses and block-breaking entries) are known.
-            pushSlot = (pushSlot + 1) % PUSH_RING;
-            RtBuffer pushBuf = pushRing[pushSlot];
+            // Select this frame's WorldPush buffer; the generated WorldPushData serializer fills it once
+            // all frame-derived values (including entity addresses and block-breaking entries) are known.
+            RtBuffer pushBuf;
+            if (CausticaConfig.Rt.Safe.noPushRing()) {
+                // Fresh allocation, destroyed once this exact frame's graphics use completes -- an
+                // explicit timeline-gated destroy instead of ring-depth-implies-completion.
+                pushBuf = ctx.createBuffer(WORLD_PUSH_SIZE, VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true,
+                        "rt world push (safe mode fresh)");
+                gpuExecutor.enqueueDestroyAfterGraphics(graphicsUse, pushBuf::destroy);
+            } else {
+                pushSlot = (pushSlot + 1) % PUSH_RING;
+                pushBuf = pushRing[pushSlot];
+            }
             ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
             frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert();
             // flags: PBR BRDF (bit 1, always on) + camera-in-water (so the path tracer starts in the water
