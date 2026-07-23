@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.rt;
 
+import dev.comfyfluffy.caustica.CausticaConfig;
 import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanQueue;
 import org.lwjgl.PointerBuffer;
@@ -33,9 +34,19 @@ import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ALL_COMMA
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
 
 /**
- * Single-owner asynchronous GPU submission lane on a queue reserved by Caustica at device creation.
- * Minecraft never fetches or submits to this queue index, so the executor can satisfy Vulkan's external
- * queue-synchronization rule without coordinating a host mutex with Blaze3D.
+ * Asynchronous GPU submission lane for terrain/entity acceleration-structure builds.
+ *
+ * <p>Normally this is a single-owner background thread submitting to a queue reserved by Caustica at
+ * device creation; Minecraft never fetches or submits to that queue index, so the executor satisfies
+ * Vulkan's external queue-synchronization rule without coordinating a host mutex with Blaze3D.
+ *
+ * <p>When {@link CausticaConfig.Rt.Safe#singleQueue()} is set, builds instead run on the graphics queue,
+ * driven by {@link #pumpSingleQueue()} called once per frame from the render thread. This queue is
+ * shared with Blaze3D's own submissions, which never take a host lock on it — the only reason that's
+ * safe is that every existing user of the graphics queue (see {@link RtContext#submitSync}) is confined
+ * to the render thread, so nothing else can be mid-submission concurrently. No background thread is
+ * started in this mode; {@link #renderThread} asserts the invariant so a future caller can't silently
+ * reintroduce cross-thread submission on the graphics queue.
  */
 public final class RtGpuExecutor {
     private static final int MAX_BUILD_BATCH = 32;
@@ -46,7 +57,8 @@ public final class RtGpuExecutor {
                     | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
 
     private final RtContext ctx;
-    private final VulkanQueue computeQueue;
+    private final boolean singleQueue;
+    private final VulkanQueue targetQueue;
     private final long buildTimeline;
     private final long graphicsTimeline;
     private final LinkedBlockingQueue<Job> jobs = new LinkedBlockingQueue<>();
@@ -57,6 +69,9 @@ public final class RtGpuExecutor {
     private final ArrayList<DestroyJob> destroyJobs = new ArrayList<>();
     private final Object submissionLock = new Object();
     private long submittedBuildValue;
+    // Captured unconditionally (cheap) so pumpSingleQueue() can assert it's never called off-thread —
+    // that assumption is the entire reason single-queue mode's graphics-queue submission is safe.
+    private final Thread renderThread = Thread.currentThread();
     private final Thread thread;
     private long commandPool;
     private volatile boolean closed;
@@ -64,13 +79,19 @@ public final class RtGpuExecutor {
 
     RtGpuExecutor(RtContext ctx) {
         this.ctx = ctx;
-        this.computeQueue = ctx.computeQueue();
+        this.singleQueue = CausticaConfig.Rt.Safe.singleQueue();
+        this.targetQueue = singleQueue ? ctx.graphicsQueue() : ctx.computeQueue();
         this.buildTimeline = createTimeline("RT terrain build timeline");
         this.graphicsTimeline = createTimeline("RT graphics-use timeline");
         createCommandPool();
-        this.thread = new Thread(this::run, "Caustica GPU executor");
-        this.thread.setDaemon(true);
-        this.thread.start();
+        if (singleQueue) {
+            // No background thread: builds execute inline from pumpSingleQueue() on the render thread.
+            this.thread = null;
+        } else {
+            this.thread = new Thread(this::run, "Caustica GPU executor");
+            this.thread.setDaemon(true);
+            this.thread.start();
+        }
     }
 
     /**
@@ -194,16 +215,20 @@ public final class RtGpuExecutor {
             return;
         }
         closed = true;
-        jobs.add(STOP);
-        try {
-            thread.join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while stopping RT GPU executor", e);
+        if (thread != null) {
+            jobs.add(STOP);
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while stopping RT GPU executor", e);
+            }
         }
-        // Stop and join first: waiting idle before the executor stops leaves a race where it can
-        // submit immediately after vkDeviceWaitIdle returns. The idle wait also makes graphics-side
-        // timeline semaphore use complete before those semaphores are destroyed below.
+        // Stop and join first (single-queue mode has no thread to join, and the render thread calling
+        // shutdown() can't be mid-pump concurrently with itself): waiting idle before the executor stops
+        // leaves a race where it can submit immediately after vkDeviceWaitIdle returns. The idle wait
+        // also makes graphics-side timeline semaphore use complete before those semaphores are destroyed
+        // below.
         ctx.waitIdle();
         Throwable failure = null;
         try {
@@ -240,56 +265,94 @@ public final class RtGpuExecutor {
                 }
                 continue;
             }
-            ArrayList<Job> batch = new ArrayList<>(MAX_BUILD_BATCH);
-            batch.add(first);
-            boolean stopAfterBatch = false;
-            while (batch.size() < MAX_BUILD_BATCH) {
-                Job next = jobs.poll();
-                if (next == null) {
-                    break;
-                }
-                if (next == STOP) {
-                    stopAfterBatch = true;
-                    break;
-                }
-                if (next == WAKE) {
-                    continue;
-                }
-                batch.add(next);
-            }
-
-            ArrayList<Job> executable = new ArrayList<>(batch.size());
-            for (Job job : batch) {
-                if (job.cancelled.getAsBoolean()) {
-                    finishJob(job, new CancellationException("RT GPU job epoch is stale"));
-                } else {
-                    executable.add(job);
-                }
-            }
-            if (!executable.isEmpty()) {
-                try {
-                    execute(executable);
-                    for (Job job : executable) {
-                        finishJob(job, null);
-                    }
-                } catch (Throwable t) {
-                    for (Job job : executable) {
-                        finishJob(job, t);
-                    }
-                }
-            }
-            if (!processDestroyJobsSafely()) {
-                failQueuedJobs(executorFailure);
-                return;
-            }
-            if (executorFailure != null) {
-                failQueuedJobs(executorFailure);
-                return;
-            }
-            if (stopAfterBatch) {
+            if (!runBatchStartingWith(first)) {
                 return;
             }
         }
+    }
+
+    /** Render-thread pump for single-queue safe mode: drains every currently queued build, executing
+     *  each batch synchronously on the graphics queue, then processes any pending destroys. No-op unless
+     *  {@link CausticaConfig.Rt.Safe#singleQueue()} is set. Call once per frame, before any code that
+     *  depends on this frame's terrain/entity build results. */
+    public void pumpSingleQueue() {
+        if (!singleQueue) {
+            return;
+        }
+        if (Thread.currentThread() != renderThread) {
+            throw new IllegalStateException(
+                    "pumpSingleQueue() must run on the render thread that owns the graphics queue");
+        }
+        checkExecutorFailure();
+        while (true) {
+            Job first = jobs.poll();
+            if (first == null) {
+                break;
+            }
+            if (first == WAKE) {
+                continue;
+            }
+            // STOP never appears here: shutdown() in single-queue mode has no thread to stop and drains
+            // synchronously on this same thread instead.
+            if (!runBatchStartingWith(first)) {
+                return;
+            }
+        }
+        if (!processDestroyJobsSafely()) {
+            failQueuedJobs(executorFailure);
+        }
+    }
+
+    /** Collect a batch starting with {@code first}, execute it, then process pending destroys. Returns
+     *  false if the caller should stop (a failure just latched, or a STOP sentinel was drained). */
+    private boolean runBatchStartingWith(Job first) {
+        ArrayList<Job> batch = new ArrayList<>(MAX_BUILD_BATCH);
+        batch.add(first);
+        boolean stopAfterBatch = false;
+        while (batch.size() < MAX_BUILD_BATCH) {
+            Job next = jobs.poll();
+            if (next == null) {
+                break;
+            }
+            if (next == STOP) {
+                stopAfterBatch = true;
+                break;
+            }
+            if (next == WAKE) {
+                continue;
+            }
+            batch.add(next);
+        }
+
+        ArrayList<Job> executable = new ArrayList<>(batch.size());
+        for (Job job : batch) {
+            if (job.cancelled.getAsBoolean()) {
+                finishJob(job, new CancellationException("RT GPU job epoch is stale"));
+            } else {
+                executable.add(job);
+            }
+        }
+        if (!executable.isEmpty()) {
+            try {
+                execute(executable);
+                for (Job job : executable) {
+                    finishJob(job, null);
+                }
+            } catch (Throwable t) {
+                for (Job job : executable) {
+                    finishJob(job, t);
+                }
+            }
+        }
+        if (!processDestroyJobsSafely()) {
+            failQueuedJobs(executorFailure);
+            return false;
+        }
+        if (executorFailure != null) {
+            failQueuedJobs(executorFailure);
+            return false;
+        }
+        return !stopAfterBatch;
     }
 
     private void finishJob(Job job, Throwable failure) {
@@ -399,10 +462,15 @@ public final class RtGpuExecutor {
                     .stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR);
             VkSubmitInfo2.Buffer submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(command).pSignalSemaphoreInfos(signal);
-            VulkanDiagnostics.noteQueueSubmission(computeQueue.vkQueue(), "Caustica compute queue");
+            VulkanDiagnostics.noteQueueSubmission(targetQueue.vkQueue(),
+                    singleQueue ? "Caustica RT builds (single-queue safe mode)" : "Caustica compute queue");
+            // The lock is a no-op in the default (dedicated-thread/compute-queue) mode since nothing else
+            // touches that queue. In single-queue mode targetQueue is the graphics queue, which
+            // RtContext.submitSync also uses without this lock — safe only because both are asserted
+            // render-thread-only (see renderThread above), never concurrent with each other.
             synchronized (ctx.deviceQueueHostLock()) {
                 RtContext.check(org.lwjgl.vulkan.KHRSynchronization2.vkQueueSubmit2KHR(
-                        computeQueue.vkQueue(), submit, 0L), "vkQueueSubmit2KHR(RT GPU executor)");
+                        targetQueue.vkQueue(), submit, 0L), "vkQueueSubmit2KHR(RT GPU executor)");
             }
             submitted = true;
             synchronized (submissionLock) {
@@ -446,7 +514,7 @@ public final class RtGpuExecutor {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandPoolCreateInfo ci = VkCommandPoolCreateInfo.calloc(stack).sType$Default()
                     .flags(VK10.VK_COMMAND_POOL_CREATE_TRANSIENT_BIT)
-                    .queueFamilyIndex(computeQueue.queueFamilyIndex());
+                    .queueFamilyIndex(targetQueue.queueFamilyIndex());
             LongBuffer out = stack.mallocLong(1);
             RtContext.check(VK10.vkCreateCommandPool(ctx.vk(), ci, null, out), "vkCreateCommandPool(RT GPU executor)");
             commandPool = out.get(0);

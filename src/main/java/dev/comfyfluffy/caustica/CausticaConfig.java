@@ -572,6 +572,32 @@ public final class CausticaConfig {
             }
         }
 
+        /** Diagnostic levers that trade performance for a smaller, easier-to-bisect UB surface. Each
+         *  is a startup-frozen switch (like {@link Hdr#ENABLED}): the resource/thread architecture they
+         *  pick between is fixed at RtContext/executor construction, so a live toggle only takes effect
+         *  after restart. */
+        public static final class Safe {
+            /** Route terrain/entity BLAS builds through the render thread onto the graphics queue
+             *  instead of the dedicated async-compute queue + background executor thread. Removes
+             *  cross-queue timeline sync and the background thread's queue ownership entirely, at the
+             *  cost of the render thread blocking on each build. */
+            public static final BooleanSetting SINGLE_QUEUE =
+                    bool("caustica.rt.safe.singleQueue", "safe.single-queue", false);
+
+            private static final boolean SINGLE_QUEUE_AT_STARTUP = SINGLE_QUEUE.value();
+
+            private Safe() {
+            }
+
+            public static boolean singleQueue() {
+                return SINGLE_QUEUE_AT_STARTUP;
+            }
+
+            public static boolean singleQueuePendingRestart() {
+                return SINGLE_QUEUE.value() != SINGLE_QUEUE_AT_STARTUP;
+            }
+        }
+
         /** RIS block-emitter lights. {@code ris-candidates = 0} disables everything. */
         public static final class Lights {
             public static final IntSetting RIS_CANDIDATES =

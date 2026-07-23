@@ -419,6 +419,10 @@ public final class RtComposite {
             return false;
         }
         ctx.gpuExecutor().throwIfFailed();
+        // No-op unless rt.safe.singleQueue is set; otherwise drains and executes queued terrain/entity
+        // builds synchronously on the graphics queue, on this thread, before anything below can consume
+        // their results.
+        ctx.gpuExecutor().pumpSingleQueue();
         // Count-bounded terrain streaming (dispatch/drain/build kick) runs here once per render frame — before
         // the ready gate below, because it is what MAKES terrain ready during the initial fill.
         try {

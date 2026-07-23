@@ -196,6 +196,10 @@ public final class RtContext {
         return computeQueue;
     }
 
+    VulkanQueue graphicsQueue() {
+        return graphicsQueue;
+    }
+
     Object deviceQueueHostLock() {
         return deviceQueueHostLock;
     }
