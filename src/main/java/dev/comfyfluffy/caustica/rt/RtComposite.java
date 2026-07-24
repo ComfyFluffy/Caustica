@@ -37,6 +37,7 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.KHRSynchronization2;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VkBufferImageCopy;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDependencyInfo;
 import org.lwjgl.vulkan.VkImageBlit;
@@ -94,7 +95,17 @@ public final class RtComposite {
     // Real inline push constants (fast constant-bank reads), separate from the WorldPush BDA ring above.
     // Hot addresses/frameIndex and raygen's debugView avoid unnecessary global-memory dereferences;
     // WorldPushConstantsData is generated from the same Slang module and owns this second ABI as well.
-    private static final int GUIDE_COUNT = 6; // RR guide buffers bound at world-pipeline bindings 3..8
+    // RR guide buffers bound at world-pipeline bindings 3..8 (extra-storage-image slots 0..5), plus one
+    // more slot (6, binding 9) for the RIS light-record texture experiment -- see lightTextureImage.
+    // Unlike the rt.safe.* levers, this isn't a runtime toggle: world.rgen.slang unconditionally declares
+    // and reads the binding 9 image (Slang has no way to branch on a Java-side flag), so the pipeline
+    // layout must unconditionally reserve it too, or shader/layout mismatch breaks pipeline creation.
+    private static final int GUIDE_COUNT = 7;
+    private static final int LIGHT_TEXTURE_SLOT = 6;
+    // Fixed capacity so the image is created + bound exactly once at pipeline bring-up and never resized
+    // -- setExtraStorageImage rewrites every ring descriptor slot at once and its own doc comment
+    // restricts that to init/resize/idle, not the arbitrary times lights regenerate.
+    private static final int LIGHT_TEXTURE_CAPACITY = 65536;
     private static int debugView() {
         return CausticaConfig.Rt.Composite.DEBUG_VIEW.value();
     }
@@ -235,6 +246,11 @@ public final class RtComposite {
     private RtImage gMotion;
     private RtImage gSpecAlbedo;
     private RtImage gSpecMotion;
+    // RIS Light-record texture experiment (see docs/SAFE_MODE_BISECT.md): fixed-capacity
+    // (LIGHT_TEXTURE_CAPACITY) RGBA32F image, 3 texels wide (posArea/halfULe/halfVSection columns) per
+    // light row. Created + bound once at pipeline bring-up (see ensureWorld); refreshed via a blocking
+    // submitSync copy every frame in composite() (see refreshLightTexture), before recordFrame.
+    private RtImage lightTextureImage;
     // Display-res RT image the display mapper reads: DLSS-RR writes it (render -> display denoise+upscale), or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
@@ -478,6 +494,7 @@ public final class RtComposite {
             }
             refreshMaterialBindingsIfNeeded(ctx);
             updateMotion();
+            refreshLightTexture(ctx);
             recordFrame(ctx, active, nativeColor);
             if (!loggedActive) {
                 loggedActive = true;
@@ -534,9 +551,18 @@ public final class RtComposite {
                             VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt world push " + i);
                 }
             }
+            // Created + bound exactly once here, never resized/rebound again for this pipeline's lifetime
+            // -- see LIGHT_TEXTURE_CAPACITY's comment for why.
+            if (lightTextureImage == null) {
+                lightTextureImage = ctx.createStorageImage(3, LIGHT_TEXTURE_CAPACITY,
+                        VK10.VK_FORMAT_R32G32B32A32_SFLOAT, "rt light record texture");
+            }
             if (output != null) {
                 worldPipeline.setStorageImage(output.view);
                 bindGuideImages();
+                if (lightTextureImage != null) {
+                    worldPipeline.setExtraStorageImage(LIGHT_TEXTURE_SLOT, lightTextureImage.view);
+                }
             }
             bindWorldTextures(ctx, !pipelineOnlyRebindPending);
             reloadRebindRequested = false;
@@ -558,6 +584,7 @@ public final class RtComposite {
         ctx.waitIdle();
         worldPipeline.destroy();
         worldPipeline = null;
+        destroyLightTextureImage();
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
     }
@@ -579,6 +606,7 @@ public final class RtComposite {
         ctx.waitIdle();
         worldPipeline.destroy();
         worldPipeline = null;
+        destroyLightTextureImage();
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
         pipelineOnlyRebindPending = true;
@@ -684,6 +712,7 @@ public final class RtComposite {
             if (worldPipeline != null) {
                 worldPipeline.destroy();
                 worldPipeline = null;
+                destroyLightTextureImage();
                 bindlessTextureCapacity = 0;
             }
             RtMaterialRegistry.INSTANCE.destroy();
@@ -701,6 +730,53 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(3, gMotion.view);
         worldPipeline.setExtraStorageImage(4, gSpecAlbedo.view);
         worldPipeline.setExtraStorageImage(5, gSpecMotion.view);
+    }
+
+    /** RIS Light-record texture experiment: refresh lightTextureImage's contents from whatever this
+     *  frame's published light arena holds, via a fully blocking copy -- called once per frame, before
+     *  recordFrame opens its own transient command buffer, specifically so this uses its own independent
+     *  submission and there's no question of interleaving with that one. ctx.waitIdle() here (on top of
+     *  submitSync's own per-submission fence wait) is deliberately heavy-handed: it removes any doubt
+     *  about whether a still-in-flight previous frame could still be reading this same image when this
+     *  frame overwrites it, at the cost this experiment already accepts (a real per-frame stall; not
+     *  shippable -- see docs/SAFE_MODE_BISECT.md). */
+    private void refreshLightTexture(RtContext ctx) {
+        if (lightTextureImage == null) {
+            return;
+        }
+        RtTerrain terrain = RtTerrain.currentOrNull();
+        if (terrain == null) {
+            return;
+        }
+        int lightCount = terrain.lightCount();
+        long srcHandle = terrain.lightBufferHandle();
+        if (lightCount <= 0 || srcHandle == 0L) {
+            return;
+        }
+        int rows = Math.min(lightCount, LIGHT_TEXTURE_CAPACITY);
+        ctx.waitIdle();
+        ctx.submitSync(cmd -> {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
+                region.get(0).bufferOffset(0L).bufferRowLength(0).bufferImageHeight(0);
+                region.get(0).imageSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(0).baseArrayLayer(0).layerCount(1);
+                region.get(0).imageOffset().set(0, 0, 0);
+                region.get(0).imageExtent().set(3, rows, 1);
+                VK10.vkCmdCopyBufferToImage(cmd, srcHandle, lightTextureImage.image,
+                        VK10.VK_IMAGE_LAYOUT_GENERAL, region);
+            }
+        });
+    }
+
+    /** lightTextureImage is pipeline-lifetime (its binding index depends on GUIDE_COUNT/extra-storage-
+     *  image layout), not resolution-dependent -- destroyed alongside worldPipeline itself, never on a
+     *  plain resize (see ensureOutput/destroyGuideImages, which are resolution-driven and unrelated). */
+    private void destroyLightTextureImage() {
+        if (lightTextureImage != null) {
+            lightTextureImage.destroy();
+            lightTextureImage = null;
+        }
     }
 
     private void destroyGuideImages() {
@@ -1322,6 +1398,7 @@ public final class RtComposite {
             worldPipeline.destroy();
             worldPipeline = null;
         }
+        destroyLightTextureImage();
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
         materialEpochTraceGate = false;

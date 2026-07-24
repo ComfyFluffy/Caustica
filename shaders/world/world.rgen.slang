@@ -34,6 +34,14 @@ import world_common;
 [[vk::binding(6, 0)]] [format("rg16f")]   RWTexture2D<float2> gMotion;     // screen-space motion (render px)
 [[vk::binding(7, 0)]] [format("rgba16f")] RWTexture2D<float4> gSpecAlbedo; // specular albedo (0 — diffuse-only)
 [[vk::binding(8, 0)]] [format("rg16f")]   RWTexture2D<float2> gSpecMotion; // reflection MVs for RR
+// RIS Light-record texture experiment (see docs/SAFE_MODE_BISECT.md): 3 texels wide (posArea/halfULe/
+// halfVSection columns), one row per light. Two prior reshapes of the equivalent BDA-indexed pointer
+// load (struct load -> three float4 loads; then indexed-array -> scalar-address-plus-fixed-offset
+// pointers) did not avoid the traced Ampere background-recompile miscompile; this tests whether routing
+// through the texture unit instead of a generic PhysicalStorageBuffer load does. Filled by
+// RtComposite#refreshLightTexture every frame via a buffer-to-image copy from the same bytes
+// worldPush.lightBufAddr would otherwise point at.
+[[vk::binding(9, 0)]] [format("rgba32f")] RWTexture2D<float4> gLightData;
 
 // Per-frame push data loaded once from the BDA buffer at the top of main() (same pattern as the GLSL
 // `worldPush` global). Layout constants generated from this module's SPIR-V — see world_common.WorldPush.
@@ -631,18 +639,17 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
         uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
         bool useLocal = hasGridCell && globalsAfter == globalsBefore;
         selectLightGridLight(gridCell, useLocal, proposalSeed, li);
-        // Same bytes as a single struct-typed ConstPtr<Light>(lightBufAddr)[li] load. Reshaping the load
-        // WIDTH alone (one 48-byte struct load -> three float4 loads via array-subscript indexing on a
-        // shared pointer) did NOT avoid the Ampere background-recompile miscompile traced to this line
-        // (see docs/SAFE_MODE_BISECT.md) -- so this instead reshapes the ADDRESS computation: the per-
-        // candidate record address is computed once as a scalar uint64_t, then each field is its own
-        // pointer constructed at a fixed +0/+16/+32 byte offset from that address and dereferenced at a
-        // literal index 0, instead of array-subscripting a shared pointer by a multiplied dynamic index.
-        uint64_t lightAddr = worldPush.lightBufAddr + uint64_t(li) * uint64_t(48);
+        // Same bytes as ConstPtr<Light>(lightBufAddr)[li]. Two prior reshapes of that BDA-indexed pointer
+        // load (struct -> three float4 loads; then indexed-array -> scalar-address-plus-fixed-offset
+        // pointers) did not avoid the traced Ampere background-recompile miscompile (see
+        // docs/SAFE_MODE_BISECT.md) -- this instead routes the load through the texture unit (gLightData,
+        // a storage image RtComposite#refreshLightTexture keeps in sync with the same bytes lightBufAddr
+        // points at) instead of a generic PhysicalStorageBuffer dereference.
+        int row = int(li);
         Light lg;
-        lg.posArea = ConstPtr<float4>(lightAddr)[0];
-        lg.halfULe = ConstPtr<float4>(lightAddr + uint64_t(16))[0];
-        lg.halfVSection = ConstPtr<float4>(lightAddr + uint64_t(32))[0];
+        lg.posArea = gLightData[int2(0, row)];
+        lg.halfULe = gLightData[int2(1, row)];
+        lg.halfVSection = gLightData[int2(2, row)];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
         float t = rndf(seed) * 2.0 - 1.0;

@@ -239,6 +239,15 @@ public final class RtTerrain {
         return lightGrid.published().lightAddress();
     }
 
+    /** Raw VkBuffer handle backing the currently published light arena (0 while no lights are
+     *  published). rt.safe.lightTexture diagnostic only: lets the render thread vkCmdCopyBufferToImage
+     *  the same bytes lightBufferAddress() points at, into a texture, without needing a second copy of
+     *  the light data or reaching into RtLightGridManager internals from outside the terrain package. */
+    public long lightBufferHandle() {
+        RtBuffer arena = lightGrid.published().arena();
+        return arena != null ? arena.handle : 0L;
+    }
+
     /** Power-weighted light alias table device address, or 0 for the shader's uniform fallback. */
     public long lightAliasBufferAddress() {
         return lightGrid.published().globalAliasAddress();
