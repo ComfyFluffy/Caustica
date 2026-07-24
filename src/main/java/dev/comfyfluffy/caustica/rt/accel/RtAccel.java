@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.rt.accel;
 
+import dev.comfyfluffy.caustica.CausticaConfig;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -333,7 +334,10 @@ public final class RtAccel {
 
         private void freeTransientBuildResources() {
             scratch.destroy();
-            if (opacityMicromap != null) {
+            // caustica.rt.ommKeepBuildInputs: when set, the micromap's inputs are left alive until the
+            // micromap itself is destroyed (OpacityMicromap#destroy still frees them), so this bounds the
+            // extra memory to resident sections rather than leaking unboundedly.
+            if (opacityMicromap != null && !CausticaConfig.Rt.Omm.KEEP_BUILD_INPUTS.value()) {
                 opacityMicromap.freeBuildInputs();
             }
         }

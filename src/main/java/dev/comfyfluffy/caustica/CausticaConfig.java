@@ -593,6 +593,18 @@ public final class CausticaConfig {
                     clampedInt("caustica.rt.ommSubdivision", "omm.subdivision", 4, 0, 6);
             public static final BooleanSetting STATS = bool("caustica.rt.ommStats", "omm.stats", false);
 
+            /** Diagnostic: keep each micromap's build inputs (opacity data, triangle array, scratch)
+             *  alive for the whole lifetime of the micromap instead of freeing them as soon as the build
+             *  completes. Per spec a built micromap is self-contained in its own storage, so freeing the
+             *  inputs afterwards is legal -- but if a driver's micromap implementation retains references
+             *  into the input data buffer, freeing it is a use-after-free that validation cannot see and
+             *  that accumulates as section builds recycle the memory. Turning this on trades memory for
+             *  ruling that out; see docs/NVIDIA_BUG_REPORT.md. Note this class of lifetime bug is NOT
+             *  covered by any deferred-destroy/leak lever, because freeBuildInputs destroys these buffers
+             *  directly rather than through RtGpuExecutor's destroy queue. */
+            public static final BooleanSetting KEEP_BUILD_INPUTS =
+                    bool("caustica.rt.ommKeepBuildInputs", "omm.keep-build-inputs", false);
+
             private Omm() {
             }
         }
