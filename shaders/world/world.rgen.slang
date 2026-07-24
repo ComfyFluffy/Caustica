@@ -631,14 +631,18 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
         uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
         bool useLocal = hasGridCell && globalsAfter == globalsBefore;
         selectLightGridLight(gridCell, useLocal, proposalSeed, li);
-        // Same bytes as a single struct-typed ConstPtr<Light>(...)[li] load, but shaped as three
-        // consecutive float4 loads at explicit offsets — the struct-typed indexed load was the second
-        // construct traced to the Ampere background-recompile miscompile (see docs/SAFE_MODE_BISECT.md).
-        ConstPtr<float4> lightF4 = ConstPtr<float4>(worldPush.lightBufAddr);
+        // Same bytes as a single struct-typed ConstPtr<Light>(lightBufAddr)[li] load. Reshaping the load
+        // WIDTH alone (one 48-byte struct load -> three float4 loads via array-subscript indexing on a
+        // shared pointer) did NOT avoid the Ampere background-recompile miscompile traced to this line
+        // (see docs/SAFE_MODE_BISECT.md) -- so this instead reshapes the ADDRESS computation: the per-
+        // candidate record address is computed once as a scalar uint64_t, then each field is its own
+        // pointer constructed at a fixed +0/+16/+32 byte offset from that address and dereferenced at a
+        // literal index 0, instead of array-subscripting a shared pointer by a multiplied dynamic index.
+        uint64_t lightAddr = worldPush.lightBufAddr + uint64_t(li) * uint64_t(48);
         Light lg;
-        lg.posArea = lightF4[li * 3u];
-        lg.halfULe = lightF4[li * 3u + 1u];
-        lg.halfVSection = lightF4[li * 3u + 2u];
+        lg.posArea = ConstPtr<float4>(lightAddr)[0];
+        lg.halfULe = ConstPtr<float4>(lightAddr + uint64_t(16))[0];
+        lg.halfVSection = ConstPtr<float4>(lightAddr + uint64_t(32))[0];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
         float t = rndf(seed) * 2.0 - 1.0;
