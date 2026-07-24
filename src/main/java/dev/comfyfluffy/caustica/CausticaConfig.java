@@ -620,17 +620,20 @@ public final class CausticaConfig {
             /** Back every "0 = not published" light-buffer BDA sentinel (lightBufAddr, lightAliasAddr,
              *  lightLocalAliasAddr, lightGridCellAddr, lightGridSpanAddr) with a small zeroed dummy
              *  buffer instead of the literal address 0 whenever no light data is published this frame.
-             *  Diagnostic only, NOT a permanent hardening: the shader's real "is this present" gate stays
-             *  on lightCount/hasGrid at the source level (unaffected by this), so with this on those
-             *  branches are still logically skipped in ordinary (non-speculative) execution -- this only
-             *  removes address 0 as the base of any load a driver's ISA compiler might still speculate
-             *  past those branches. If corruption survives every ring-removal lever above but disappears
-             *  with this on, the driver is speculating a load through a stale/null light-buffer address
-             *  on the RIS path specifically. Leave off by default: it changes what a mispredicted/
-             *  speculated load actually reads, which is exactly the point, but that's a real (if
-             *  extremely unlikely to matter) behavior change worth keeping opt-in. */
+             *
+             *  Originally added (and defaulted off) as a diagnostic-only lever to test whether an Ampere
+             *  driver background-recompile miscompile was speculating a load through address 0 past the
+             *  shader's lightCount/hasGrid gate. Root cause confirmed instead to be conditionally-executed
+             *  (branchy) indexed PhysicalStorageBuffer loads inside the RIS candidate loop specifically —
+             *  see docs/SAFE_MODE_BISECT.md and world.rgen.slang's selectLightGridLight. The fix reshapes
+             *  those loads to execute unconditionally every candidate (branch-free load + select), which
+             *  means world.rgen.slang's selectLightGridLight/selectLightGridSpanLight/selectSectionLight
+             *  now genuinely dereference lightGridSpanAddr/lightLocalAliasAddr on every RIS candidate,
+             *  including when no light grid is published. Defaulted ON: this is now a real correctness
+             *  requirement for RIS, not merely a diagnostic experiment — turning it off with RIS enabled
+             *  will null-deref on any world where the light grid hasn't published yet. */
             public static final BooleanSetting NO_NULL_BDA =
-                    bool("caustica.rt.safe.noNullBda", "safe.no-null-bda", false);
+                    bool("caustica.rt.safe.noNullBda", "safe.no-null-bda", true);
 
             /** Skip {@code RtEntities}' rigid-reuse fast path (re-referencing a previously built entity
              *  BLAS through just an instance transform, with no rebuild, whenever this frame's pose is a

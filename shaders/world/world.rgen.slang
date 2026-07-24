@@ -584,11 +584,18 @@ void selectLightGridSpanLight(LightGridCell cell, inout uint proposalSeed,
 // Light48 load: section power cancels with the section-local light PDF.
 void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposalSeed,
                           out uint lightIndex) {
-    // if (useLocal) {
-        selectLightGridSpanLight(cell, proposalSeed, lightIndex);
-    // } else {
-        selectGlobalLight(proposalSeed, lightIndex);
-    // }
+    // Both chains always execute (a select picks the result) rather than branching around one of the
+    // two BDA loads below — an NVIDIA Ampere driver background-recompile miscompile was traced to a
+    // conditionally-executed indexed PhysicalStorageBuffer load inside this candidate loop (see
+    // docs/SAFE_MODE_BISECT.md); branch-free load + select avoided it in testing. cell.spanCount is 0
+    // whenever !useLocal (findLightGridCell zero-inits it before any early return), so the local chain's
+    // result is well-defined-but-discarded garbage in that case — safe only because every 0-valued BDA
+    // sentinel it touches (lightGridSpanAddr, lightLocalAliasAddr) is guaranteed backed by a real (dummy,
+    // zeroed) allocation; see CausticaConfig.Rt.Safe.NO_NULL_BDA, required (not just diagnostic) here.
+    uint localIndex, globalIndex;
+    selectLightGridSpanLight(cell, proposalSeed, localIndex);
+    selectGlobalLight(proposalSeed, globalIndex);
+    lightIndex = useLocal ? localIndex : globalIndex;
 }
 
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
@@ -600,12 +607,13 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
     LightGridCell gridCell;
     int3 gridCellCoord;
     float3 gridLookup = hitPos;
-    // if (worldPush.lightGridCellAddr != 0) {
-        // Stochastically blend across hard section boundaries. Every cell proposal retains full global
-        // support, so conditioning on this independently jittered lookup remains unbiased.
-        gridLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
-                * worldPush.lightGridOrigin.w;
-    // }
+    // Stochastically blend across hard section boundaries. Every cell proposal retains full global
+    // support, so conditioning on this independently jittered lookup remains unbiased. Applied
+    // unconditionally (harmless when there's no grid: findLightGridCell's own cellAddr==0 check below
+    // still short-circuits it) rather than guarded by lightGridCellAddr != 0, for the same
+    // branch-around-a-later-load reason documented on selectLightGridLight above.
+    gridLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
+            * worldPush.lightGridOrigin.w;
     bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
     uint candidateCount = worldPush.risCandidates;
     // Deterministically stratify the proposal mixture. At the default M=8 this schedules exactly six
@@ -614,7 +622,6 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
     // candidate; M=1 is global-only so the estimator retains full support.
     uint globalCandidateCount = hasGridCell
             ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
-    // uint globalCandidateCount = 1u;
     uint localCandidateCount = candidateCount - globalCandidateCount;
     float localProbability = float(localCandidateCount) / float(candidateCount);
     for (uint c = 0u; c < candidateCount; c++) {
@@ -624,11 +631,14 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
         uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
         bool useLocal = hasGridCell && globalsAfter == globalsBefore;
         selectLightGridLight(gridCell, useLocal, proposalSeed, li);
-        // Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
+        // Same bytes as a single struct-typed ConstPtr<Light>(...)[li] load, but shaped as three
+        // consecutive float4 loads at explicit offsets — the struct-typed indexed load was the second
+        // construct traced to the Ampere background-recompile miscompile (see docs/SAFE_MODE_BISECT.md).
+        ConstPtr<float4> lightF4 = ConstPtr<float4>(worldPush.lightBufAddr);
         Light lg;
-        lg.halfULe = float4(0.0, 0.0, 0.0, 0.0);
-        lg.halfVSection = float4(0.0, 0.0, 0.0, 0.0);
-        lg.posArea = float4(0.0, 0.0, 0.0, 0.0);
+        lg.posArea = lightF4[li * 3u];
+        lg.halfULe = lightF4[li * 3u + 1u];
+        lg.halfVSection = lightF4[li * 3u + 2u];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
         float t = rndf(seed) * 2.0 - 1.0;
