@@ -643,6 +643,16 @@ public final class CausticaConfig {
             public static final BooleanSetting NO_ENTITY_RIGID_REUSE =
                     bool("caustica.rt.safe.noEntityRigidReuse", "safe.no-entity-rigid-reuse", false);
 
+            /** Build the world ray-tracing pipeline with {@code VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT}
+             *  set, so captured shader disassembly (RenderDoc/Nsight) matches source control flow more
+             *  closely instead of the driver's optimized codegen, at the cost of slower shaders. Pairs with
+             *  slangc's {@code -O0} (see {@code build.gradle}) and the {@code -g} debug info already
+             *  embedded in every compiled shader. Read live at pipeline-build time (not frozen at startup
+             *  like {@link #SINGLE_QUEUE}), so it takes effect on the next {@link RtDeviceBringup} pipeline
+             *  rebuild — see {@code RtComposite.recreateWorldPipeline()} for an in-game trigger. */
+            public static final BooleanSetting NO_PIPELINE_OPTIMIZATION =
+                    bool("caustica.rt.safe.noPipelineOptimization", "safe.no-pipeline-optimization", false);
+
             private static final boolean SINGLE_QUEUE_AT_STARTUP = SINGLE_QUEUE.value();
 
             private Safe() {
@@ -678,6 +688,10 @@ public final class CausticaConfig {
 
             public static boolean noEntityRigidReuse() {
                 return NO_ENTITY_RIGID_REUSE.value();
+            }
+
+            public static boolean noPipelineOptimization() {
+                return NO_PIPELINE_OPTIMIZATION.value();
             }
         }
 

@@ -1,4 +1,7 @@
 {
+	"key.category.caustica.caustica": "Caustica",
+	"key.caustica.recreateWorldPipeline": "Recreate World RT Pipeline",
+
 	"caustica.options.rt.header": "Ray Tracing",
 
 	"caustica.options.rt.exposureMode": "Exposure",

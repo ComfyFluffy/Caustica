@@ -163,6 +163,10 @@ public final class RtComposite {
     // boundBlockAlbedoAtlasHandle to a fresh non-zero value (MC's deferred free keeps the old handle live for a few
     // frames, so "handle != 0" alone isn't enough to tell old from new).
     private volatile boolean reloadRebindRequested;
+    // Set by recreateWorldPipeline(): the next ensureWorld() rebuild should re-point the fresh pipeline's
+    // descriptor sets at whatever's already prepared (atlas/material pages/entity textures unchanged)
+    // instead of running bindWorldTextures' full material-table rebuild — so it does NOT clear terrain.
+    private volatile boolean pipelineOnlyRebindPending;
     // The block-atlas view handle currently bound into the world pipeline (set by bindWorldTextures).
     private long boundBlockAlbedoAtlasHandle;
     private int bindlessTextureCapacity;
@@ -534,8 +538,9 @@ public final class RtComposite {
                 worldPipeline.setStorageImage(output.view);
                 bindGuideImages();
             }
-            bindWorldTextures(ctx);
+            bindWorldTextures(ctx, !pipelineOnlyRebindPending);
             reloadRebindRequested = false;
+            pipelineOnlyRebindPending = false;
         }
         // The TLAS is rebuilt and bound per frame in recordFrame since dynamic entity content animates
         // the instance set every frame.
@@ -558,26 +563,69 @@ public final class RtComposite {
     }
 
     /**
-     * Resolve + bind every world-pipeline texture: the block atlas (binding 2 + bindless fallback slot 0)
-     * and the canonical material page bundles in reserved bindless slots. Shared by first creation and
-     * the post-reload rebind. Resets the entity bindless registry, recreates material pages, builds
-     * the shared material registry, and invalidates old-epoch geometry before tracing resumes.
+     * Force the world ray-tracing pipeline to be torn down and rebuilt from scratch on the next frame —
+     * an easy in-game trigger to pick up freshly recompiled shader SPIR-V (e.g. after a
+     * {@code compileShaders} rerun, or flipping {@code caustica.rt.safe.noPipelineOptimization}) without
+     * restarting Minecraft. Unlike {@link #refreshPipelineShapeIfNeeded} (which also runs on a genuine
+     * bindless-capacity change), the block atlas and material tables are assumed unchanged here, so the
+     * rebuild only re-points the fresh pipeline's descriptor sets at what's already prepared — no
+     * material-table rebuild, no {@link RtTerrain#requestFullClear()}. A no-op if RT isn't up yet.
      */
+    public void recreateWorldPipeline() {
+        RtContext ctx = RtContext.currentOrNull();
+        if (ctx == null || worldPipeline == null) {
+            return;
+        }
+        ctx.waitIdle();
+        worldPipeline.destroy();
+        worldPipeline = null;
+        bindlessTextureCapacity = 0;
+        materialBindingsReady = false;
+        pipelineOnlyRebindPending = true;
+        CausticaMod.LOGGER.info(
+                "Caustica: world RT pipeline destroyed; rebuilding on next frame (no terrain reload)");
+    }
+
     private void bindWorldTextures(RtContext ctx) {
+        bindWorldTextures(ctx, true);
+    }
+
+    /**
+     * Resolve + bind every world-pipeline texture: the block atlas (binding 2 + bindless fallback slot 0)
+     * and the canonical material page bundles in reserved bindless slots. Shared by first creation, the
+     * post-reload rebind, and {@link #recreateWorldPipeline()}'s pipeline-only rebind.
+     *
+     * @param fullRebuild when true (first creation / resource reload), also resets + reprepares
+     *                    {@link RtBlockMaterials}, rebuilds {@link RtMaterialRegistry}, and drops terrain
+     *                    as a unit ({@link RtTerrain#requestFullClear()}) so old-epoch atlas UVs/material
+     *                    IDs never render against the new table. When false (pipeline-only recreate: same
+     *                    atlas, same materials — just a fresh {@code VkPipeline}/descriptor sets), skips
+     *                    all of that and only re-writes descriptors against what's already prepared.
+     */
+    private void bindWorldTextures(RtContext ctx, boolean fullRebuild) {
         long sampler = atlasSampler(ctx);
         long atlasView = blockAlbedoAtlasView();
         boundBlockAlbedoAtlasHandle = atlasView; // remember what we bound so a reload can detect the new atlas
         worldPipeline.setBlockAlbedoAtlas(atlasView, sampler);
         // Bindless slot 0 = fallback texture (the block atlas) so an entity whose texture can't be
         // resolved samples something defined rather than an unbound (partially-bound) descriptor.
-        RtBlockMaterials.INSTANCE.reset();
-        RtMaterialOverrides materialOverrides = RtMaterialOverrides.load();
-        RtEmissionSemantics emissionSemantics = RtEmissionSemantics.analyze();
-        RtBlockMaterials.INSTANCE.prepareAll(ctx, bindlessTextureCapacity, emissionSemantics, materialOverrides);
+        RtMaterialOverrides materialOverrides = null;
+        if (fullRebuild) {
+            RtBlockMaterials.INSTANCE.reset();
+            materialOverrides = RtMaterialOverrides.load();
+            RtEmissionSemantics emissionSemantics = RtEmissionSemantics.analyze();
+            RtBlockMaterials.INSTANCE.prepareAll(ctx, bindlessTextureCapacity, emissionSemantics, materialOverrides);
+        }
+        // Bindless slots are per-pipeline (a fresh pipeline's descriptor set starts empty), so this always
+        // resets the registry — but it's an in-memory cache reset only; already-drawn entities simply
+        // re-queue their texture for upload (RtEntityTextures#uploadPending) the next time they render, no
+        // terrain/material-table implications either way.
         RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity);
         worldPipeline.setEntityAlbedoTexture(0, atlasView, sampler);
         RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler);
-        RtMaterialRegistry.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, materialOverrides);
+        if (fullRebuild) {
+            RtMaterialRegistry.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, materialOverrides);
+        }
         materialBindingsReady = true;
         // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
         // handle is stable across frames; the shader only samples it inside the sun/moon discs (sky
@@ -587,10 +635,12 @@ public final class RtComposite {
             worldPipeline.setSkyAtlas(celView != 0L ? celView : atlasView, sampler);
         }
         setCelestialUvAtlas(celView);
-        // Atlas UVs and material IDs are one resource epoch. Drop old terrain as a unit rather than
-        // incrementally displaying old UVs/IDs against the new atlas/table.
-        RtTerrain.requestFullClear();
-        materialEpochTraceGate = true;
+        if (fullRebuild) {
+            // Atlas UVs and material IDs are one resource epoch. Drop old terrain as a unit rather than
+            // incrementally displaying old UVs/IDs against the new atlas/table.
+            RtTerrain.requestFullClear();
+            materialEpochTraceGate = true;
+        }
     }
 
     private void refreshMaterialBindingsIfNeeded(RtContext ctx) {

@@ -11,13 +11,28 @@ import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
+import com.mojang.blaze3d.platform.InputConstants;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.rendering.v1.InvalidateRenderStateCallback;
+import net.minecraft.client.KeyMapping;
+import net.minecraft.resources.Identifier;
+import org.lwjgl.glfw.GLFW;
 
 public final class CausticaClient implements ClientModInitializer {
 	private static boolean rtInitDone = false;
+
+	private static final KeyMapping.Category CAUSTICA_KEY_CATEGORY = KeyMapping.Category.register(
+			Identifier.fromNamespaceAndPath(CausticaMod.MOD_ID, CausticaMod.MOD_ID));
+
+	// Unbound by default (no vanilla key conflicts); assign one in Controls > Caustica. An easy in-game
+	// trigger to rebuild just the world RT pipeline (e.g. after a compileShaders rerun, or flipping
+	// caustica.rt.safe.noPipelineOptimization) without the F3+A full-terrain-clear side effect.
+	private static final KeyMapping RECREATE_WORLD_PIPELINE_KEY = KeyMappingHelper.registerKeyMapping(
+			new KeyMapping("key.caustica.recreateWorldPipeline", InputConstants.Type.KEYSYM,
+					GLFW.GLFW_KEY_UNKNOWN, CAUSTICA_KEY_CATEGORY));
 
 	@Override
 	public void onInitializeClient() {
@@ -26,6 +41,10 @@ public final class CausticaClient implements ClientModInitializer {
 		// The GpuDevice exists well before the first tick, so a one-shot at tick start
 		// runs on the render thread with the device idle between frames.
 		ClientTickEvents.START_CLIENT_TICK.register(client -> {
+			while (RECREATE_WORLD_PIPELINE_KEY.consumeClick()) {
+				RtComposite.INSTANCE.recreateWorldPipeline();
+			}
+
 			if (!VanillaRenderController.rtRuntimeWorkRequested()) {
 				if (rtInitDone) {
 					shutdownRt();

@@ -28,6 +28,7 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
 
+import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
@@ -308,8 +309,19 @@ public final class RtPipeline {
             // Depth 1: secondary shadow/visibility rays are issued sequentially from raygen (not
             // nested in closest-hit), so each traceRayEXT is depth 1 — no recursion budget needed.
             rtpci.get(0).sType$Default().pStages(stages).pGroups(groups).maxPipelineRayRecursionDepth(1).layout(layout);
+            int pipelineFlags = 0;
             if (RtDeviceBringup.ommEnabled()) {
-                rtpci.get(0).flags(VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT);
+                pipelineFlags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+            }
+            // Debug-only: skips the driver's shader compiler optimization passes so captured
+            // RenderDoc/Nsight disassembly matches source control flow, at the cost of slower shaders.
+            // Pairs with slangc's -O0 (see build.gradle) and the -g debug info already embedded in every
+            // compiled shader.
+            if (CausticaConfig.Rt.Safe.noPipelineOptimization()) {
+                pipelineFlags |= VK10.VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            }
+            if (pipelineFlags != 0) {
+                rtpci.get(0).flags(pipelineFlags);
             }
             LongBuffer pPipeline = stack.mallocLong(1);
             check(vkCreateRayTracingPipelinesKHR(vk, VK10.VK_NULL_HANDLE, VK10.VK_NULL_HANDLE, rtpci, null, pPipeline),

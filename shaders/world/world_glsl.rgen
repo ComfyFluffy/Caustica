@@ -679,6 +679,7 @@ vec3 shadeReservoir(Reservoir s, vec3 hitPos, vec3 n, vec3 v, vec3 rd, vec3 diff
     vec3 toL = s.pos - origin;
     float dist = length(toL);
     vis = visibility(origin, toL / dist, dist * 0.999);
+    // vis = vec3(1.0, 1.0, 1.0);
     return contrib * vis * s.W;
 }
 
@@ -885,12 +886,12 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, uvec2 pix, uint sample
             }
 
             if (risOn) {
-                vec3 v = -rd;
-                Reservoir r = risInitial(hitPos, n, v, rd, albedo, vec3(0.0, 0.0, 0.0), 1.0, false,
-                        true, 0.0, seed, proposalSeed);
-                vec3 risVis;
-                L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, vec3(0.0, 0.0, 0.0), 1.0,
-                        false, true, 0.0, risVis);
+                // vec3 v = -rd;
+                // Reservoir r = risInitial(hitPos, n, v, rd, albedo, vec3(0.0, 0.0, 0.0), 1.0, false,
+                //         true, 0.0, seed, proposalSeed);
+                // vec3 risVis;
+                // L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, vec3(0.0, 0.0, 0.0), 1.0,
+                //         false, true, 0.0, risVis);
             }
 
             if (bounce >= maxBounces) {
@@ -970,7 +971,8 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, uvec2 pix, uint sample
         }
 
         float emission = payloadEmission();
-        bool gateEmitter = risOn && payloadEmitterInList();
+        // bool gateEmitter = risOn && payloadEmitterInList();
+        bool gateEmitter = true;
         if (emission > 0.0 && (!gateEmitter || showCelestial)) {
             L += throughput * albedo * emission;
         }
