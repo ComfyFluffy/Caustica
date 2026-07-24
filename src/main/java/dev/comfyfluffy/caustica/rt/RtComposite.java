@@ -106,6 +106,14 @@ public final class RtComposite {
     // -- setExtraStorageImage rewrites every ring descriptor slot at once and its own doc comment
     // restricts that to init/resize/idle, not the arbitrary times lights regenerate.
     private static final int LIGHT_TEXTURE_CAPACITY = 65536;
+    // Lights wrap across rows: a one-light-per-row layout would need a 65536-tall image, over the 32768
+    // per-dimension format maximum. 1024 lights/row keeps the image 3072x64 and, because each row then
+    // holds exactly 1024 * 48 B of the source buffer contiguously, lets whole rows be copied straight
+    // from the linear light arena with no repacking (see refreshLightTexture).
+    // MUST match LIGHT_TEXTURE_LIGHTS_PER_ROW in world.rgen.slang -- this is a shared ABI.
+    private static final int LIGHT_TEXTURE_LIGHTS_PER_ROW = 1024;
+    private static final int LIGHT_TEXTURE_BYTES_PER_LIGHT = 48; // 3 x float4, matches Light in world_common.slang
+    private static final int LIGHT_TEXTURE_TEXELS_PER_LIGHT = 3;
     private static int debugView() {
         return CausticaConfig.Rt.Composite.DEBUG_VIEW.value();
     }
@@ -535,6 +543,16 @@ public final class RtComposite {
     private RtPipeline ensureWorld(RtContext ctx) {
         if (worldPipeline == null) {
             bindlessTextureCapacity = RtEntityTextures.maxTextures();
+            // Before RtPipeline.create, deliberately: anything that throws AFTER worldPipeline is assigned
+            // leaves a live pipeline whose descriptors were never written, and the next call sees
+            // worldPipeline != null and skips this whole block -- so every frame afterwards traces with
+            // unwritten descriptors instead of failing loudly. Allocate first, assign the pipeline last.
+            if (lightTextureImage == null) {
+                lightTextureImage = ctx.createStorageImage(
+                        LIGHT_TEXTURE_LIGHTS_PER_ROW * LIGHT_TEXTURE_TEXELS_PER_LIGHT,
+                        LIGHT_TEXTURE_CAPACITY / LIGHT_TEXTURE_LIGHTS_PER_ROW,
+                        VK10.VK_FORMAT_R32G32B32A32_SFLOAT, "rt light record texture");
+            }
             worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(),
                     // Miss index 0 = sky (world.rmiss), 1 = shadow/visibility (shadow.rmiss) — matched by
                     // visibility()'s traceRay missIndex in world_glsl.rgen / world.rgen.slang's NO_SER path.
@@ -551,18 +569,12 @@ public final class RtComposite {
                             VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt world push " + i);
                 }
             }
-            // Created + bound exactly once here, never resized/rebound again for this pipeline's lifetime
-            // -- see LIGHT_TEXTURE_CAPACITY's comment for why.
-            if (lightTextureImage == null) {
-                lightTextureImage = ctx.createStorageImage(3, LIGHT_TEXTURE_CAPACITY,
-                        VK10.VK_FORMAT_R32G32B32A32_SFLOAT, "rt light record texture");
-            }
             if (output != null) {
                 worldPipeline.setStorageImage(output.view);
                 bindGuideImages();
-                if (lightTextureImage != null) {
-                    worldPipeline.setExtraStorageImage(LIGHT_TEXTURE_SLOT, lightTextureImage.view);
-                }
+                // Bound exactly once here, never resized/rebound again for this pipeline's lifetime --
+                // see LIGHT_TEXTURE_CAPACITY's comment for why.
+                worldPipeline.setExtraStorageImage(LIGHT_TEXTURE_SLOT, lightTextureImage.view);
             }
             bindWorldTextures(ctx, !pipelineOnlyRebindPending);
             reloadRebindRequested = false;
@@ -748,23 +760,43 @@ public final class RtComposite {
         if (terrain == null) {
             return;
         }
-        int lightCount = terrain.lightCount();
         long srcHandle = terrain.lightBufferHandle();
+        int lightCount = Math.min(terrain.lightCount(), LIGHT_TEXTURE_CAPACITY);
         if (lightCount <= 0 || srcHandle == 0L) {
             return;
         }
-        int rows = Math.min(lightCount, LIGHT_TEXTURE_CAPACITY);
+        // Whole rows first, then whatever partial row is left. Copying ceil(lightCount/perRow) full rows
+        // in one region would read past the end of the light arena for any count that isn't an exact
+        // multiple of the row width.
+        int fullRows = lightCount / LIGHT_TEXTURE_LIGHTS_PER_ROW;
+        int tailLights = lightCount % LIGHT_TEXTURE_LIGHTS_PER_ROW;
+        int rowTexels = LIGHT_TEXTURE_LIGHTS_PER_ROW * LIGHT_TEXTURE_TEXELS_PER_LIGHT;
         ctx.waitIdle();
         ctx.submitSync(cmd -> {
             try (MemoryStack stack = MemoryStack.stackPush()) {
-                VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
-                region.get(0).bufferOffset(0L).bufferRowLength(0).bufferImageHeight(0);
-                region.get(0).imageSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
-                        .mipLevel(0).baseArrayLayer(0).layerCount(1);
-                region.get(0).imageOffset().set(0, 0, 0);
-                region.get(0).imageExtent().set(3, rows, 1);
+                int regionCount = (fullRows > 0 ? 1 : 0) + (tailLights > 0 ? 1 : 0);
+                VkBufferImageCopy.Buffer regions = VkBufferImageCopy.calloc(regionCount, stack);
+                int next = 0;
+                if (fullRows > 0) {
+                    VkBufferImageCopy region = regions.get(next++);
+                    region.bufferOffset(0L).bufferRowLength(rowTexels).bufferImageHeight(0);
+                    region.imageSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                            .mipLevel(0).baseArrayLayer(0).layerCount(1);
+                    region.imageOffset().set(0, 0, 0);
+                    region.imageExtent().set(rowTexels, fullRows, 1);
+                }
+                if (tailLights > 0) {
+                    VkBufferImageCopy region = regions.get(next);
+                    region.bufferOffset((long) fullRows * LIGHT_TEXTURE_LIGHTS_PER_ROW
+                                    * LIGHT_TEXTURE_BYTES_PER_LIGHT)
+                            .bufferRowLength(0).bufferImageHeight(0);
+                    region.imageSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                            .mipLevel(0).baseArrayLayer(0).layerCount(1);
+                    region.imageOffset().set(0, fullRows, 0);
+                    region.imageExtent().set(tailLights * LIGHT_TEXTURE_TEXELS_PER_LIGHT, 1, 1);
+                }
                 VK10.vkCmdCopyBufferToImage(cmd, srcHandle, lightTextureImage.image,
-                        VK10.VK_IMAGE_LAYOUT_GENERAL, region);
+                        VK10.VK_IMAGE_LAYOUT_GENERAL, regions);
             }
         });
     }

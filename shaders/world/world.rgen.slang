@@ -42,6 +42,9 @@ import world_common;
 // RtComposite#refreshLightTexture every frame via a buffer-to-image copy from the same bytes
 // worldPush.lightBufAddr would otherwise point at.
 [[vk::binding(9, 0)]] [format("rgba32f")] RWTexture2D<float4> gLightData;
+// Lights wrap across rows (a one-light-per-row image would exceed the 32768 per-dimension format
+// maximum). MUST match LIGHT_TEXTURE_LIGHTS_PER_ROW in RtComposite.java -- this is a shared ABI.
+static const uint LIGHT_TEXTURE_LIGHTS_PER_ROW = 1024u;
 
 // Per-frame push data loaded once from the BDA buffer at the top of main() (same pattern as the GLSL
 // `worldPush` global). Layout constants generated from this module's SPIR-V — see world_common.WorldPush.
@@ -645,11 +648,12 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
         // docs/SAFE_MODE_BISECT.md) -- this instead routes the load through the texture unit (gLightData,
         // a storage image RtComposite#refreshLightTexture keeps in sync with the same bytes lightBufAddr
         // points at) instead of a generic PhysicalStorageBuffer dereference.
-        int row = int(li);
+        int row = int(li / LIGHT_TEXTURE_LIGHTS_PER_ROW);
+        int col = int((li % LIGHT_TEXTURE_LIGHTS_PER_ROW) * 3u);
         Light lg;
-        lg.posArea = gLightData[int2(0, row)];
-        lg.halfULe = gLightData[int2(1, row)];
-        lg.halfVSection = gLightData[int2(2, row)];
+        lg.posArea = gLightData[int2(col, row)];
+        lg.halfULe = gLightData[int2(col + 1, row)];
+        lg.halfVSection = gLightData[int2(col + 2, row)];
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
         float t = rndf(seed) * 2.0 - 1.0;
