@@ -612,12 +612,12 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
     // local and two global candidates, with every lane taking the same branch for a given candidate.
     // Counts that are not divisible by four use the nearest practical split with at least one global
     // candidate; M=1 is global-only so the estimator retains full support.
-    // uint globalCandidateCount = hasGridCell
-    //         ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
-    uint globalCandidateCount = 1u;
+    uint globalCandidateCount = hasGridCell
+            ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
+    // uint globalCandidateCount = 1u;
     uint localCandidateCount = candidateCount - globalCandidateCount;
     float localProbability = float(localCandidateCount) / float(candidateCount);
-    for (uint c = 0u; c < 8u; c++) {
+    for (uint c = 0u; c < candidateCount; c++) {
         r.M += 1.0;
         uint li;
         uint globalsBefore = (c * globalCandidateCount) / candidateCount;
