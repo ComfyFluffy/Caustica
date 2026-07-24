@@ -482,13 +482,13 @@ float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 h
 void selectGlobalLight(inout uint proposalSeed, out uint lightIndex) {
     float aliasSample = rndf(proposalSeed) * float(worldPush.lightCount);
     uint column = min(uint(aliasSample), worldPush.lightCount - 1u);
-    if (worldPush.lightAliasAddr != 0) {
+    // if (worldPush.lightAliasAddr != 0) {
         LightAlias a = ConstPtr<LightAlias>(worldPush.lightAliasAddr)[column];
         bool self = aliasSample - float(column) < a.accept;
         lightIndex = self ? column : a.aliasIndex;
-    } else {
-        lightIndex = column;
-    }
+    // } else {
+    //     lightIndex = column;
+    // }
 }
 
 bool findLightGridCell(float3 p, out LightGridCell cell, out int3 cellCoord) {
@@ -584,11 +584,11 @@ void selectLightGridSpanLight(LightGridCell cell, inout uint proposalSeed,
 // Light48 load: section power cancels with the section-local light PDF.
 void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposalSeed,
                           out uint lightIndex) {
-    if (useLocal) {
+    // if (useLocal) {
         selectLightGridSpanLight(cell, proposalSeed, lightIndex);
-    } else {
+    // } else {
         selectGlobalLight(proposalSeed, lightIndex);
-    }
+    // }
 }
 
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
@@ -600,30 +600,35 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
     LightGridCell gridCell;
     int3 gridCellCoord;
     float3 gridLookup = hitPos;
-    if (worldPush.lightGridCellAddr != 0) {
+    // if (worldPush.lightGridCellAddr != 0) {
         // Stochastically blend across hard section boundaries. Every cell proposal retains full global
         // support, so conditioning on this independently jittered lookup remains unbiased.
         gridLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
                 * worldPush.lightGridOrigin.w;
-    }
+    // }
     bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
     uint candidateCount = worldPush.risCandidates;
     // Deterministically stratify the proposal mixture. At the default M=8 this schedules exactly six
     // local and two global candidates, with every lane taking the same branch for a given candidate.
     // Counts that are not divisible by four use the nearest practical split with at least one global
     // candidate; M=1 is global-only so the estimator retains full support.
-    uint globalCandidateCount = hasGridCell
-            ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
+    // uint globalCandidateCount = hasGridCell
+    //         ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
+    uint globalCandidateCount = 1u;
     uint localCandidateCount = candidateCount - globalCandidateCount;
     float localProbability = float(localCandidateCount) / float(candidateCount);
-    for (uint c = 0u; c < worldPush.risCandidates; c++) {
+    for (uint c = 0u; c < 8u; c++) {
         r.M += 1.0;
         uint li;
         uint globalsBefore = (c * globalCandidateCount) / candidateCount;
         uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
         bool useLocal = hasGridCell && globalsAfter == globalsBefore;
         selectLightGridLight(gridCell, useLocal, proposalSeed, li);
-        Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
+        // Light lg = ConstPtr<Light>(worldPush.lightBufAddr)[li];
+        Light lg;
+        lg.halfULe = float4(0.0, 0.0, 0.0, 0.0);
+        lg.halfVSection = float4(0.0, 0.0, 0.0, 0.0);
+        lg.posArea = float4(0.0, 0.0, 0.0, 0.0);
         // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
         float s = rndf(seed) * 2.0 - 1.0;
         float t = rndf(seed) * 2.0 - 1.0;
@@ -631,9 +636,9 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
                 + s * lg.halfULe.xyz + t * lg.halfVSection.xyz;
         float3 le = lightRadiance(lg);
         float3 lightNormal = lightGeometricNormal(lg);
-        float phat;
-        evalSampleContrib(sp, lightNormal, le, lg.posArea.w, hitPos, n, v, rd,
-                diffAlb, F0, rough, pbr, twoSided, sss, phat);
+        float phat = 0.0;
+        // evalSampleContrib(sp, lightNormal, le, lg.posArea.w, hitPos, n, v, rd,
+        //         diffAlb, F0, rough, pbr, twoSided, sss, phat);
         if (phat <= 0.0) {
             continue;
         }
@@ -881,11 +886,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
     // RIS emitter NEE: direct lighting from block emitters is active when lights are published and the
     // candidate count is non-zero. Off => emitters are gathered only on path hits (legacy behaviour).
     bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0;
-    if (risOn) {
-        printf("RIS enabled: lightCount=%u, risCandidates=%u, lightBufAddr=%u\n",
-                worldPush.lightCount, worldPush.risCandidates, worldPush.lightBufAddr);
-    }
-    risOn = false;
+    // if (risOn) {
+    //     printf("RIS enabled: lightCount=%u, risCandidates=%u, lightBufAddr=%u\n",
+    //             worldPush.lightCount, worldPush.risCandidates, worldPush.lightBufAddr);
+    // }
+    // risOn = false;
     // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
     // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
     uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u

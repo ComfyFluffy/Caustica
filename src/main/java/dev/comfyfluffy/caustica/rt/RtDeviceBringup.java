@@ -230,8 +230,8 @@ public final class RtDeviceBringup {
     }
 
     public static String worldRaygenShader() {
-        // return serEnabled ? WORLD_RAYGEN_SER : WORLD_RAYGEN_NO_SER;
-        return WORLD_RAYGEN_GLSL;
+        return serEnabled ? WORLD_RAYGEN_SER : WORLD_RAYGEN_NO_SER;
+        // return WORLD_RAYGEN_GLSL;
     }
 
     public static boolean serExtEnabled() {
