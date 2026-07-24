@@ -41,7 +41,10 @@ static WorldPush worldPush;
 
 // Ray payloads. Module-level statics so the helper functions (visibility / refractedGuideHit /
 // specularReflectionMotion / tracePath) can share them, mirroring the GLSL rayPayloadEXT globals.
+// Vulkan requires every shader stage reached by one trace to use an identical payload structure, so
+// shadow rays use Payload too even though their any-hit path only needs albedo.rgb + hitT.
 static Payload payload;
+static Payload shadowPayload;
 static float4 shadowVis; // rgb = transmittance; a = nearest water-crossing t (-1 = none)
 
 // First-hit (primary-visibility) guide attributes, captured at bounce 0 of tracePath. The primary ray
@@ -308,7 +311,12 @@ uint pcg(inout uint s) {
     uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
     return (w >> 22u) ^ w;
 }
-float rndf(inout uint s) { return float(pcg(s)) * (1.0 / 4294967296.0); }
+float rndf(inout uint s) {
+    // Convert the high 24 bits, which are exactly representable as float. Converting all 32 bits first
+    // lets the top 128 uint values round to 2^32, incorrectly returning 1.0 and breaking `< probability`
+    // tests (most seriously the F == 1 total-internal-reflection branch).
+    return float(pcg(s) >> 8u) * (1.0 / 16777216.0);
+}
 
 float3 primaryRayDir(float2 ndc) {
     float4 nearH = mul(worldPush.invViewProj, float4(ndc.x, ndc.y, 1.0, 1.0));
@@ -714,26 +722,35 @@ void traceRadiance(uint cullMask, float3 ro, float tmin, float3 rd, float tmax) 
 #endif
 
 float3 visibility(float3 origin, float3 dir, float tmax) {
-    shadowVis = float4(1.0, 1.0, 1.0, -1.0); // a = water-crossing sentinel, filled by the water any-hit
+    shadowPayload.albedo = float3(1.0, 1.0, 1.0);
+    shadowPayload.hitT = -1.0; // water-crossing sentinel, filled by the water any-hit
+    shadowPayload.normal = float3(0.0, 0.0, 0.0);
+    shadowPayload.motionPrev = float3(0.0, 0.0, 0.0);
+    shadowPayload.f0 = float3(0.0, 0.0, 0.0);
+    shadowPayload.flags = 0u;
+    shadowPayload.roughMetal = 0u;
+    shadowPayload.emissionSss = 0u;
+    shadowPayload.iorTransmission = 0u;
+    shadowPayload.rayCone = 0u;
     // Shadow SBT records run any-hit only for cutout/translucent/water. Cutout alpha-tests; translucent
-    // and water tint shadowVis.rgb and pass through. Solid blocks terminate traversal. There is no closest
-    // shader worth executing (SKIP_CLOSEST_HIT_SHADER), so a==1.0 (only ever written by shadow.rmiss)
-    // is the traversal-missed signal — an accepted opaque hit never touches shadowVis.a at all.
+    // and water tint shadowPayload.albedo and pass through. Solid blocks terminate traversal. There is no
+    // closest shader worth executing (SKIP_CLOSEST_HIT_SHADER).
 #ifdef NO_SER
-    // missIndex=1: shadow.rmiss (SBT miss index 1). Unlike the SER path below (HitObject.IsMiss() without
-    // Invoke — never triggers a miss shader), a plain TraceRay genuinely invokes the miss shader on
-    // escape, so this must point at shadow.rmiss (sets shadowVis.a=1.0), not miss index 0 (world.rmiss,
-    // the sky/Payload miss — invoking it here would stomp shadowVis with unrelated sky-shader writes).
+    // missIndex=1: shadow.rmiss (SBT miss index 1) sets payload.hitT=1.0 — the traversal-missed signal a
+    // plain TraceRay genuinely invokes (unlike the SER path below, HitObject.IsMiss() without Invoke,
+    // which never triggers a miss shader). An accepted opaque hit never touches shadowPayload.hitT at all.
     TraceRay(topLevelAS,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
             CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 1u,
-            makeRay(origin, RAY_TMIN, dir, tmax), shadowVis);
+            makeRay(origin, RAY_TMIN, dir, tmax), shadowPayload);
+    shadowVis = float4(shadowPayload.albedo, shadowPayload.hitT);
     return shadowVis.a == 1.0 ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
 #else
     HitObject hObj = HitObject::TraceRay(topLevelAS,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
             CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 0u,
-            makeRay(origin, RAY_TMIN, dir, tmax), shadowVis);
+            makeRay(origin, RAY_TMIN, dir, tmax), shadowPayload);
+    shadowVis = float4(shadowPayload.albedo, shadowPayload.hitT);
     return hObj.IsMiss() ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
 #endif
 }

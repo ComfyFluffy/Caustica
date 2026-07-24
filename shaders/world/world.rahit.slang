@@ -8,9 +8,9 @@
 //    closest-hit. Opaque entity geometry bypasses this shader; every alpha/transmissive material shares
 //    one non-opaque geometry and routes here through its SBT record.
 //
-// NOTE on the payload: this module declares the SHADOW payload (float4 shadowVis). Radiance rays carry
-// the big Payload struct but only reach the cutout paths here, which never touch the payload — the
-// water/translucent branches that write shadowVis run only from shadow SBT records.
+// Radiance and shadow rays share the exact Payload ABI, as Vulkan requires for every stage reachable by
+// a trace. Shadow traversal uses albedo.rgb as accumulated transmittance and hitT as the nearest-water
+// crossing; radiance cutout paths do not touch either field.
 import world_common;
 
 [[vk::push_constant]] WorldPushConstants pc;
@@ -48,7 +48,7 @@ float alphaDitherThreshold(uint salt) {
 }
 
 [shader("anyhit")]
-void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr) {
+void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) {
     uint pid = PrimitiveIndex();
     float2 attribs = attr.barycentrics;
     float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
@@ -89,14 +89,14 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
         if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_GLASS) {
             float3 tint = lerp(float3(1.0, 1.0, 1.0),
                     srgbToLinear(texel.rgb) * epr.tint.rgb, texel.a);
-            shadowVis.rgb *= tint * clamp(materialHeader.params.w, 0.0, 1.0);
+            payload.albedo *= tint * clamp(materialHeader.params.w, 0.0, 1.0);
             IgnoreHit();
         }
         if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_WATER) {
             float3 tint = srgbToLinear(texel.rgb) * epr.tint.rgb;
-            shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), tint, WATER_SHADOW_TINT)
+            payload.albedo *= lerp(float3(1.0, 1.0, 1.0), tint, WATER_SHADOW_TINT)
                     * clamp(materialHeader.params.w, 0.0, 1.0);
-            shadowVis.a = shadowVis.a < 0.0 ? RayTCurrent() : min(shadowVis.a, RayTCurrent());
+            payload.hitT = payload.hitT < 0.0 ? RayTCurrent() : min(payload.hitT, RayTCurrent());
             IgnoreHit();
         }
         return;
@@ -110,11 +110,11 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     // the biome water color, then keep walking so submerged terrain is lit by colored transmission.
     if (bucket == BUCKET_WATER) {
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
-        shadowVis.rgb *= lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, WATER_SHADOW_TINT);
-        // Record the NEAREST water crossing (any-hit order is arbitrary) in the otherwise-unused alpha
+        payload.albedo *= lerp(float3(1.0, 1.0, 1.0), pr.tint.rgb, WATER_SHADOW_TINT);
+        // Record the NEAREST water crossing (any-hit order is arbitrary) in the shadow payload's hitT
         // lane. For an underwater shading point this is the exit point of its sun shadow ray, where
         // world.rgen evaluates the wave-refraction caustic. visibility() seeds the -1 sentinel.
-        shadowVis.a = shadowVis.a < 0.0 ? RayTCurrent() : min(shadowVis.a, RayTCurrent());
+        payload.hitT = payload.hitT < 0.0 ? RayTCurrent() : min(payload.hitT, RayTCurrent());
         IgnoreHit();
     }
 
@@ -126,7 +126,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
     // Modeled as Beer-Lambert absorption (matching the water medium in world.rgen): a per-channel
     // extinction derived from how dark the average is, scaled by the average alpha (how much of the
     // sprite is glass-colorant vs. see-through frame), so saturated panes darken transmitted light
-    // non-linearly. Multiplying into shadowVis.rgb compounds correctly across stacked panes.
+    // non-linearly. Multiplying into payload.albedo compounds correctly across stacked panes.
     if (bucket == BUCKET_TRANSLUCENT) {
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
         MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
@@ -136,7 +136,7 @@ void main(inout float4 shadowVis, in BuiltInTriangleIntersectionAttributes attr)
         // The neutral floor is a flat per-hit dimming, NOT scaled by alpha: vanilla clear glass has a low
         // natural alpha, so folding it into the alpha-scaled term crushed it to near-zero for exactly the
         // white/clear-glass case it's meant to cover.
-        shadowVis.rgb *= exp(-colorExtinction * materialHeader.average.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
+        payload.albedo *= exp(-colorExtinction * materialHeader.average.a - TRANSLUCENT_NEUTRAL_EXTINCTION);
         IgnoreHit();
     }
 
