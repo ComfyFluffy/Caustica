@@ -165,7 +165,7 @@ uint payloadEmissionSource() {
     return (payload.flags >> PAYLOAD_EMISSION_SOURCE_SHIFT) & PAYLOAD_EMISSION_SOURCE_MASK;
 }
 bool payloadWaterEntering() { return (payload.flags & PAYLOAD_WATER_ENTERING) != 0u; }
-bool payloadEmitterInList() { return (payload.flags & PAYLOAD_EMITTER_IN_LIST) != 0u; }
+// bool payloadEmitterInList() { return (payload.flags & PAYLOAD_EMITTER_IN_LIST) != 0u; }
 float payloadRoughness() { return unpackHalf2x16(payload.roughMetal).x; }
 float payloadMetalness() { return unpackHalf2x16(payload.roughMetal).y; }
 float payloadEmission() { return unpackHalf2x16(payload.emissionSss).x; }
@@ -435,253 +435,259 @@ vec3 visibility(vec3 origin, vec3 dir, float tmax) {
 
 // ===== RIS emitter NEE ==================================================================
 
-struct Reservoir {
-    vec3  pos;
-    vec3  lnrm;
-    vec3  le;
-    float area;
-    float M;
-    float W;
-    float wSum;
-    float phat;
-};
+//struct Reservoir {
+//    vec4  pos;
+//    vec4  lnrm;
+//    vec4  le;
+//    float area;
+//    float M;
+//    float W;
+//    float wSum;
+//    float phat;
+//};//
 
-Reservoir resEmpty() {
-    Reservoir r;
-    r.pos = vec3(0.0, 0.0, 0.0);
-    r.lnrm = vec3(0.0, 0.0, 0.0);
-    r.le = vec3(0.0, 0.0, 0.0);
-    r.area = 0.0;
-    r.M = 0.0;
-    r.W = 0.0;
-    r.wSum = 0.0;
-    r.phat = 0.0;
-    return r;
-}
+//Reservoir resEmpty() {
+//    Reservoir r;
+//    r.pos = vec4(0.0, 0.0, 0.0, 1.0);
+//    r.lnrm = vec4(0.0, 0.0, 0.0, 1.0);
+//    r.le = vec4(0.0, 0.0, 0.0, 1.0);
+//    r.area = 0.0;
+//    r.M = 0.0;
+//    r.W = 0.0;
+//    r.wSum = 0.0;
+//    r.phat = 0.0;
+//    return r;
+//}//
 
-vec3 evalSampleContrib(vec3 sp, vec3 lnrm, vec3 le, float area, vec3 hitPos, vec3 n,
-                        vec3 v, vec3 rd, vec3 diffAlb, vec3 F0, float rough, bool pbr,
-                        bool twoSided, float sss, out float phat) {
-    phat = 0.0;
-    vec3 toL = sp - hitPos;
-    float dist2 = dot(toL, toL);
-    if (dist2 < 1.0e-6) {
-        return vec3(0.0, 0.0, 0.0);
-    }
-    float dist = sqrt(dist2);
-    vec3 wi = toL / dist;
-    float cosL = max(0.0, dot(lnrm, -wi));
-    if (cosL <= 0.0) {
-        return vec3(0.0, 0.0, 0.0);
-    }
-    float ndl = dot(n, wi);
-    if (twoSided) {
-        ndl = abs(ndl);
-    }
-    vec3 contrib = vec3(0.0, 0.0, 0.0);
-    if (ndl > 0.0) {
-        float G = ndl * cosL / dist2;
-        vec3 brdf = diffAlb * INV_PI;
-        if (pbr) {
-            vec3 h = normalize(wi + v);
-            float ndh = max(0.0, dot(n, h));
-            float ndv = max(1.0e-4, dot(n, v));
-            float vdh = max(0.0, dot(v, h));
-            float D = ggxD(ndh, rough);
-            float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
-            vec3 Fs = fresnelSchlick(vdh, F0);
-            brdf += (D * Gs) * Fs / (4.0 * ndv * ndl);
-        }
-        contrib = brdf * le * (G * area);
-    } else if (sss > 0.0) {
-        float backNdl = -ndl;
-        float G = backNdl * cosL / dist2;
-        float cosT = dot(wi, rd);
-        contrib = diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * le * (G * area);
-    }
-    phat = luminance(contrib);
-    return contrib;
-}
+//vec3 evalSampleContrib(vec3 sp, vec3 lnrm, vec3 le, float area, vec3 hitPos, vec3 n,
+//                        vec3 v, vec3 rd, vec3 diffAlb, vec3 F0, float rough, bool pbr,
+//                        bool twoSided, float sss, out float phat) {
+//    phat = 0.0;
+//    vec3 toL = sp - hitPos;
+//    float dist2 = dot(toL, toL);
+//    if (dist2 < 1.0e-6) {
+//        return vec3(0.0, 0.0, 0.0);
+//    }
+//    float dist = sqrt(dist2);
+//    vec3 wi = toL / dist;
+//    float cosL = max(0.0, dot(lnrm, -wi));
+//    if (cosL <= 0.0) {
+//        return vec3(0.0, 0.0, 0.0);
+//    }
+//    float ndl = dot(n, wi);
+//    if (twoSided) {
+//        ndl = abs(ndl);
+//    }
+//    vec3 contrib = vec3(0.0, 0.0, 0.0);
+//    if (ndl > 0.0) {
+//        float G = ndl * cosL / dist2;
+//        vec3 brdf = diffAlb * INV_PI;
+//        if (pbr) {
+//            vec3 h = normalize(wi + v);
+//            float ndh = max(0.0, dot(n, h));
+//            float ndv = max(1.0e-4, dot(n, v));
+//            float vdh = max(0.0, dot(v, h));
+//            float D = ggxD(ndh, rough);
+//            float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
+//            vec3 Fs = fresnelSchlick(vdh, F0);
+//            brdf += (D * Gs) * Fs / (4.0 * ndv * ndl);
+//        }
+//        contrib = brdf * le * (G * area);
+//    } else if (sss > 0.0) {
+//        float backNdl = -ndl;
+//        float G = backNdl * cosL / dist2;
+//        float cosT = dot(wi, rd);
+//        contrib = diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * le * (G * area);
+//    }
+//    phat = luminance(contrib);
+//    return contrib;
+//}//
 
-void selectGlobalLight(inout uint proposalSeed, out uint lightIndex) {
-    float aliasSample = rndf(proposalSeed) * float(worldPush.lightCount);
-    uint column = min(uint(aliasSample), worldPush.lightCount - 1u);
-    if (worldPush.lightAliasAddr != 0ul) {
-        LightAlias a = LightAliasBuf(worldPush.lightAliasAddr).d[column];
-        bool self = aliasSample - float(column) < a.accept;
-        lightIndex = self ? column : a.aliasIndex;
-    } else {
-        lightIndex = column;
-    }
-}
+//void selectGlobalLight(inout uint proposalSeed, out uint lightIndex) {
+//    float aliasSample = rndf(proposalSeed) * float(worldPush.lightCount);
+//    uint column = min(uint(aliasSample), worldPush.lightCount - 1u);
+//    if (worldPush.lightAliasAddr != 0ul) {
+//        LightAlias a = LightAliasBuf(worldPush.lightAliasAddr).d[column];
+//        bool self = aliasSample - float(column) < a.accept;
+//        lightIndex = self ? column : a.aliasIndex;
+//    } else {
+//        lightIndex = column;
+//    }
+//}//
 
-bool findLightGridCell(vec3 p, out LightGridCell cell, out ivec3 cellCoord) {
-    cell.spanOffset = 0u;
-    cell.spanCount = 0u;
-    cell.invWeightSum = 0.0;
-    cellCoord = ivec3(0, 0, 0);
-    if (worldPush.lightGridCellAddr == 0ul || worldPush.lightGridSpanAddr == 0ul) return false;
-    ivec3 coord = ivec3(floor((p - worldPush.lightGridOrigin.xyz) / worldPush.lightGridOrigin.w));
-    if (coord.x < 0 || coord.y < 0 || coord.z < 0
-            || coord.x >= worldPush.lightGridDims.x
-            || coord.y >= worldPush.lightGridDims.y
-            || coord.z >= worldPush.lightGridDims.z) return false;
-    uint linear = (uint(coord.z) * uint(worldPush.lightGridDims.y) + uint(coord.y))
-            * uint(worldPush.lightGridDims.x) + uint(coord.x);
-    cell = LightGridCellBuf(worldPush.lightGridCellAddr).d[linear];
-    cellCoord = coord;
-    return cell.spanCount > 0u;
-}
+//bool findLightGridCell(vec3 p, out LightGridCell cell, out ivec3 cellCoord) {
+//    cell.spanOffset = 0u;
+//    cell.spanCount = 0u;
+//    cell.invWeightSum = 0.0;
+//    cellCoord = ivec3(0, 0, 0);
+//    if (worldPush.lightGridCellAddr == 0ul || worldPush.lightGridSpanAddr == 0ul) return false;
+//    ivec3 coord = ivec3(floor((p - worldPush.lightGridOrigin.xyz) / worldPush.lightGridOrigin.w));
+//    if (coord.x < 0 || coord.y < 0 || coord.z < 0
+//            || coord.x >= worldPush.lightGridDims.x
+//            || coord.y >= worldPush.lightGridDims.y
+//            || coord.z >= worldPush.lightGridDims.z) return false;
+//    uint linear = (uint(coord.z) * uint(worldPush.lightGridDims.y) + uint(coord.y))
+//            * uint(worldPush.lightGridDims.x) + uint(coord.x);
+//    cell = LightGridCellBuf(worldPush.lightGridCellAddr).d[linear];
+//    cellCoord = coord;
+//    return cell.spanCount > 0u;
+//}//
 
-void selectSectionLight(uint firstLight, uint lightCount, inout uint proposalSeed,
-                         out uint lightIndex) {
-    float aliasSample = rndf(proposalSeed) * float(lightCount);
-    uint column = min(uint(aliasSample), lightCount - 1u);
-    LightAlias alias = LightAliasBuf(worldPush.lightLocalAliasAddr).d[firstLight + column];
-    bool self = aliasSample - float(column) < alias.accept;
-    uint localIndex = self ? column : alias.aliasIndex;
-    lightIndex = firstLight + localIndex;
-}
+//void selectSectionLight(uint firstLight, uint lightCount, inout uint proposalSeed,
+//                         out uint lightIndex) {
+//    float aliasSample = rndf(proposalSeed) * float(lightCount);
+//    uint column = min(uint(aliasSample), lightCount - 1u);
+//    LightAlias alias = LightAliasBuf(worldPush.lightLocalAliasAddr).d[firstLight + column];
+//    bool self = aliasSample - float(column) < alias.accept;
+//    uint localIndex = self ? column : alias.aliasIndex;
+//    lightIndex = firstLight + localIndex;
+//}//
 
-float unpackUnsignedFloat(uint bits, uint mantissaBits) {
-    uint mantissaMask = (1u << mantissaBits) - 1u;
-    uint mantissa = bits & mantissaMask;
-    uint exponent = (bits >> mantissaBits) & 31u;
-    if (exponent == 0u) {
-        return float(mantissa) * exp2(float(1 - 15 - int(mantissaBits)));
-    }
-    return (1.0 + float(mantissa) / float(1u << mantissaBits))
-            * exp2(float(int(exponent) - 15));
-}
+//float unpackUnsignedFloat(uint bits, uint mantissaBits) {
+//    uint mantissaMask = (1u << mantissaBits) - 1u;
+//    uint mantissa = bits & mantissaMask;
+//    uint exponent = (bits >> mantissaBits) & 31u;
+//    if (exponent == 0u) {
+//        return float(mantissa) * exp2(float(1 - 15 - int(mantissaBits)));
+//    }
+//    return (1.0 + float(mantissa) / float(1u << mantissaBits))
+//            * exp2(float(int(exponent) - 15));
+//}//
 
-vec3 lightRadiance(Light light) {
-    uint packed = floatBitsToUint(light.halfULe.w);
-    return vec3(unpackUnsignedFloat(packed & 0x7ffu, 6u),
-            unpackUnsignedFloat((packed >> 11u) & 0x7ffu, 6u),
-            unpackUnsignedFloat((packed >> 22u) & 0x3ffu, 5u));
-}
+//vec3 lightRadiance(Light light) {
+//    uint packed = floatBitsToUint(light.halfULe.w);
+//    return vec3(unpackUnsignedFloat(packed & 0x7ffu, 6u),
+//            unpackUnsignedFloat((packed >> 11u) & 0x7ffu, 6u),
+//            unpackUnsignedFloat((packed >> 22u) & 0x3ffu, 5u));
+//}//
 
-ivec3 lightSectionCoord(Light light) {
-    uint packed = floatBitsToUint(light.halfVSection.w);
-    return ivec3(int(packed & 0x3ffu), int((packed >> 10u) & 0x3ffu),
-            int((packed >> 20u) & 0x3ffu));
-}
+//ivec3 lightSectionCoord(Light light) {
+//    uint packed = floatBitsToUint(light.halfVSection.w);
+//    return ivec3(int(packed & 0x3ffu), int((packed >> 10u) & 0x3ffu),
+//            int((packed >> 20u) & 0x3ffu));
+//}//
 
-vec3 lightGeometricNormal(Light light) {
-    vec3 normal = normalize(cross(light.halfULe.xyz, light.halfVSection.xyz));
-    return (floatBitsToUint(light.halfVSection.w) & 0x40000000u) != 0u ? -normal : normal;
-}
+//vec3 lightGeometricNormal(Light light) {
+//    vec3 normal = normalize(cross(light.halfULe.xyz, light.halfVSection.xyz));
+//    return (floatBitsToUint(light.halfVSection.w) & 0x40000000u) != 0u ? -normal : normal;
+//}//
 
-float proposalPdf(Light light, vec3 le, LightGridCell cell, ivec3 cellCoord,
-                   float localProbability) {
-    float power = max(0.0, light.posArea.w * luminance(le));
-    float globalPdf = worldPush.lightAliasAddr != 0ul
-            ? power * worldPush.lightRebase.w : 1.0 / float(worldPush.lightCount);
-    float localPdf = 0.0;
-    if (localProbability > 0.0 && power > 0.0) {
-        ivec3 delta = lightSectionCoord(light) - cellCoord;
-        if (all(lessThanEqual(abs(delta), ivec3(2, 2, 2)))) {
-            vec3 deltaF = vec3(delta);
-            localPdf = power * cell.invWeightSum / max(1.0, dot(deltaF, deltaF));
-        }
-    }
-    return localProbability * localPdf + (1.0 - localProbability) * globalPdf;
-}
+//float proposalPdf(Light light, vec3 le, LightGridCell cell, ivec3 cellCoord,
+//                   float localProbability) {
+//    float power = max(0.0, light.posArea.w * luminance(le));
+//    float globalPdf = worldPush.lightAliasAddr != 0ul
+//            ? power * worldPush.lightRebase.w : 1.0 / float(worldPush.lightCount);
+//    float localPdf = 0.0;
+//    if (localProbability > 0.0 && power > 0.0) {
+//        ivec3 delta = lightSectionCoord(light) - cellCoord;
+//        if (all(lessThanEqual(abs(delta), ivec3(2, 2, 2)))) {
+//            vec3 deltaF = vec3(delta);
+//            localPdf = power * cell.invWeightSum / max(1.0, dot(deltaF, deltaF));
+//        }
+//    }
+//    return localProbability * localPdf + (1.0 - localProbability) * globalPdf;
+//}//
 
-void selectLightGridSpanLight(LightGridCell cell, inout uint proposalSeed,
-                               out uint lightIndex) {
-    LightGridSpanBuf spans = LightGridSpanBuf(worldPush.lightGridSpanAddr);
-    float aliasSample = rndf(proposalSeed) * float(cell.spanCount);
-    uint column = min(uint(aliasSample), cell.spanCount - 1u);
-    LightGridSpan span = spans.d[cell.spanOffset + column];
-    bool self = aliasSample - float(column) < span.accept;
-    uint firstLight = self ? span.firstLight : span.aliasFirstLight;
-    uint lightCount = self ? (span.packedLightCounts & 0xffffu)
-            : (span.packedLightCounts >> 16u);
-    selectSectionLight(firstLight, lightCount, proposalSeed, lightIndex);
-}
+//void selectLightGridSpanLight(LightGridCell cell, inout uint proposalSeed,
+//                               out uint lightIndex) {
+//    LightGridSpanBuf spans = LightGridSpanBuf(worldPush.lightGridSpanAddr);
+//    float aliasSample = rndf(proposalSeed) * float(cell.spanCount);
+//    uint column = min(uint(aliasSample), cell.spanCount - 1u);
+//    LightGridSpan span = spans.d[cell.spanOffset + column];
+//    bool self = aliasSample - float(column) < span.accept;
+//    uint firstLight = self ? span.firstLight : span.aliasFirstLight;
+//    uint lightCount = self ? (span.packedLightCounts & 0xffffu)
+//            : (span.packedLightCounts >> 16u);
+//    selectSectionLight(firstLight, lightCount, proposalSeed, lightIndex);
+//}//
 
-void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposalSeed,
-                           out uint lightIndex) {
-    if (useLocal) {
-        selectLightGridSpanLight(cell, proposalSeed, lightIndex);
-    } else {
-        selectGlobalLight(proposalSeed, lightIndex);
-    }
-}
+//void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposalSeed,
+//                           out uint lightIndex) {
+//    if (useLocal) {
+//        selectLightGridSpanLight(cell, proposalSeed, lightIndex);
+//    } else {
+//        selectGlobalLight(proposalSeed, lightIndex);
+//    }
+//}//
 
-Reservoir risInitial(vec3 hitPos, vec3 n, vec3 v, vec3 rd, vec3 diffAlb, vec3 F0,
-                      float rough, bool pbr, bool twoSided, float sss,
-                      inout uint seed, inout uint proposalSeed) {
-    Reservoir r = resEmpty();
-    LightGridCell gridCell;
-    ivec3 gridCellCoord;
-    vec3 gridLookup = hitPos;
-    if (worldPush.lightGridCellAddr != 0ul) {
-        gridLookup += (vec3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
-                * worldPush.lightGridOrigin.w;
-    }
-    bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
-    uint candidateCount = worldPush.risCandidates;
-    uint globalCandidateCount = hasGridCell
-            ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
-    uint localCandidateCount = candidateCount - globalCandidateCount;
-    float localProbability = float(localCandidateCount) / float(candidateCount);
-    for (uint c = 0u; c < worldPush.risCandidates; c++) {
-        r.M += 1.0;
-        uint li;
-        uint globalsBefore = (c * globalCandidateCount) / candidateCount;
-        uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
-        bool useLocal = hasGridCell && globalsAfter == globalsBefore;
-        selectLightGridLight(gridCell, useLocal, proposalSeed, li);
-        Light lg = LightBuf(worldPush.lightBufAddr).d[li];
-        float s = rndf(seed) * 2.0 - 1.0;
-        float t = rndf(seed) * 2.0 - 1.0;
-        vec3 sp = lg.posArea.xyz + worldPush.lightRebase.xyz
-                + s * lg.halfULe.xyz + t * lg.halfVSection.xyz;
-        vec3 le = lightRadiance(lg);
-        vec3 lightNormal = lightGeometricNormal(lg);
-        float phat;
-        evalSampleContrib(sp, lightNormal, le, lg.posArea.w, hitPos, n, v, rd,
-                diffAlb, F0, rough, pbr, twoSided, sss, phat);
-        if (phat <= 0.0) {
-            continue;
-        }
-        float sourcePdf = proposalPdf(lg, le, gridCell, gridCellCoord, localProbability);
-        float w = phat / max(sourcePdf, 1.0e-20);
-        r.wSum += w;
-        if (rndf(seed) * r.wSum < w) {
-            r.pos = sp;
-            r.lnrm = lightNormal;
-            r.le = le;
-            r.area = lg.posArea.w;
-            r.phat = phat;
-        }
-    }
-    r.W = r.phat > 0.0 ? (r.wSum / (r.M * r.phat)) : 0.0;
-    return r;
-}
+//Reservoir risInitial(vec3 hitPos, vec3 n, vec3 v, vec3 rd, vec3 diffAlb, vec3 F0,
+//                      float rough, bool pbr, bool twoSided, float sss,
+//                      inout uint seed, inout uint proposalSeed) {
+//    Reservoir r = resEmpty();
+//    LightGridCell gridCell;
+//    ivec3 gridCellCoord;
+//    vec3 gridLookup = hitPos;
+//    // if (worldPush.lightGridCellAddr != 0ul) {
+//    //     gridLookup += (vec3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
+//    //             * worldPush.lightGridOrigin.w;
+//    // }
+//    // bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
+//    bool hasGridCell = false;
+//    uint candidateCount = 8u;
+//    uint globalCandidateCount = hasGridCell
+//            ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
+//    uint localCandidateCount = candidateCount - globalCandidateCount;
+//    float localProbability = float(localCandidateCount) / float(candidateCount);
+//    for (uint c = 0u; c < 8u; c++) {
+//        r.M += 1.0;
+//        uint li = 0u;
+//        uint globalsBefore = (c * globalCandidateCount) / candidateCount;
+//        uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
+//        bool useLocal = hasGridCell && globalsAfter == globalsBefore;
+//        // selectLightGridLight(gridCell, useLocal, proposalSeed, li);
+//        // Light lg = LightBuf(worldPush.lightBufAddr).d[li];
+//        // all zero lights
+//        Light lg;
+//        float s = rndf(seed) * 2.0 - 1.0;
+//        float t = rndf(seed) * 2.0 - 1.0;
+//        vec3 sp = lg.posArea.xyz + worldPush.lightRebase.xyz
+//                + s * lg.halfULe.xyz + t * lg.halfVSection.xyz;
+//        vec3 le = lightRadiance(lg);
+//        vec3 lightNormal = lightGeometricNormal(lg);
+//        float phat = 0.0;
+//        // evalSampleContrib(sp, lightNormal, le, lg.posArea.w, hitPos, n, v, rd,
+//        //         diffAlb, F0, rough, pbr, twoSided, sss, phat);
+//        // if (phat <= 0.0) {
+//        //     continue;
+//        // }
+//         // float sourcePdf = proposalPdf(lg, le, gridCell, gridCellCoord, localProbability);
+//        float sourcePdf = 0.0;
+//        float w = phat / max(sourcePdf, 1.0e-20);
+//        r.wSum += w;
+//        // if (rndf(seed) * r.wSum < w) {
+//            r.pos = vec4(sp, 1.0);
+//            r.lnrm = vec4(lightNormal, 1.0);
+//            r.le = vec4(le, 1.0);
+//            r.area = lg.posArea.w;
+//            r.phat = phat;
+//        // }
+//    }
+//    r.W = r.phat > 0.0 ? (r.wSum / (r.M * r.phat)) : 0.0;
+//    return r;
+//}//
 
-vec3 shadeReservoir(Reservoir s, vec3 hitPos, vec3 n, vec3 v, vec3 rd, vec3 diffAlb,
-                     vec3 F0, float rough, bool pbr, bool twoSided, float sss, out vec3 vis) {
-    vis = vec3(0.0, 0.0, 0.0);
-    if (s.W <= 0.0 || s.phat <= 0.0) {
-        return vec3(0.0, 0.0, 0.0);
-    }
-    float phat;
-    vec3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, hitPos, n, v, rd,
-            diffAlb, F0, rough, pbr, twoSided, sss, phat);
-    if (phat <= 0.0) {
-        return vec3(0.0, 0.0, 0.0);
-    }
-    float side = dot(n, s.pos - hitPos) >= 0.0 ? 1.0 : -1.0;
-    vec3 origin = hitPos + side * n * SURF_BIAS;
-    vec3 toL = s.pos - origin;
-    float dist = length(toL);
-    vis = visibility(origin, toL / dist, dist * 0.999);
-    // vis = vec3(1.0, 1.0, 1.0);
-    return contrib * vis * s.W;
-}
+//vec3 shadeReservoir(Reservoir s, vec3 hitPos, vec3 n, vec3 v, vec3 rd, vec3 diffAlb,
+//                     vec3 F0, float rough, bool pbr, bool twoSided, float sss, out vec3 vis) {
+//    vis = vec3(0.0, 0.0, 0.0);
+//    if (s.W <= 0.0 || s.phat <= 0.0) {
+//        return vec3(0.0, 0.0, 0.0);
+//    }
+//    float phat = 0.0;
+//    // vec3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, hitPos, n, v, rd,
+//    //            diffAlb, F0, rough, pbr, twoSided, sss, phat);
+//    vec3 contrib = vec3(0.0, 0.0, 0.0);
+//    if (phat <= 0.0) {
+//        return vec3(0.0, 0.0, 0.0);
+//    }
+//    vec3 sPos = s.pos.xyz;
+//    float side = dot(n, sPos - hitPos) >= 0.0 ? 1.0 : -1.0;
+//    vec3 origin = hitPos + side * n * SURF_BIAS;
+//    vec3 toL = sPos - origin;
+//    float dist = length(toL);
+//    // vis = visibility(origin, toL / dist, dist * 0.999);
+//    vis = vec3(1.0, 1.0, 1.0);
+//    return contrib * vis * s.W;
+//}
 
 vec2 projectPrevNdc(vec3 worldPos) {
     vec4 clip = worldPush.prevViewProj * vec4(worldPos - worldPush.camOffset + worldPush.camDelta, 1.0);
@@ -781,7 +787,7 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, uvec2 pix, uint sample
     // RIS is currently force-disabled after being evaluated, mirroring world.rgen.slang's own
     // `risOn = false;` right after its (now-dropped) debug printf — kept for exact behavioral parity.
     bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && worldPush.lightBufAddr != 0ul;
-    // risOn = false;
+    risOn = false;
     uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u
             ^ worldPush.frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
     proposalSeed = pcg(proposalSeed);
@@ -885,14 +891,14 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, uvec2 pix, uint sample
                 }
             }
 
-            if (risOn) {
+            // if (risOn) {
                 // vec3 v = -rd;
                 // Reservoir r = risInitial(hitPos, n, v, rd, albedo, vec3(0.0, 0.0, 0.0), 1.0, false,
                 //         true, 0.0, seed, proposalSeed);
                 // vec3 risVis;
                 // L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, vec3(0.0, 0.0, 0.0), 1.0,
                 //         false, true, 0.0, risVis);
-            }
+            // }
 
             if (bounce >= maxBounces) {
                 break;
@@ -970,12 +976,12 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, uvec2 pix, uint sample
             gv_motionObjDisp = payload.motionPrev;
         }
 
-        float emission = payloadEmission();
+        // float emission = payloadEmission();
         // bool gateEmitter = risOn && payloadEmitterInList();
-        bool gateEmitter = true;
-        if (emission > 0.0 && (!gateEmitter || showCelestial)) {
-            L += throughput * albedo * emission;
-        }
+        // bool gateEmitter = true;
+        // if (emission > 0.0 && (!gateEmitter || showCelestial)) {
+        //     L += throughput * albedo * emission;
+        // }
 
         vec3 lightDir = worldPush.lightDir.xyz;
         float lightHalfAngle = worldPush.lightDir.w;
@@ -1004,14 +1010,14 @@ vec3 tracePath(vec3 ro, vec3 rd, float primaryConeSpread, uvec2 pix, uint sample
             }
         }
 
-        if (risOn) {
-            float activeSss = bounce <= MAX_SSS_BOUNCE ? sss : 0.0;
-            Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, pbr, false, activeSss,
-                    seed, proposalSeed);
-            vec3 risVis;
-            L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, pbr, false,
-                    activeSss, risVis);
-        }
+        // if (risOn) {
+            // float activeSss = bounce <= MAX_SSS_BOUNCE ? sss : 0.0;
+            // Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, pbr, false, activeSss,
+            //         seed, proposalSeed);
+            // vec3 risVis;
+            // L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, pbr, false,
+            //         activeSss, risVis);
+        // }
 
         if (sss > 0.0 && bounce <= MAX_SSS_BOUNCE) {
             float backNdl = max(0.0, dot(-n, lightDir));
