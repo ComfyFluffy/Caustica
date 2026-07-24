@@ -569,12 +569,15 @@ public final class RtComposite {
                             VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt world push " + i);
                 }
             }
+            // Outside the output != null check below, deliberately: the light texture is fixed-size and
+            // resolution-independent, so unlike the output/guide images it is ready to bind the moment the
+            // pipeline exists. Binding it in there instead would miss the (normal) case where ensureWorld
+            // runs before the first ensureOutput -- ensureOutput's own rebind path only re-points the
+            // storage + guide images, so nothing would ever write this descriptor.
+            worldPipeline.setExtraStorageImage(LIGHT_TEXTURE_SLOT, lightTextureImage.view);
             if (output != null) {
                 worldPipeline.setStorageImage(output.view);
                 bindGuideImages();
-                // Bound exactly once here, never resized/rebound again for this pipeline's lifetime --
-                // see LIGHT_TEXTURE_CAPACITY's comment for why.
-                worldPipeline.setExtraStorageImage(LIGHT_TEXTURE_SLOT, lightTextureImage.view);
             }
             bindWorldTextures(ctx, !pipelineOnlyRebindPending);
             reloadRebindRequested = false;
@@ -761,6 +764,7 @@ public final class RtComposite {
             return;
         }
         long srcHandle = terrain.lightBufferHandle();
+        long srcOffset = terrain.lightBufferOffset();
         int lightCount = Math.min(terrain.lightCount(), LIGHT_TEXTURE_CAPACITY);
         if (lightCount <= 0 || srcHandle == 0L) {
             return;
@@ -779,7 +783,7 @@ public final class RtComposite {
                 int next = 0;
                 if (fullRows > 0) {
                     VkBufferImageCopy region = regions.get(next++);
-                    region.bufferOffset(0L).bufferRowLength(rowTexels).bufferImageHeight(0);
+                    region.bufferOffset(srcOffset).bufferRowLength(rowTexels).bufferImageHeight(0);
                     region.imageSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
                             .mipLevel(0).baseArrayLayer(0).layerCount(1);
                     region.imageOffset().set(0, 0, 0);
@@ -787,7 +791,7 @@ public final class RtComposite {
                 }
                 if (tailLights > 0) {
                     VkBufferImageCopy region = regions.get(next);
-                    region.bufferOffset((long) fullRows * LIGHT_TEXTURE_LIGHTS_PER_ROW
+                    region.bufferOffset(srcOffset + (long) fullRows * LIGHT_TEXTURE_LIGHTS_PER_ROW
                                     * LIGHT_TEXTURE_BYTES_PER_LIGHT)
                             .bufferRowLength(0).bufferImageHeight(0);
                     region.imageSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)

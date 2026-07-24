@@ -167,7 +167,10 @@ final class RtLightGridManager {
         RtBuffer arena = null;
         RtBuffer upload = null;
         try {
-            int usage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            // TRANSFER_SRC so RtComposite#refreshLightTexture can copy this arena into the RIS light-record
+            // texture (see docs/SAFE_MODE_BISECT.md); the arena is otherwise only ever a copy destination.
+            int usage = VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                    | VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
             arena = ctx.createAsyncBuffer(layout.totalBytes, usage, false,
                     "terrain light hierarchy arena " + requestId);
             upload = ctx.createUploadBuffer(layout.totalBytes,
@@ -364,6 +367,9 @@ final class RtLightGridManager {
         }
 
         long lightAddress() { return address(layout.lightOffset); }
+        /** Byte offset of the light records within {@link #arena}, for a copy that needs a buffer handle
+         *  + offset rather than a device address (see RtComposite#refreshLightTexture). */
+        long lightOffset() { return layout.lightOffset; }
         long globalAliasAddress() { return address(layout.globalAliasOffset); }
         long localAliasAddress() { return layout.hasGrid ? address(layout.localAliasOffset) : 0L; }
         long cellAddress() { return layout.hasGrid ? address(layout.cellOffset) : 0L; }

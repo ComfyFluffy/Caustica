@@ -248,6 +248,13 @@ public final class RtTerrain {
         return arena != null ? arena.handle : 0L;
     }
 
+    /** Byte offset of the light records inside {@link #lightBufferHandle()}'s buffer. Currently always 0
+     *  (the arena layout puts lights first), but read explicitly so a layout change can't silently make
+     *  the copy read the wrong region. */
+    public long lightBufferOffset() {
+        return lightGrid.published().lightOffset();
+    }
+
     /** Power-weighted light alias table device address, or 0 for the shader's uniform fallback. */
     public long lightAliasBufferAddress() {
         return lightGrid.published().globalAliasAddress();
