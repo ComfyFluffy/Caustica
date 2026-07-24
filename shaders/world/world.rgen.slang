@@ -720,9 +720,13 @@ float3 visibility(float3 origin, float3 dir, float tmax) {
     // shader worth executing (SKIP_CLOSEST_HIT_SHADER), so a==1.0 (only ever written by shadow.rmiss)
     // is the traversal-missed signal — an accepted opaque hit never touches shadowVis.a at all.
 #ifdef NO_SER
+    // missIndex=1: shadow.rmiss (SBT miss index 1). Unlike the SER path below (HitObject.IsMiss() without
+    // Invoke — never triggers a miss shader), a plain TraceRay genuinely invokes the miss shader on
+    // escape, so this must point at shadow.rmiss (sets shadowVis.a=1.0), not miss index 0 (world.rmiss,
+    // the sky/Payload miss — invoking it here would stomp shadowVis with unrelated sky-shader writes).
     TraceRay(topLevelAS,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-            CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 0u,
+            CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, 1u,
             makeRay(origin, RAY_TMIN, dir, tmax), shadowVis);
     return shadowVis.a == 1.0 ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
 #else
@@ -864,7 +868,7 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, uint2 pix, uint 
         printf("RIS enabled: lightCount=%u, risCandidates=%u, lightBufAddr=%u\n",
                 worldPush.lightCount, worldPush.risCandidates, worldPush.lightBufAddr);
     }
-    // risOn = false;
+    risOn = false;
     // Independent light-proposal RNG. Screen-space coherent selection is intentionally deferred until
     // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
     uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u

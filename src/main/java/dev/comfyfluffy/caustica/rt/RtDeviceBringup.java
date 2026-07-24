@@ -208,6 +208,11 @@ public final class RtDeviceBringup {
     /** {@code NO_SER} when {@code false}: world.rgen falls back to plain TraceRay (no HitObject / ReorderThread). */
     private static final String WORLD_RAYGEN_SER = "world.rgen.spv";
     private static final String WORLD_RAYGEN_NO_SER = "world_noser.rgen.spv";
+    // Hand-written GLSL raygen (shaders/world/world_glsl.rgen) — a feature-parity port of
+    // world.rgen.slang's NO_SER path, interface-compatible with the unchanged Slang-compiled
+    // world.rchit/rahit/rmiss/shadow.rmiss stages. Currently the active raygen for all devices; the
+    // Slang world.rgen.slang variants above are kept compiled but unused.
+    private static final String WORLD_RAYGEN_GLSL = "world_glsl.rgen.spv";
 
     private record FeatureSupport(List<String> missingRequired, boolean ser,
                                   boolean omm, boolean presentId, boolean wideLines) {
@@ -225,7 +230,8 @@ public final class RtDeviceBringup {
     }
 
     public static String worldRaygenShader() {
-        return serEnabled ? WORLD_RAYGEN_SER : WORLD_RAYGEN_NO_SER;
+        // return serEnabled ? WORLD_RAYGEN_SER : WORLD_RAYGEN_NO_SER;
+        return WORLD_RAYGEN_GLSL;
     }
 
     public static boolean serExtEnabled() {

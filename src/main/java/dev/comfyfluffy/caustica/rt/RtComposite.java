@@ -515,7 +515,11 @@ public final class RtComposite {
         if (worldPipeline == null) {
             bindlessTextureCapacity = RtEntityTextures.maxTextures();
             worldPipeline = RtPipeline.create(ctx, RtDeviceBringup.worldRaygenShader(),
-                    new String[]{"world.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
+                    // Miss index 0 = sky (world.rmiss), 1 = shadow/visibility (shadow.rmiss) — matched by
+                    // visibility()'s traceRay missIndex in world_glsl.rgen / world.rgen.slang's NO_SER path.
+                    // The SER path never triggers a miss shader for shadow rays (HitObject.IsMiss() without
+                    // Invoke), so shadow.rmiss only actually runs under NO_SER / the GLSL raygen.
+                    new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
                     WorldPushConstantsData.BYTE_SIZE, true, GUIDE_COUNT, bindlessTextureCapacity, true);
             // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.
             // Safe mode (rt.safe.noPushRing) allocates a fresh buffer per frame instead, so skip the ring.
