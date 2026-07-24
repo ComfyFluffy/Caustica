@@ -637,8 +637,8 @@ Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAl
         float3 le = lightRadiance(lg);
         float3 lightNormal = lightGeometricNormal(lg);
         float phat = 0.0;
-        // evalSampleContrib(sp, lightNormal, le, lg.posArea.w, hitPos, n, v, rd,
-        //         diffAlb, F0, rough, pbr, twoSided, sss, phat);
+        evalSampleContrib(sp, lightNormal, le, lg.posArea.w, hitPos, n, v, rd,
+                diffAlb, F0, rough, pbr, twoSided, sss, phat);
         if (phat <= 0.0) {
             continue;
         }
