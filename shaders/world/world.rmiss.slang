@@ -14,7 +14,11 @@ import world_common;
 
 // Vanilla celestials atlas (sun + moon-phase sprites), bound by RtComposite. Sampled with an explicit
 // LOD (no derivatives in a miss shader). The sun/moon discs are drawn from its real texels.
-[[vk::binding(9, 0)]] Sampler2D celestialsAtlas;
+// Binding shifts with GUIDE_COUNT (RtComposite): sky binding = firstExtraBinding + extraStorageImages,
+// so it moves whenever the extra-storage-image count changes (currently 10 = 3 + 7, since the RIS
+// Light-record texture experiment added a 7th extra-storage-image slot at binding 9 — see
+// world.rgen.slang's gLightData).
+[[vk::binding(10, 0)]] Sampler2D celestialsAtlas;
 
 static const float PI = 3.14159265359;
 float pow2(float x) { return x * x; }
