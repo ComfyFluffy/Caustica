@@ -73,19 +73,41 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     // remains active with its full configured candidate count at every hit. Pass A's primary/interface
     // prefix is outside this SSS quality budget.
     int indirectDepth = 0;
+    // Domain of the next continuation ray. The first trace resumes the record's domain; every later
+    // iteration re-selects it below, at the loop's single continuation-domain assignment point.
+    uint nextDomain = normalizeSecondaryDomain(seg.secondaryDomain);
+    uint baseSurfaceDomain = SECONDARY_DOMAIN_WORLD;
+    uint scatterClass = SCATTER_DIFFUSE;
+    // Camera-visible transmission continuity: seeded by the record, kept only across transmission
+    // lobes, cleared by everything else — and while true, transmission continuations stay in the
+    // local-view domain so the visible player never switches representation mid-chain.
+    bool cameraTransmissionContinuity = seg.cameraTransmissionContinuity;
     for (int bounce = seg.bounce; bounce <= maxBounces; bounce++) {
+        // The single continuation-domain assignment point, live once a prior hit has selected a lobe.
+        // Assigning per-branch instead would let a new upstream continuation path silently inherit the
+        // wrong domain without a rebase conflict.
+        if (bounce > seg.bounce) {
+            cameraTransmissionContinuity = cameraTransmissionContinuity
+                    && scatterClass == SCATTER_TRANSMISSION;
+            nextDomain = continuationDomainForLobe(baseSurfaceDomain, scatterClass,
+                    cameraTransmissionContinuity);
+        }
         // Radiance SBT records run any-hit only for true alpha cutout. Translucent/water go straight to
         // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
-        // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the first-person
-        // player. Bounce rays are secondary (CULL_SECONDARY): exclude particles, include the player.
+        // Primary (bounce 0) is the camera ray (CULL_PRIMARY): sees particles but not the world stand-in.
+        // Every later ray takes its continuation domain — world surfaces keep CULL_SECONDARY for every
+        // lobe; a local-view surface's reflection-class lobes take CULL_REFLECTION, its other lobes
+        // CULL_LOCAL_VIEW_SECONDARY.
 #ifdef CAUSTICA_ENABLE_EXT_SER
         // SER lifetime phase: keep paths that are not roulette-eligible, paths that may terminate via
         // roulette, and paths guaranteed to end at the bounce cap in separate coherence groups.
         uint pathPhaseHint = bounce >= maxBounces ? 2u : (bounce >= rrStart ? 1u : 0u);
-        traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
+        traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : secondaryMaskForDomain(nextDomain),
+                               ro, 0.0, rd, 10000.0,
                                showCelestial, rayConeWidth, rayConeSpread, pathPhaseHint);
 #else
-        traceRadiance(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
+        traceRadiance(bounce == 0 ? CULL_PRIMARY : secondaryMaskForDomain(nextDomain),
+                      ro, 0.0, rd, 10000.0,
                       showCelestial, rayConeWidth, rayConeSpread);
 #endif
 
@@ -93,7 +115,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             // A ray still in water should leave through a water interface. A miss instead means the
             // streamed/open volume has no known exit; do not reinterpret that unknown region as air
             // and reveal sky.
-            if (medium.current.water) {
+            if (mediumIsWater(medium.current)) {
                 break;
             }
 
@@ -104,6 +126,13 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             L += throughput * sky; // escaped to sky
             break;
         }
+
+        // Latch this hit's base domain before anything can overwrite the global payload. Every
+        // shadow/NEE/RIS/SSS ray cast from this vertex consumes baseSurfaceMask; the continuation's
+        // domain is selected separately, at the top of the next iteration, once the lobe is known.
+        baseSurfaceDomain = secondaryDomainForSurface(payload.flags);
+        uint baseSurfaceMask = secondaryMaskForDomain(baseSurfaceDomain);
+        scatterClass = SCATTER_DIFFUSE;
 
         // Beer–Lambert: attenuate along the segment just travelled by the medium it lay inside. Applies
         // to every hit reached while inside a volume dielectric (its own exit face, or whatever content
@@ -152,34 +181,47 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             }
 
             // The medium this face opens into, and the one it returns to on the way out — which is what
-            // the stack remembers.
-            Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0), tint, transmission);
-            float etaI = medium.current.ior;
-            float etaT = entering ? entered.ior : medium.outer.ior;
-
-            float cosI = clamp(dot(-rd, n), 0.0, 1.0);
-            float F = fresnelDielectric(cosI, etaI, etaT);
-            float3 transmittedDir = refract(rd, n, etaI / etaT);
+            // the stack remembers. Identity resolution decides whether the face is an optical event:
+            // entering and current-layer exits run Fresnel; a deeper or unmatched exit passes straight
+            // through, at most dropping the matched layer (see medium.slang).
+            Medium entered = makeDielectricMedium(payloadMediumId(), max(payloadIor(), 1.0),
+                                                  tint, transmission);
+            uint exitMatch = entering ? MEDIUM_EXIT_NO_MATCH : mediumResolveExit(medium, entered.mediumId);
+            bool opticalEvent = entering || exitMatch == MEDIUM_EXIT_CURRENT;
             // The translucent terrain layer is recessed by TRANSLUCENT_INSET (RtTerrainMesher), so a
             // glass/ice face touching a slab or stair sits a hair behind that neighbour's surface. A full
             // SURF_BIAS would restart the transmitted ray past the neighbour and see through it. Water
             // comes from the fluid mesher, which applies no inset, so it takes the ordinary bias.
             float transmitBias = isWater ? SURF_BIAS : INSET_TRANSMIT_BIAS;
 
-            bool chooseReflection = rndf(seed) < F;
-            if (chooseReflection) {
-                rd = reflect(rd, n);
-                ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, SURF_BIAS);
-            } else {
-                if (dot(transmittedDir, transmittedDir) <= 0.0) break; // TIR with F < 1 cannot happen
-                rd = normalize(transmittedDir);
+            if (!opticalEvent) {
+                scatterClass = SCATTER_TRANSMISSION;
+                if (mediumExitIsDeep(exitMatch)) {
+                    mediumCommitExit(medium, exitMatch);
+                }
                 ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, transmitBias);
-                // Crossing into or out of the volume. Absorption is the medium's job from here, so the
-                // tint is NOT also multiplied into the throughput — that would double-count it.
-                if (entering) {
-                    mediumPush(medium, entered);
+            } else {
+                float etaI = medium.current.ior;
+                float etaT = entering ? entered.ior : medium.parent1.ior;
+                float cosI = clamp(dot(-rd, n), 0.0, 1.0);
+                float F = fresnelDielectric(cosI, etaI, etaT);
+                float3 transmittedDir = refract(rd, n, etaI / etaT);
+                bool chooseReflection = rndf(seed) < F;
+                scatterClass = chooseReflection ? SCATTER_REFLECTION : SCATTER_TRANSMISSION;
+                if (chooseReflection) {
+                    rd = reflect(rd, n);
+                    ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, SURF_BIAS);
                 } else {
-                    mediumPop(medium);
+                    if (dot(transmittedDir, transmittedDir) <= 0.0) break; // TIR with F < 1 cannot happen
+                    rd = normalize(transmittedDir);
+                    ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, transmitBias);
+                    // Crossing into or out of the volume. Absorption is the medium's job from here, so the
+                    // tint is NOT also multiplied into the throughput — that would double-count it.
+                    if (entering) {
+                        if (!mediumPush(medium, entered)) break;
+                    } else {
+                        mediumCommitExit(medium, exitMatch);
+                    }
                 }
             }
             showCelestial = true; // specular interface: the continuation ray may see the sun/moon disc
@@ -211,7 +253,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             float ndl = abs(signedNdl);
             if (ndl > 0.0) {
                 float3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
-                float3 vis = visibility(shadowOrigin, lightDir, 10000.0).transmittance;
+                float3 vis = visibility(baseSurfaceMask, shadowOrigin, lightDir, 10000.0).transmittance;
                 if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
                     L += throughput * albedo * INV_PI * celestialLight.illuminance * ndl * vis;
                 }
@@ -224,8 +266,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                 float3 v = -rd;
                 Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
                                          true, 0.0, seed, proposalSeed);
-                L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
-                                                 true, 0.0);
+                L += throughput * shadeReservoir(baseSurfaceMask, r, hitPos, n, v, rd, albedo,
+                                                 float3(0.0, 0.0, 0.0), 1.0, true, 0.0);
             }
 
             if (bounce >= maxBounces) {
@@ -286,12 +328,12 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         }
         float ndl = max(0.0, dot(n, lightDir));
         if (ndl > 0.0) {
-            VisibilityResult shadow = visibility(p, lightDir, 10000.0);
+            VisibilityResult shadow = visibility(baseSurfaceMask, p, lightDir, 10000.0);
             float3 vis = shadow.transmittance;
             // Underwater receiver whose shadow ray crossed a water surface: scale the direct light by
             // the wave-refraction caustic at the exit point. Focusing scales the incident irradiance,
             // so it applies to the whole NEE term (diffuse + specular).
-            if (medium.current.water && waterWaves && shadow.waterHitT > 0.0) {
+            if (mediumIsWater(medium.current) && waterWaves && shadow.waterHitT > 0.0) {
                 vis *= waterCaustic(p + lightDir * shadow.waterHitT, lightDir, shadow.waterHitT);
             }
             if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
@@ -317,8 +359,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             float activeSss = hitDepth <= MAX_SSS_INDIRECT_DEPTH ? sss : 0.0;
             Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, false, activeSss,
                                      seed, proposalSeed);
-            L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, false,
-                                             activeSss);
+            L += throughput * shadeReservoir(baseSurfaceMask, r, hitPos, n, v, rd, diffAlb, F0, rough,
+                                             false, activeSss);
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the
@@ -329,11 +371,12 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         if (sss > 0.0 && hitDepth <= MAX_SSS_INDIRECT_DEPTH) {
             float backNdl = max(0.0, dot(-n, lightDir));
             if (backNdl > 0.0) {
-                VisibilityResult shadowBack = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
+                VisibilityResult shadowBack = visibility(baseSurfaceMask, hitPos - n * SURF_BIAS,
+                                                         lightDir, 10000.0);
                 float3 visB = shadowBack.transmittance;
                 // Same caustic as the front-face NEE — underwater kelp/seagrass transmission should
                 // flicker with the same light bands as the floor around it.
-                if (medium.current.water && waterWaves && shadowBack.waterHitT > 0.0) {
+                if (mediumIsWater(medium.current) && waterWaves && shadowBack.waterHitT > 0.0) {
                     visB *= waterCaustic(hitPos + lightDir * shadowBack.waterHitT,
                                          lightDir, shadowBack.waterHitT);
                 }
@@ -356,6 +399,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                        ? 1.0
                        : clamp(luminance(F0) / (luminance(F0) + luminance(diffAlb) + 1.0e-4), 0.1, 0.9);
         if (rndf(seed) < ps) {
+            scatterClass = SCATTER_REFLECTION;
             float3 l;
             if (exactSpecular) {
                 // Authored zero is a delta distribution, not a narrow finite GGX lobe. This avoids the

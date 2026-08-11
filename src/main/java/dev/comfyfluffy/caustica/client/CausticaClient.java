@@ -1,6 +1,7 @@
 package dev.comfyfluffy.caustica.client;
 
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.compat.firstperson.FirstPersonModelBridge;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtComposite;
@@ -15,13 +16,17 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.InvalidateRenderStateCallback;
+import net.fabricmc.loader.api.FabricLoader;
 
 public final class CausticaClient implements ClientModInitializer {
+	private static final String FIRST_PERSON_MODEL_MOD_ID = "firstperson";
 	private static boolean rtInitDone = false;
 
 	@Override
 	public void onInitializeClient() {
 		CausticaMod.LOGGER.info("Caustica client initialized");
+
+		registerFirstPersonModelBridge();
 
 		// Class-init runs DebugScreenEntries.register(...) via its ID field; touching the class here
 		// makes the entry discoverable in F3's entry list. Off by default -- the player opts in the
@@ -80,6 +85,20 @@ public final class CausticaClient implements ClientModInitializer {
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
 			shutdownRt();
 		});
+	}
+
+	private static void registerFirstPersonModelBridge() {
+		// Guarding on the loader keeps the bridge class — and the mod types it links against — untouched
+		// when the mod is absent, which is the normal case and must stay silent.
+		if (!FabricLoader.getInstance().isModLoaded(FIRST_PERSON_MODEL_MOD_ID)) {
+			return;
+		}
+		try {
+			FirstPersonModelBridge.register();
+		} catch (LinkageError e) {
+			CausticaMod.LOGGER.warn("FirstPerson Model is installed but its bridge failed to link; "
+					+ "first-person ray-traced geometry stays disabled", e);
+		}
 	}
 
 	private static void shutdownRt() {

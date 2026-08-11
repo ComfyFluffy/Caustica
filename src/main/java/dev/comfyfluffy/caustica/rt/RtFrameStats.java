@@ -38,6 +38,7 @@ public final class RtFrameStats {
                     "terrain.drainCompletion",
                     "terrain.snapshotDispatch",
                     "terrain.publish",
+                    "terrain.lightGridPublish",
                     "entity.capture",
                     "entity.capture.extract",
                     "entity.capture.submit",
@@ -89,7 +90,8 @@ public final class RtFrameStats {
                     "entityPackedBytes", "entityPackedPaddingBytes", "entityRetainedGeometryBytes",
                     "entityFrameListsWaits", "entityTableWaits", "entitySlotWaits",
                     "entityGraphicsWaitNanos", "entityMotionFlushes", "entityTableFlushes",
-                    "entityBlockEntityRetirements", "entitySlotRetirements", "entityTableRetirements"},
+                    "entityBlockEntityRetirements", "entitySlotRetirements", "entityTableRetirements",
+                    "firstPersonInstances", "localViewInstances", "worldStandInInstances"},
             true);
 
     private static final List<GarbageCollectorMXBean> GC_BEANS = ManagementFactory.getGarbageCollectorMXBeans();

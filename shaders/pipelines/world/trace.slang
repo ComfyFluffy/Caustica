@@ -7,14 +7,76 @@ import world_common;
 import world_core;
 import bindings;
 
+// Ray inclusion masks, not cull classes: each is ANDed against an instance's TLAS visibility mask and
+// the instance is visible when the result is non-zero. The CULL_ prefix is historical.
 public static const uint CULL_SECONDARY = 0x01u;
 public static const uint CULL_PRIMARY = 0x02u;
+public static const uint CULL_LOCAL_VIEW_SECONDARY = 0x04u;
+// Reflection domain: continuation rays and specular probes leaving a local-view surface through a
+// reflection-class lobe (interface Fresnel reflection, delta specular, glossy VNDF). Scene geometry's
+// 0xFF instance mask contains this bit while neither player representation's mask does, so a local-view
+// reflection can never contain the player.
+public static const uint CULL_REFLECTION = 0x08u;
+
+// The three legal values of a path record's packed secondary-domain field; the fourth two-bit encoding
+// is never packed. WORLD doubles as the normalization target for camera-replayed records.
+public static const uint SECONDARY_DOMAIN_WORLD = 0u;
+public static const uint SECONDARY_DOMAIN_LOCAL_VIEW = 1u;
+public static const uint SECONDARY_DOMAIN_REFLECTION = 2u;
+
+// Scatter classes a continuation lobe falls into; the pass-through of an optically inert medium face
+// counts as transmission.
+public static const uint SCATTER_REFLECTION = 0u;
+public static const uint SCATTER_TRANSMISSION = 1u;
+public static const uint SCATTER_DIFFUSE = 2u;
+
 public static const uint TERRAIN_BUCKETS = 4u;
 public static const uint SBT_RADIANCE = 0u;
 public static const uint SBT_SHADOW = TERRAIN_BUCKETS;
 public static const uint SBT_STRIDE_BUCKET = 1u;
 public static const uint MISS_RADIANCE = 0u;
 public static const uint MISS_GUIDE = 1u;
+
+public uint normalizeSecondaryDomain(uint domain) {
+    return domain == SECONDARY_DOMAIN_LOCAL_VIEW || domain == SECONDARY_DOMAIN_REFLECTION
+            ? domain : SECONDARY_DOMAIN_WORLD;
+}
+
+public uint secondaryMaskForDomain(uint domain) {
+    uint normalized = normalizeSecondaryDomain(domain);
+    if (normalized == SECONDARY_DOMAIN_LOCAL_VIEW) return CULL_LOCAL_VIEW_SECONDARY;
+    if (normalized == SECONDARY_DOMAIN_REFLECTION) return CULL_REFLECTION;
+    return CULL_SECONDARY;
+}
+
+// A continuation ray's domain, decided once per hit after the scatter lobe is chosen. An unbroken
+// camera-visible transmission chain keeps the local-view domain across world interfaces (both player
+// representations then resolve consistently through water and glass); otherwise world surfaces keep the
+// world domain for every lobe, and a local-view surface sends reflection-class lobes into the
+// reflection domain and every other lobe into its own local-view domain.
+public uint continuationDomainForLobe(uint baseSurfaceDomain, uint scatterClass,
+                                      bool cameraTransmissionContinuity) {
+    if (scatterClass == SCATTER_TRANSMISSION && cameraTransmissionContinuity) {
+        return SECONDARY_DOMAIN_LOCAL_VIEW;
+    }
+    if (baseSurfaceDomain == SECONDARY_DOMAIN_LOCAL_VIEW) {
+        return scatterClass == SCATTER_REFLECTION
+                ? SECONDARY_DOMAIN_REFLECTION : SECONDARY_DOMAIN_LOCAL_VIEW;
+    }
+    return SECONDARY_DOMAIN_WORLD;
+}
+
+// The base domain a secondary ray inherits from the surface it leaves. The flags word is an explicit
+// parameter rather than a read of the global payload: the global is overwritten by the next trace, so a
+// caller must name WHICH hit it derives from.
+public uint secondaryDomainForSurface(uint payloadFlags) {
+    return (payloadFlags & PAYLOAD_SURFACE_LOCAL_VIEW) != 0u
+            ? SECONDARY_DOMAIN_LOCAL_VIEW : SECONDARY_DOMAIN_WORLD;
+}
+
+public uint secondaryMaskForSurface(uint payloadFlags) {
+    return secondaryMaskForDomain(secondaryDomainForSurface(payloadFlags));
+}
 
 public RayDesc makeRay(float3 origin, float tmin, float3 dir, float tmax) {
     RayDesc r;
@@ -96,7 +158,7 @@ public Payload makeShadowPayload() {
     return shadowPayload;
 }
 
-public VisibilityResult visibility(float3 origin, float3 dir, float tmax) {
+public VisibilityResult visibility(uint rayMask, float3 origin, float3 dir, float tmax) {
     // Vulkan requires an identical payload structure for every stage reachable by this trace. The shadow
     // path uses only the albedo view as accumulated transmittance and hitT as the nearest-water crossing.
     Payload shadowPayload = makeShadowPayload();
@@ -106,7 +168,7 @@ public VisibilityResult visibility(float3 origin, float3 dir, float tmax) {
     // needs only ordinary TraceRay and no invocation-reorder capability.
     TraceRay(topLevelAS,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-            CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, MISS_GUIDE,
+            rayMask, SBT_SHADOW, SBT_STRIDE_BUCKET, MISS_GUIDE,
             makeRay(origin, RAY_TMIN, dir, tmax), shadowPayload);
     VisibilityResult result;
     result.transmittance = shadowPayload.flags == 0u

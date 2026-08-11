@@ -36,13 +36,18 @@ public struct SpecSurface {
     public float3 motionPrev;     // current-minus-previous displacement of the reflecting surface
     public float roughness;
     public float3 albedo;         // specular albedo fed to DLSS-RR for demodulation (0 = pure diffuse)
+    // Domain for the reflection probe. The interface's own domain, carried here because the probe runs
+    // from writeGuides — after tracePrimary returned and after the transmission chain has overwritten the
+    // global payload, at which point the primary hit's domain is no longer recoverable.
+    public uint secondaryRayMask;
 };
 public static SpecSurface gv_spec = {};
 
 // Static surfaces reuse one normal for all three roles. Water overrides them (wave-displaced shading
 // normal now and last frame, flat geometric normal for the bias) via the six-argument form.
 public SpecSurface makeSpecSurface(float3 camRel, float3 normal, float3 previousNormal,
-                            float3 biasNormal, float3 motionPrev, float roughness, float3 albedo) {
+                            float3 biasNormal, float3 motionPrev, float roughness, float3 albedo,
+                            uint secondaryRayMask) {
     SpecSurface s;
     s.camRel = camRel;
     s.normal = normal;
@@ -51,17 +56,20 @@ public SpecSurface makeSpecSurface(float3 camRel, float3 normal, float3 previous
     s.motionPrev = motionPrev;
     s.roughness = roughness;
     s.albedo = albedo;
+    s.secondaryRayMask = secondaryRayMask;
     return s;
 }
 
+// The convenience forms serve the static/sky/particle paths, which are always world surfaces.
 public SpecSurface makeSpecSurface(float3 camRel, float3 normal, float roughness, float3 albedo) {
     return makeSpecSurface(camRel, normal, normal, normal,
-            float3(0.0, 0.0, 0.0), roughness, albedo);
+            float3(0.0, 0.0, 0.0), roughness, albedo, CULL_SECONDARY);
 }
 
 public SpecSurface makeSpecSurface(float3 camRel, float3 normal, float3 motionPrev,
                             float roughness, float3 albedo) {
-    return makeSpecSurface(camRel, normal, normal, normal, motionPrev, roughness, albedo);
+    return makeSpecSurface(camRel, normal, normal, normal, motionPrev, roughness, albedo,
+            CULL_SECONDARY);
 }
 // angle can land behind the eye even though the reflector itself is comfortably in view.
 public float2 projectPrevNdc(float3 worldPos, out bool valid) {
@@ -107,7 +115,7 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
 
     // Pass A stops radiance traversal at the first split, so reflection motion keeps one dedicated,
     // deterministic guide probe.
-    traceGuide(CULL_SECONDARY,
+    traceGuide(surface.secondaryRayMask,
             offsetSurfaceOrigin(surfacePos, surface.biasNormal, specDir, SURF_BIAS),
             RAY_TMIN, specDir, 10000.0,
             max(length(surface.camRel) * primaryConeSpread, RAY_CONE_MIN_WIDTH),
@@ -158,10 +166,17 @@ public void setTransmissionGuide(float3 hitCamRel, float3 motionPrev, float3 nor
 
 // Deterministic ordinary guide behind the first transmitted interface. This is guide-only work:
 // radiance reflection/transmission continuations are queued at the first split and traced by Pass B.
-public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
+public void resolveTransmissionGuide(uint rayMask, float3 surfacePos, float3 transmittedDir,
                               float3 surfaceBiasNormal, MediumStack medium, float rayBias,
                               float rayConeWidth, float rayConeSpread, float3 guideFilter) {
     if (dot(transmittedDir, transmittedDir) <= 0.0) return;
+    // With the local view published, the whole chain keeps the union of the camera domain and the
+    // local-view secondary domain — matching the radiance chain's representation, never mid-switching
+    // to a mask that could hit the world stand-in. Unset keeps the per-crossing derivation below.
+    bool localViewPresent = (worldPush.flags & 4u) != 0u;
+    if (localViewPresent) {
+        rayMask = CULL_PRIMARY | CULL_LOCAL_VIEW_SECONDARY;
+    }
 
     float3 direction = normalize(transmittedDir);
     float3 ro = offsetSurfaceOrigin(surfacePos, surfaceBiasNormal, direction, rayBias);
@@ -169,7 +184,7 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
     // The camera interface consumed bounce 0; the remaining configured bounce budget is the natural
     // cap for deterministic guide crossings too.
     for (uint crossing = 0u; crossing < worldPush.maxBounces; ++crossing) {
-        traceGuide(CULL_PRIMARY, ro, RAY_TMIN, direction, 10000.0,
+        traceGuide(rayMask, ro, RAY_TMIN, direction, 10000.0,
                 rayConeWidth, rayConeSpread);
         if (payload.hitT <= 0.0) {
             setTransmissionGuide((ro + direction * 1.0e6) - worldPush.camOffset,
@@ -206,25 +221,50 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
                     worldPush.waterParams.w, waterFootprint);
         }
 
-        float transmission = clamp(payloadTransmission(), 0.0, 1.0);
-        Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0),
-                                              payloadAlbedo(), transmission);
-        float etaT = entering ? entered.ior : medium.outer.ior;
-        float3 nextDirection = refract(direction, interfaceNormal, medium.current.ior / etaT);
-        if (dot(nextDirection, nextDirection) <= 0.0) {
-            // Never let a TIR reflection become ordinary diffuse/depth.
+        // An ice interface ends the guide chain: depth, position, normal and motion all describe this
+        // interface, never a blend with the destination behind it. Shaped like the TIR endpoint above.
+        if (material == MATERIAL_DIELECTRIC && payloadSurfaceIce()) {
             setTransmissionGuide(interfacePos - worldPush.camOffset,
-                    isWater ? float3(0.0, 0.0, 0.0) : float3(payload.motionPrev),
-                    interfaceNormal, 0.0, float3(0.0, 0.0, 0.0), false);
+                    float3(payload.motionPrev), interfaceNormal, 0.0,
+                    float3(0.0, 0.0, 0.0), false);
             return;
         }
-        if (!isWater && entering) {
-            guideFilter *= payloadAlbedo();
+
+        float transmission = clamp(payloadTransmission(), 0.0, 1.0);
+        Medium entered = makeDielectricMedium(payloadMediumId(), max(payloadIor(), 1.0),
+                                              payloadAlbedo(), transmission);
+        uint exitMatch = entering ? MEDIUM_EXIT_NO_MATCH : mediumResolveExit(medium, entered.mediumId);
+        bool opticalEvent = entering || exitMatch == MEDIUM_EXIT_CURRENT;
+        float3 nextDirection = direction;
+        if (opticalEvent) {
+            float etaT = entering ? entered.ior : medium.parent1.ior;
+            nextDirection = refract(direction, interfaceNormal, medium.current.ior / etaT);
+            if (dot(nextDirection, nextDirection) <= 0.0) {
+                // Never let a TIR reflection become ordinary diffuse/depth.
+                setTransmissionGuide(interfacePos - worldPush.camOffset,
+                        isWater ? float3(0.0, 0.0, 0.0) : float3(payload.motionPrev),
+                        interfaceNormal, 0.0, float3(0.0, 0.0, 0.0), false);
+                return;
+            }
+            if (!isWater && entering) {
+                guideFilter *= payloadAlbedo();
+            }
+            if (entering) {
+                // A full stack ends the deterministic chain; the tuple keeps its last endpoint, the
+                // same fail-closed shape as exhausting the crossing budget.
+                if (!mediumPush(medium, entered)) {
+                    return;
+                }
+            } else {
+                mediumCommitExit(medium, exitMatch);
+            }
+        } else if (mediumExitIsDeep(exitMatch)) {
+            mediumCommitExit(medium, exitMatch);
         }
-        if (entering) {
-            mediumPush(medium, entered);
-        } else {
-            mediumPop(medium);
+        if (!localViewPresent) {
+            // Re-derive from THIS crossing, or a chain that leaves the local-view representation and
+            // enters world glass would keep probing in the local-view domain.
+            rayMask = CULL_PRIMARY | secondaryMaskForSurface(payload.flags);
         }
         direction = normalize(nextDirection);
         ro = offsetSurfaceOrigin(interfacePos, geometricNormal, direction,

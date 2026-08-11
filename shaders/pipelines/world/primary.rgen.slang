@@ -36,13 +36,17 @@ public PathSegment tracePrimary(PathSegment seg,
     uint seed = seg.seed;
     bool showCelestial = seg.showCelestial;
     bool waterWaves = (worldPush.flags & 16u) != 0u;
+    // The local view published this frame: camera-visible transmission chains then keep the local-view
+    // domain and seed the continuity bit; unset falls back to interface-derived domains, same frame.
+    bool localViewPresent = (worldPush.flags & 4u) != 0u;
     nextRecord = PATH_NO_NEXT;
 
     {
         int bounce = seg.bounce;
+        // Replayed by Pass B as the camera ray, so its domain field is normalized rather than derived.
         PathSegment terminal = makePathSegment(ro, rd, throughput, medium,
                                                rayConeWidth, rayConeSpread, seed, bounce,
-                                               showCelestial);
+                                               showCelestial, SECONDARY_DOMAIN_WORLD, localViewPresent);
         traceRadiance(CULL_PRIMARY, ro, 0.0, rd, 10000.0,
                       showCelestial, rayConeWidth, rayConeSpread);
 
@@ -88,8 +92,13 @@ public PathSegment tracePrimary(PathSegment seg,
                     float3 v = -rd;
                     gv_albedo = diffAlb;
                     gv_rough = rough;
-                    gv_spec = makeSpecSurface(gv_hitCamRel, n, float3(payload.motionPrev), rough,
-                                              rrSpecularAlbedo(payload.f0, rough, dot(n, v)));
+                    // A local-view surface's reflection probe belongs to the reflection domain — never
+                    // its own domain, so the probe cannot see either player representation. World
+                    // surfaces keep the world secondary domain; particles above always belong to it.
+                    gv_spec = makeSpecSurface(gv_hitCamRel, n, n, n, float3(payload.motionPrev), rough,
+                                              rrSpecularAlbedo(payload.f0, rough, dot(n, v)),
+                                              payloadSurfaceLocalView()
+                                                      ? CULL_REFLECTION : CULL_SECONDARY);
                 }
             }
 
@@ -127,13 +136,44 @@ public PathSegment tracePrimary(PathSegment seg,
         }
 
         float transmission = clamp(payloadTransmission(), 0.0, 1.0);
-        Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0),
+        Medium entered = makeDielectricMedium(payloadMediumId(), max(payloadIor(), 1.0),
                                               payloadAlbedo(), transmission);
-        float etaI = medium.current.ior;
-        float etaT = entering ? entered.ior : medium.outer.ior;
-        float F = fresnelDielectric(clamp(dot(-rd, n), 0.0, 1.0), etaI, etaT);
-        float3 transmittedDir = refract(rd, n, etaI / etaT);
         float transmitBias = isWater ? SURF_BIAS : INSET_TRANSMIT_BIAS;
+        // Identity resolution decides whether this face is an optical event at all: entering and
+        // current-layer exits run Fresnel and refraction; a deeper or unmatched exit lets the ray pass
+        // straight through, at most dropping the matched layer (see medium.slang).
+        uint exitMatch = entering ? MEDIUM_EXIT_NO_MATCH : mediumResolveExit(medium, entered.mediumId);
+        bool opticalEvent = entering || exitMatch == MEDIUM_EXIT_CURRENT;
+        MediumStack transmittedMedium = medium;
+        bool transmissionAvailable = true;
+        float F = 0.0;
+        float3 transmittedDir = rd;
+        if (opticalEvent) {
+            float etaI = medium.current.ior;
+            float etaT = entering ? entered.ior : medium.parent1.ior;
+            F = fresnelDielectric(clamp(dot(-rd, n), 0.0, 1.0), etaI, etaT);
+            transmittedDir = refract(rd, n, etaI / etaT);
+            if (entering) {
+                transmissionAvailable = mediumPush(transmittedMedium, entered);
+            } else {
+                mediumCommitExit(transmittedMedium, exitMatch);
+            }
+        } else if (mediumExitIsDeep(exitMatch)) {
+            mediumCommitExit(transmittedMedium, exitMatch);
+        }
+        // This interface's domains, read once here — before any guide probe below overwrites the global
+        // payload. Every continuation domain and guide mask in this branch derives from these: the
+        // transmission side keeps the interface's own secondary domain, the reflection side takes the
+        // reflection domain when the interface is local view.
+        bool interfaceLocalView = payloadSurfaceLocalView();
+        uint interfaceSecondaryDomain = secondaryDomainForSurface(payload.flags);
+        uint interfaceSecondaryMask = secondaryMaskForDomain(interfaceSecondaryDomain);
+        // Camera-visible transmission keeps the local-view domain whenever the local view is published,
+        // even through world water and glass; the reflection side is never part of that chain.
+        uint transmissionSecondaryDomain = localViewPresent
+                ? SECONDARY_DOMAIN_LOCAL_VIEW : interfaceSecondaryDomain;
+        uint interfaceReflectionDomain = interfaceLocalView
+                ? SECONDARY_DOMAIN_REFLECTION : SECONDARY_DOMAIN_WORLD;
 
         if (bounce == 0) {
             gv_normal = n;
@@ -145,16 +185,14 @@ public PathSegment tracePrimary(PathSegment seg,
             gv_motionObjDisp = isWater ? float3(0.0, 0.0, 0.0) : payload.motionPrev;
             gv_spec = makeSpecSurface(gv_hitCamRel, n, previousNormal, geometricNormal,
                                       isWater ? float3(0.0, 0.0, 0.0) : float3(payload.motionPrev),
-                                      gv_rough, float3(F, F, F));
-            if (dot(transmittedDir, transmittedDir) > 0.0) {
-                MediumStack guideMedium = medium;
-                if (entering) {
-                    mediumPush(guideMedium, entered);
-                } else {
-                    mediumPop(guideMedium);
-                }
-                resolveTransmissionGuide(hitPos, transmittedDir, geometricNormal,
-                        guideMedium, transmitBias, rayConeWidth, rayConeSpread,
+                                      gv_rough, float3(F, F, F),
+                                      secondaryMaskForDomain(interfaceReflectionDomain));
+            if (dot(transmittedDir, transmittedDir) > 0.0 && transmissionAvailable) {
+                // Guide-only: keeps the baseline's deliberate particle visibility (CULL_PRIMARY) while
+                // also reaching the player geometry the matching radiance path sees.
+                resolveTransmissionGuide(CULL_PRIMARY | interfaceSecondaryMask,
+                        hitPos, transmittedDir, geometricNormal,
+                        transmittedMedium, transmitBias, rayConeWidth, rayConeSpread,
                         !isWater && entering
                                 ? payloadAlbedo() : float3(1.0, 1.0, 1.0));
             }
@@ -162,21 +200,24 @@ public PathSegment tracePrimary(PathSegment seg,
 
         // Split once, write both post-interface continuations, and stop Pass A radiance traversal.
         // Pass B owns every radiance trace after this point.
-        bool splitEligible = dot(transmittedDir, transmittedDir) > 0.0
+        bool splitEligible = opticalEvent && dot(transmittedDir, transmittedDir) > 0.0
                 && F > 0.0 && F < 1.0;
+        if (splitEligible && !transmissionAvailable) {
+            // The transmission branch fails closed on a full stack; only the reflection survives.
+            float3 reflectedDir = reflect(rd, n);
+            return makePathSegment(
+                    offsetSurfaceOrigin(hitPos, geometricNormal, reflectedDir, SURF_BIAS),
+                    reflectedDir, throughput * F, medium,
+                    rayConeWidth, rayConeSpread, seed, bounce + 1,
+                    true, interfaceReflectionDomain, false);
+        }
         if (splitEligible) {
-            MediumStack transmittedMedium = medium;
-            if (entering) {
-                mediumPush(transmittedMedium, entered);
-            } else {
-                mediumPop(transmittedMedium);
-            }
             float3 deferredDir = normalize(transmittedDir);
             PathSegment deferred = makePathSegment(
                     offsetSurfaceOrigin(hitPos, geometricNormal, deferredDir, transmitBias),
                     deferredDir, throughput * (1.0 - F), transmittedMedium,
                     rayConeWidth, rayConeSpread, seed, bounce + 1,
-                    true);
+                    true, transmissionSecondaryDomain, localViewPresent);
             queue[splitRecord] = packPathSegment(deferred, PATH_NO_NEXT);
             nextRecord = splitRecord;
             float3 reflectedDir = reflect(rd, n);
@@ -184,8 +225,18 @@ public PathSegment tracePrimary(PathSegment seg,
                     offsetSurfaceOrigin(hitPos, geometricNormal, reflectedDir, SURF_BIAS),
                     reflectedDir, throughput * F, medium,
                     rayConeWidth, rayConeSpread, seed ^ 0xa511e9b3u, bounce + 1,
-                    true);
+                    true, interfaceReflectionDomain, false);
             return reflected;
+        }
+
+        if (!opticalEvent) {
+            // A deep or unmatched exit is optically inert: continue straight with unchanged direction
+            // and weight, carrying at most the deep removal. It still extends a transmission chain.
+            return makePathSegment(
+                    offsetSurfaceOrigin(hitPos, geometricNormal, rd, transmitBias),
+                    rd, throughput, transmittedMedium,
+                    rayConeWidth, rayConeSpread, seed, bounce + 1,
+                    true, transmissionSecondaryDomain, localViewPresent);
         }
 
         bool hasTransmission = dot(transmittedDir, transmittedDir) > 0.0;
@@ -196,19 +247,22 @@ public PathSegment tracePrimary(PathSegment seg,
                     offsetSurfaceOrigin(hitPos, geometricNormal, reflectedDir, SURF_BIAS),
                     reflectedDir, throughput * F, medium,
                     rayConeWidth, rayConeSpread, seed, bounce + 1,
-                    true);
+                    true, interfaceReflectionDomain, false);
         } else {
             float3 deferredDir = normalize(transmittedDir);
-            if (entering) {
-                mediumPush(medium, entered);
-            } else {
-                mediumPop(medium);
+            if (!transmissionAvailable) {
+                // Pure transmission with a full stack cannot proceed; fail closed with zero weight.
+                return makePathSegment(
+                        offsetSurfaceOrigin(hitPos, geometricNormal, deferredDir, transmitBias),
+                        deferredDir, float3(0.0, 0.0, 0.0), medium,
+                        rayConeWidth, rayConeSpread, seed, bounce + 1,
+                        true, transmissionSecondaryDomain, localViewPresent);
             }
             continuation = makePathSegment(
                     offsetSurfaceOrigin(hitPos, geometricNormal, deferredDir, transmitBias),
-                    deferredDir, throughput * (1.0 - F), medium,
+                    deferredDir, throughput * (1.0 - F), transmittedMedium,
                     rayConeWidth, rayConeSpread, seed, bounce + 1,
-                    true);
+                    true, transmissionSecondaryDomain, localViewPresent);
         }
         return continuation;
     }
@@ -233,7 +287,7 @@ void main() {
     uint seed = (dispatchIndex.x * 1973u + dispatchIndex.y * 9277u + 26699u)
             ^ (worldPush.frameIndex * 2654435761u);
     MediumStack cameraMedium = makeMediumStack((worldPush.flags & 1u) != 0u
-            ? makeDielectricMedium(true, WATER_IOR, worldPush.waterParams.xyz, 1.0)
+            ? makeDielectricMedium(MEDIUM_ID_WATER, WATER_IOR, worldPush.waterParams.xyz, 1.0)
             : airMedium());
     uint pixelIndex = dispatchIndex.y * dimensions.x + dispatchIndex.x;
     uint baseRecordCount = dimensions.x * dimensions.y;
@@ -242,7 +296,7 @@ void main() {
 
     seed = pcg(seed);
     PathSegment current = makePathSegment(origin, dir, float3(1.0, 1.0, 1.0),
-            cameraMedium, 0.0, rayConeSpread, seed, 0, true);
+            cameraMedium, 0.0, rayConeSpread, seed, 0, true, SECONDARY_DOMAIN_WORLD, false);
     uint nextRecord;
     PathSegment terminal = tracePrimary(
             current, queue, splitRecord, nextRecord);

@@ -18,11 +18,19 @@ void payloadSetPacked(inout Payload payload, uint material, float roughness, flo
     payload.iorTransmission = packHalf2(float2(ior, transmission));
 }
 
-// Which side of a dielectric face this hit is on, shared by every hit path. Comes from the face
-// orientation, so it is re-derived at each crossing instead of toggled (see PAYLOAD_DIELECTRIC_ENTERING).
-void payloadSetDielectric(inout Payload payload, uint material, bool entering) {
+// Which side of a dielectric face this hit is on, plus the volume's canonical medium identity and ice
+// marker, shared by every hit path. The side comes from the face orientation, so it is re-derived at
+// each crossing instead of toggled (see PAYLOAD_DIELECTRIC_ENTERING).
+void payloadSetDielectric(inout Payload payload, uint material, bool entering,
+        uint materialId, uint features) {
     if (material != MATERIAL_WATER && material != MATERIAL_DIELECTRIC) return;
     if (entering) payload.flags |= PAYLOAD_DIELECTRIC_ENTERING;
+    uint mediumId = material == MATERIAL_WATER
+            ? MEDIUM_ID_WATER : materialId + MEDIUM_ID_DIELECTRIC_BASE;
+    payload.flags |= (mediumId << PAYLOAD_MEDIUM_ID_SHIFT) & PAYLOAD_MEDIUM_ID_MASK;
+    if ((features & MATERIAL_FEATURE_ICE) != 0u) {
+        payload.flags |= PAYLOAD_SURFACE_ICE;
+    }
 }
 
 uint materialEmissionSource(MaterialHeader header, float emission) {
@@ -322,7 +330,11 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         payloadSetPacked(payload, material, surface.roughness, surface.metalness,
                 emission, sss, header.params.z, header.params.w,
                 materialEmissionSource(header, emission));
-        payloadSetDielectric(payload, material, entering);
+        payloadSetDielectric(payload, material, entering, pr.materialId, header.features);
+        // After payloadSetPacked, which ASSIGNS flags rather than OR-ing into it.
+        if ((g.reserved.x & ENTITY_GEOM_LOCAL_VIEW) != 0u) {
+            payload.flags |= PAYLOAD_SURFACE_LOCAL_VIEW;
+        }
         return;
     }
 
@@ -393,7 +405,8 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         payloadSetPacked(payload, MATERIAL_DIELECTRIC, glassSurface.roughness,
                 glassSurface.metalness, 0.0, 0.0, materialHeader.params.z,
                 materialHeader.params.w, EMISSION_SOURCE_NONE);
-        payloadSetDielectric(payload, MATERIAL_DIELECTRIC, entering);
+        payloadSetDielectric(payload, MATERIAL_DIELECTRIC, entering, pr.materialId,
+                materialHeader.features);
         return;
     }
 
@@ -430,7 +443,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     payloadSetPacked(payload, material, surface.roughness, surface.metalness,
             surface.emission, surface.sss, materialHeader.params.z, materialHeader.params.w,
             materialEmissionSource(materialHeader, surface.emission));
-    payloadSetDielectric(payload, material, entering);
+    payloadSetDielectric(payload, material, entering, pr.materialId, materialHeader.features);
     // RIS emitter-NEE membership: raygen gates this emitter's direct-hit emission term (RIS covers it).
     if ((pr.flags & TERRAIN_PRIM_IN_LIGHT_BUFFER) != 0u) {
         payload.flags |= PAYLOAD_EMITTER_IN_LIST;

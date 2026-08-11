@@ -2,6 +2,7 @@ package dev.comfyfluffy.caustica.rt.entity;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import dev.comfyfluffy.caustica.CausticaConfig;
+import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.ParticleEngineAccessor;
 import dev.comfyfluffy.caustica.mixin.ParticleGroupAccessor;
 import net.minecraft.client.Camera;
@@ -15,6 +16,7 @@ import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
+import net.minecraft.client.renderer.entity.state.AvatarRenderState;
 import net.minecraft.client.renderer.entity.state.EntityRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
@@ -84,10 +86,15 @@ public final class RtEntities {
     public static final int ENTITY_BIT = 0x800000;
     /** Custom-index flag (bit 22) marking a particle billboard instance (shares the entity geom table). */
     public static final int PARTICLE_BIT = 0x400000;
+    /** {@code EntityGeom.reserved} low-word flags; must stay in lock-step with {@code world_common.slang}. */
+    private static final int ENTITY_GEOM_LOCAL_VIEW = 1;
+    private static final int ENTITY_GEOM_WORLD_STAND_IN = 1 << 1;
     // TLAS visibility-mask bits, ANDed against the per-ray cull mask in world.rgen. Bit 0 = secondary rays
-    // (shadows / GI / reflections, CULL_SECONDARY); bit 1 = the primary camera ray (CULL_PRIMARY).
+    // leaving a world surface (shadows / GI / reflections, CULL_SECONDARY); bit 1 = the primary camera ray
+    // (CULL_PRIMARY); bit 2 = secondary rays leaving a local-view surface (CULL_LOCAL_VIEW_SECONDARY).
     private static final int MASK_SECONDARY = 0x01;
     private static final int MASK_PRIMARY = 0x02;
+    private static final int MASK_LOCAL_VIEW_SECONDARY = 0x04;
     /** Default mask: visible to every ray (terrain and ordinary entities use this). */
     private static final int MASK_ALL = 0xFF;
     /** Particles are primary-ray-only: visible/lit by the camera path, invisible to shadows/GI/reflections. */
@@ -182,6 +189,9 @@ public final class RtEntities {
     // Reusable capture pipeline (single-threaded on the render thread).
     private final RtEntityCollector collector = new RtEntityCollector();
     private final RtEntityCapture capture = new RtEntityCapture();
+    // The first-person body is meshed before the ordinary capture and only replaces it once its geometry
+    // is known to be non-empty, so a failed attempt must leave the ordinary buffer untouched.
+    private final RtEntityCapture fpCapture = new RtEntityCapture();
     private final PoseStack entityPoseStack = new PoseStack();
     private final PoseStack blockEntityPoseStack = new PoseStack();
     private CameraRenderState cameraState;
@@ -222,6 +232,10 @@ public final class RtEntities {
     // entities keep their float[] backing to avoid steady-state allocation churn.
     private Int2ObjectOpenHashMap<EntityPrev> prevVerts = new Int2ObjectOpenHashMap<>(entityMapCapacity());
     private Int2ObjectOpenHashMap<EntityPrev> curVerts = new Int2ObjectOpenHashMap<>(entityMapCapacity());
+
+    private String lastFirstPersonProviderId = null;
+    /** Session-scoped so the per-frame budget warning is logged once rather than every frame. */
+    private boolean warnedLocalViewBudget = false;
 
     // This frame's glowing entities (see GlowEntity) + the camera-relative offset (camera pos - rebase
     // origin) their positions are captured against, for RtGlowOutlineFeature's raster pass. Rebuilt every frame.
@@ -350,9 +364,14 @@ public final class RtEntities {
         long retryYawFitAfter;
     }
 
-    /** This frame's terrain and dynamic instance segments, entity BLAS builds, and geometry-table address. */
+    /**
+     * This frame's terrain and dynamic instance segments, entity BLAS builds, geometry-table address,
+     * and whether the camera entity's local-view representation was successfully published into the
+     * geometry table this frame.
+     */
     public record FrameEntities(List<RtAccel.Instance> baseInstances, List<RtAccel.Instance> dynamicInstances,
-                                List<RtAccel.PreparedBlas> blas, long geomTableAddr, FrameUse use) {
+                                List<RtAccel.PreparedBlas> blas, long geomTableAddr,
+                                boolean localViewPublished, FrameUse use) {
     }
 
     private record FrameUse(FrameLists lists, TableSlot table) {
@@ -380,6 +399,10 @@ public final class RtEntities {
     }
 
     private record Motion(long dispAddr, float rigidX, float rigidY, float rigidZ) {
+    }
+
+    /** A first-person body already meshed into {@link #fpCapture}, awaiting publication. */
+    private record FirstPersonCapture(String providerId, int motionId, float x, float y, float z) {
     }
 
     private static final class MotionSlice {
@@ -585,6 +608,7 @@ public final class RtEntities {
         TableSlot table;
         int count;        // geometry-table entries / TLAS instances
         int logicalCount; // ordinary entities + block entities + individual particles
+        boolean localViewPublished;
 
         final GraphicsUseWaiter graphicsUseWaiter;
 
@@ -608,12 +632,12 @@ public final class RtEntities {
     public FrameEntities beginFrame(RtContext ctx, List<RtAccel.Instance> base, int rbx, int rby, int rbz,
                                     double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
         if (!enabled()) {
-            return new FrameEntities(base, List.of(), List.of(), 0L, null);
+            return new FrameEntities(base, List.of(), List.of(), 0L, false, null);
         }
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
         if (level == null) {
-            return new FrameEntities(base, List.of(), List.of(), 0L, null);
+            return new FrameEntities(base, List.of(), List.of(), 0L, false, null);
         }
         float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
         setCamera(camX, camY, camZ, projection, viewRotation);
@@ -641,7 +665,7 @@ public final class RtEntities {
         RtFrameStats.FRAME.count("entityRetainedGeometryBytes", retainedGeometryBytes);
 
         if (build.instances == null) {
-            return new FrameEntities(base, List.of(), List.of(), 0L, null);
+            return new FrameEntities(base, List.of(), List.of(), 0L, false, null);
         }
         try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.uploadFlush")) {
             build.motion.flushWrites();
@@ -651,7 +675,7 @@ public final class RtEntities {
             }
         }
         return new FrameEntities(base, build.instances, build.blas, build.geomTableAddr,
-                new FrameUse(build.lists, build.table));
+                build.localViewPublished, new FrameUse(build.lists, build.table));
     }
 
     /** Associate every resource returned for a successfully enqueued frame with its graphics completion. */
@@ -697,11 +721,38 @@ public final class RtEntities {
             }
             boolean firstPersonSelf = entity == cameraEntity && firstPerson;
             int mask = firstPersonSelf ? MASK_SECONDARY : MASK_ALL;
+            // The stand-in flag rides the geometry record and forces the TLAS instance non-opaque, so
+            // any_hit can apply the exactly-once shadow semi-transmittance to the first-person body.
+            int entityGeomFlags = firstPersonSelf ? ENTITY_GEOM_WORLD_STAND_IN : 0;
             float ix;
             float iy;
             float iz;
             int id = entity.getId();
             EntityPrev prev = prevVerts.get(id);
+
+            // First-person compatibility: a provider-supplied camera-safe body is the camera entity's
+            // local-view representation, and the ordinary capture below stays its world-space stand-in for
+            // shadows, GI and reflections. The two occupy disjoint secondary domains, so the stand-in's head
+            // can no longer seal off the visible first-person surfaces the way a single fully-visible
+            // instance did.
+            //
+            // The precheck runs BEFORE the provider is queried, because one iteration now emits two table
+            // entries. The table is sized exactly maxEntities() and writeTableEntry indexes it by
+            // build.count, so entering here with only one slot left would write one entry past the end.
+            // Short budget therefore degrades to the stand-in alone rather than publishing half a player.
+            boolean localViewEligible = firstPersonSelf
+                    && CausticaConfig.Rt.Entities.FIRST_PERSON_COMPAT_ENABLED.value();
+            boolean localViewAdmitted = localViewEligible
+                    && admitsLocalView(maxEntities(), build.logicalCount);
+            if (localViewAdmitted) {
+                FirstPersonCapture fpReady = captureFirstPerson(build, dispatcher, entity, partial, id);
+                if (fpReady != null) {
+                    build.localViewPublished = localViewPresence(localViewEligible, localViewAdmitted,
+                            true, publishFirstPerson(ctx, build, fpReady, rbx, rby, rbz));
+                }
+            } else if (localViewEligible) {
+                warnLocalViewBudgetExhausted();
+            }
             capture.reset(prev != null ? prev.size / 3 : 0);
             try {
                 EntityRenderState state;
@@ -775,16 +826,23 @@ public final class RtEntities {
             boolean reused;
             long reuseStart = RtFrameStats.FRAME.startStage();
             try {
-                reused = appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
+                reused = appendRigidReuse(ctx, build, motion, id, mask, entityGeomFlags,
+                        ix - rbx, iy - rby, iz - rbz);
             } finally {
                 RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
             }
             if (!reused) {
                 appendCapture(ctx, build, motion, id, ENTITY_BIT, mask,
-                        translationTransform(ix - rbx, iy - rby, iz - rbz));
+                        translationTransform(ix - rbx, iy - rby, iz - rbz), entityGeomFlags);
             }
             build.logicalCount++;
             RtFrameStats.FRAME.count("entitiesCaptured", 1);
+            if (localViewEligible) {
+                // Counted where the instance actually lands, so this stays 0 on any path that captures
+                // nothing for the camera entity. Gated on eligibility too: with the toggle off there is no
+                // local view to stand in for, and the frame stats must match the baseline exactly.
+                RtFrameStats.FRAME.count("worldStandInInstances", 1);
+            }
             capturedThisFrame++;
         }
         Int2ObjectOpenHashMap<EntityPrev> oldPrev = prevVerts;
@@ -808,6 +866,140 @@ public final class RtEntities {
             placed[i + 2] = src[i + 2] + tz;
         }
         return placed;
+    }
+
+    /**
+     * Mesh the camera entity's first-person body, sourced from the selected provider's state rather than
+     * Caustica's own extraction, into {@link #fpCapture}. Returns {@code null} when no instance can be
+     * produced this frame, in which case the caller falls back to the ordinary capture; any provider throw
+     * trips the session-scoped circuit breaker and falls back to baseline.
+     *
+     * <p>Capture and publication are split so that a failure at any step leaves no persistent trace: the
+     * ordinary capture that then runs must be byte-for-byte what it would have been.
+     */
+    private FirstPersonCapture captureFirstPerson(FrameBuild build, EntityRenderDispatcher dispatcher,
+                                                  Entity entity, float partial, int entityId) {
+        if (entityId < 0) {
+            return null;
+        }
+        int fpMotionId = -(entityId + 1);
+
+        FirstPersonStateRegistry registry = FirstPersonStateRegistry.instance();
+        FirstPersonStateRegistry.SelectedProvider selected = registry.selectProvider();
+        if (selected == null) {
+            return null;
+        }
+
+        EntityRenderState fpState;
+        boolean cameraSafe;
+        try {
+            fpState = selected.provider.provideState(entity, partial);
+            if (fpState == null) {
+                return null;
+            }
+            cameraSafe = selected.safety.isCameraSafe(entity, fpState, partial);
+        } catch (Throwable t) {
+            registry.circuitBreak(selected.id, t);
+            return null;
+        }
+        if (!cameraSafe) {
+            return null;
+        }
+        // Only the vanilla identity field is read; no mod-specific state is interpreted here.
+        if (fpState instanceof AvatarRenderState avatar && avatar.id != entityId) {
+            registry.warnOwnershipMismatch(selected.id, entityId, avatar.id);
+            return null;
+        }
+
+        EntityPrev fpHistory = prevVerts.get(fpMotionId);
+        fpCapture.reset(fpHistory != null ? fpHistory.size / 3 : 0);
+        try {
+            collector.begin(fpCapture, true);
+            resetPoseStack(entityPoseStack);
+            dispatcher.submit(fpState, cameraState, 0.0, 0.0, 0.0, entityPoseStack, collector);
+        } catch (Throwable t) {
+            registry.circuitBreak(selected.id, t);
+            return null;
+        } finally {
+            collector.begin(null, false);
+            resetPoseStack(entityPoseStack);
+        }
+        if (fpCapture.isEmpty()) {
+            return null;
+        }
+        // The provider's state carries the mod's own positional offset, so this anchor is the mod's, not
+        // the player's real world position — Caustica reuses it without interpreting it.
+        return new FirstPersonCapture(selected.id, fpMotionId,
+                (float) fpState.x, (float) fpState.y, (float) fpState.z);
+    }
+
+    /**
+     * Whether the camera entity may still publish BOTH representations. One iteration emits two geometry-table
+     * entries, and the table is sized exactly {@code capacity}, so admitting the pair with a single free slot
+     * would write one entry past the end. Package-private so the bounds test exercises this exact predicate
+     * instead of a copy of it.
+     */
+    static boolean admitsLocalView(int capacity, int logicalCount) {
+        return capacity - logicalCount >= 2;
+    }
+
+    /**
+     * Report the entity budget denying the local-view representation. Warned at most once per session, like
+     * the provider circuit-breaker: the condition recurs every frame, so an unsuppressed warning would flood
+     * the log. Without it the player simply sees their hands vanish with nothing explaining why.
+     */
+    private void warnLocalViewBudgetExhausted() {
+        if (warnedLocalViewBudget) {
+            return;
+        }
+        warnedLocalViewBudget = true;
+        CausticaMod.LOGGER.warn("Entity budget left fewer than 2 free geometry-table slots; the camera "
+                + "entity falls back to its world stand-in alone and the first-person body is not drawn. "
+                + "Raise the RT entity limit to restore it.");
+    }
+
+    /**
+     * The publication verdict behind the frame's localViewPresent signal: true only when the
+     * compatibility gate, the two-slot budget admission, the provider capture (which folds provider
+     * absence, missing state, camera-unsafe state, ownership mismatch and the circuit breaker into one
+     * readiness fact) and the geometry-table write ALL held this frame. Kept pure so the definition is
+     * unit-testable; captureEntities feeds it the real per-frame facts, and every degraded path leaves
+     * the signal false.
+     */
+    static boolean localViewPresence(boolean compatEligible, boolean budgetAdmitted,
+                                     boolean captureReady, boolean instanceWritten) {
+        return compatEligible && budgetAdmitted && captureReady && instanceWritten;
+    }
+
+    /**
+     * Publish the mesh {@link #captureFirstPerson} left in {@link #fpCapture} as the camera entity's
+     * local-view representation: visible to the primary camera ray and to secondary rays leaving a
+     * local-view surface, invisible to world secondary rays. Motion history lives in a disjoint negative key space
+     * ({@code -(entityId + 1)}); entity ids are assigned positive by vanilla, so a frame that falls back to
+     * the ordinary capture cannot diff against first-person history, or the other way round.
+     *
+     * <p>Returns whether the local-view instance landed in the geometry table — the publication fact the
+     * frame's presence signal is sourced from.
+     */
+    private boolean publishFirstPerson(RtContext ctx, FrameBuild build, FirstPersonCapture ready,
+                                    int rbx, int rby, int rbz) {
+        EntityPrev fpHistory = prevVerts.get(ready.motionId());
+        // A provider swap must not diff this frame's mesh against the previous provider's history, but the
+        // float[] backing is still worth reusing — drop the baseline, keep the buffer.
+        EntityPrev fpBaseline = ready.providerId().equals(lastFirstPersonProviderId) ? fpHistory : null;
+        Motion motion = uploadVertexMotion(ctx, build, fpCapture.verts, fpBaseline,
+                ready.x(), ready.y(), ready.z());
+        curVerts.put(ready.motionId(),
+                storeEntityPrev(fpHistory, fpCapture.verts, ready.x(), ready.y(), ready.z()));
+        appendTransientCapture(ctx, build, fpCapture, motion, ENTITY_BIT,
+                MASK_PRIMARY | MASK_LOCAL_VIEW_SECONDARY,
+                translationTransform(ready.x() - rbx, ready.y() - rby, ready.z() - rbz),
+                ENTITY_GEOM_LOCAL_VIEW);
+        lastFirstPersonProviderId = ready.providerId();
+        build.logicalCount++;
+        RtFrameStats.FRAME.count("firstPersonInstances", 1);
+        RtFrameStats.FRAME.count("localViewInstances", 1);
+        return true;
     }
 
     /**
@@ -1025,7 +1217,7 @@ public final class RtEntities {
         }
         long dispAddr = uploadDisp(ctx, build, particleDisp);
         appendCapture(ctx, build, new Motion(dispAddr, 0f, 0f, 0f),
-                -1, PARTICLE_BIT, PARTICLE_MASK, IDENTITY); // one combined mesh, per-particle MV
+                -1, PARTICLE_BIT, PARTICLE_MASK, IDENTITY, 0); // one combined mesh, per-particle MV
     }
 
     /** Average (rebase-space) position of a captured particle's verts — approximates the particle center. */
@@ -1265,7 +1457,7 @@ public final class RtEntities {
         // passes null ⇒ dispAddr 0 ⇒ no MV. The disp buffer is a per-frame transient, so a BE that stops
         // animating reverts to MV 0 next frame.
         long dispAddr = uploadDisp(ctx, build, disp);
-        writeTableEntry(build, e.primAddr, e.indexAddr, e.uvAddr, dispAddr, 0f, 0f, 0f, e.bucketTris);
+        writeTableEntry(build, e.primAddr, e.indexAddr, e.uvAddr, dispAddr, 0f, 0f, 0f, e.bucketTris, 0);
         // Block-local mesh placed by a translate-only instance transform (blockPos − rebase), like terrain.
         float[] xform = {1, 0, 0, e.bx - rbx, 0, 1, 0, e.by - rby, 0, 0, 1, e.bz - rbz};
         build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress,
@@ -1367,7 +1559,7 @@ public final class RtEntities {
      * pose is non-rigid (animation), or the shading data changed under identical topology.
      */
     private boolean appendRigidReuse(RtContext ctx, FrameBuild build, Motion motion, int entityId, int mask,
-                                     float placeX, float placeY, float placeZ) {
+                                     int entityGeomFlags, float placeX, float placeY, float placeZ) {
         EntityAccel ea = entityAccels.get(entityId);
         if (ea == null || ea.refAccel == null
                 || ea.refVertCount != capture.verts.size() / 3 || ea.refIdxCount != capture.idx.size()) {
@@ -1417,10 +1609,12 @@ public final class RtEntities {
         }
         build.lists.usedEntitySlots.add(ea.refSlot);
         writeTableEntry(build, ea.refPrimAddr, ea.refIndexAddr, ea.refUvAddr,
-                motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ, ea.refBucketTris);
+                motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ, ea.refBucketTris,
+                entityGeomFlags);
         build.instances.add(new RtAccel.Instance(placeTransform(localTransform, placeX, placeY, placeZ),
                 ea.refAccel.deviceAddress,
-                ENTITY_BIT | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
+                ENTITY_BIT | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET,
+                instanceGeometryFlags(entityGeomFlags)));
         build.count++;
         RtFrameStats.FRAME.count("entityReuse", 1);
         return true;
@@ -1527,35 +1721,48 @@ public final class RtEntities {
      * {@code entityId} ≥ 0 → refit path (persistent updatable AS keyed by id); {@code < 0} (refit disabled)
      * → transient one-shot full BUILD. Used by the animated-entity pass; block entities use {@link #buildBe}.
      */
-    private void appendCapture(RtContext ctx, FrameBuild build, float[] disp, int entityId, int instanceBit, int mask) {
+    private void appendCapture(RtContext ctx, FrameBuild build, float[] disp, int entityId, int instanceBit, int mask,
+                               int entityGeomFlags) {
         beginBuildIfNeeded(ctx, build);
         appendCapture(ctx, build, new Motion(uploadDisp(ctx, build, disp), 0f, 0f, 0f),
-                entityId, instanceBit, mask, IDENTITY);
+                entityId, instanceBit, mask, IDENTITY, entityGeomFlags);
     }
 
     private void appendCapture(RtContext ctx, FrameBuild build, Motion motion, int entityId, int instanceBit, int mask,
-                               float[] instanceTransform) {
+                               float[] instanceTransform, int entityGeomFlags) {
         beginBuildIfNeeded(ctx, build);
         if (entityId >= 0) {
-            appendPackedEntity(ctx, build, motion, entityId, instanceBit, mask, instanceTransform);
+            appendPackedEntity(ctx, build, motion, entityId, instanceBit, mask, instanceTransform, entityGeomFlags);
             return;
         }
+        appendTransientCapture(ctx, build, capture, motion, instanceBit, mask, instanceTransform, entityGeomFlags);
+    }
+
+    /**
+     * Transient one-shot path: upload {@code source} as a per-frame mesh + freshly built BLAS. Unlike
+     * {@link #appendPackedEntity} it owns no persistent slot, so the geometry it reads is an explicit
+     * parameter — the first-person instance submits into its own capture buffer (see {@link #fpCapture}).
+     */
+    private void appendTransientCapture(RtContext ctx, FrameBuild build, RtEntityCapture source, Motion motion,
+                                        int instanceBit, int mask, float[] instanceTransform,
+                                        int entityGeomFlags) {
+        beginBuildIfNeeded(ctx, build);
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        int vertCount = capture.verts.size() / 3;
-        RtEntityCapture.PackedGeometry packed = capture.packGeometry();
+        int vertCount = source.verts.size() / 3;
+        RtEntityCapture.PackedGeometry packed = source.packGeometry();
         int idxCount = packed.indices().size();
-        EntityGeometryLayout layout = EntityGeometryLayout.create(capture.verts.size(), idxCount,
-                capture.uvList.size(), packed.primitives().size());
+        EntityGeometryLayout layout = EntityGeometryLayout.create(source.verts.size(), idxCount,
+                source.uvList.size(), packed.primitives().size());
         long required = Math.addExact(layout.totalBytes, EntityGeometryLayout.REGION_ALIGNMENT - 1L);
         RtBuffer geometry = allocBuffer(ctx, required, asInput | storage, true, "particle geometry");
         layout = layout.shifted((-geometry.deviceAddress) & (EntityGeometryLayout.REGION_ALIGNMENT - 1L));
-        MemoryUtil.memFloatBuffer(geometry.mapped + layout.positionOffset, capture.verts.size())
-                .put(capture.verts.elements(), 0, capture.verts.size());
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.positionOffset, source.verts.size())
+                .put(source.verts.elements(), 0, source.verts.size());
         MemoryUtil.memIntBuffer(geometry.mapped + layout.indexOffset, idxCount)
                 .put(packed.indices().elements(), 0, idxCount);
-        MemoryUtil.memFloatBuffer(geometry.mapped + layout.uvOffset, capture.uvList.size())
-                .put(capture.uvList.elements(), 0, capture.uvList.size());
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.uvOffset, source.uvList.size())
+                .put(source.uvList.elements(), 0, source.uvList.size());
         MemoryUtil.memFloatBuffer(geometry.mapped + layout.primOffset, packed.primitives().size())
                 .put(packed.primitives().elements(), 0, packed.primitives().size());
         geometry.flush(layout.positionOffset, layout.totalBytes - layout.positionOffset);
@@ -1571,17 +1778,19 @@ public final class RtEntities {
         build.pooledBlas.add(blas);
 
         writeTableEntry(build, primAddr, indexAddr, uvAddr, motion.dispAddr,
-                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris());
+                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris(), entityGeomFlags);
 
         build.instances.add(new RtAccel.Instance(instanceTransform, blas.accel.deviceAddress,
-                instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
+                instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET,
+                instanceGeometryFlags(entityGeomFlags)));
         build.buffers.add(geometry);
         build.count++;
     }
 
     /** Pack one changed entity's four logical geometry regions into its retired ring slot's backing. */
     private void appendPackedEntity(RtContext ctx, FrameBuild build, Motion motion, int entityId,
-                                    int instanceBit, int mask, float[] instanceTransform) {
+                                    int instanceBit, int mask, float[] instanceTransform,
+                                    int entityGeomFlags) {
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = capture.verts.size() / 3;
@@ -1649,9 +1858,10 @@ public final class RtEntities {
         }
 
         writeTableEntry(build, primAddr, indexAddr, uvAddr, motion.dispAddr,
-                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris());
+                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris(), entityGeomFlags);
         build.instances.add(new RtAccel.Instance(instanceTransform, accel.deviceAddress,
-                instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
+                instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET,
+                instanceGeometryFlags(entityGeomFlags)));
 
         EntityAccel ea = slot.owner;
         clearRefGeometry(ea);
@@ -1710,9 +1920,15 @@ public final class RtEntities {
         return slice.deviceAddress;
     }
 
-    /** Write one std430 EntityGeom entry, including bases for the two packed BLAS geometries. */
+    /**
+     * Write one std430 EntityGeom entry, including bases for the two packed BLAS geometries. The
+     * {@code reserved} low word carries per-instance semantic flags read by world.rchit; its high word stays
+     * zero. {@code entityGeomFlags} is mandatory rather than defaulted so a new instance path cannot
+     * silently inherit 0 — a missed call site is a compile error.
+     */
     private void writeTableEntry(FrameBuild build, long primAddr, long idxAddr, long uvAddr, long dispAddr,
-                                 float rigidX, float rigidY, float rigidZ, int[] bucketTris) {
+                                 float rigidX, float rigidY, float rigidZ, int[] bucketTris,
+                                 int entityGeomFlags) {
         if (bucketTris == null || bucketTris.length != RtAccel.ENTITY_BUCKETS) {
             throw new IllegalArgumentException("Missing entity BLAS bucket counts");
         }
@@ -1727,8 +1943,15 @@ public final class RtEntities {
         MemoryUtil.memPutFloat(entry + 44, 0f);
         MemoryUtil.memPutInt(entry + 48, 0);
         MemoryUtil.memPutInt(entry + 52, bucketTris[RtAccel.ENTITY_BUCKET_OPAQUE]);
-        MemoryUtil.memPutInt(entry + 56, 0);
+        MemoryUtil.memPutInt(entry + 56, entityGeomFlags);
         MemoryUtil.memPutInt(entry + 60, 0);
+    }
+
+    /** The world stand-in's TLAS instance runs any-hit for every geometry so its shadow policy applies. */
+    private static int instanceGeometryFlags(int entityGeomFlags) {
+        return (entityGeomFlags & ENTITY_GEOM_WORLD_STAND_IN) != 0
+                ? org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
+                : 0;
     }
 
     /** Select the next per-entity slot, waiting on its exact last graphics use before mutable reuse. */

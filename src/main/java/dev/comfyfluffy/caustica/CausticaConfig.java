@@ -616,6 +616,11 @@ public final class CausticaConfig {
                     intAtLeast("caustica.rt.beBuildsPerFrame", "entities.block-entities.builds-per-frame", 64, 0);
             public static final BooleanSetting REFIT_ENABLED =
                     bool("caustica.rt.entityRefit", "entities.refit.enabled", true);
+            public static final BooleanSetting FIRST_PERSON_COMPAT_ENABLED =
+                    bool("caustica.rt.firstPersonCompat", "entities.first-person-compat.enabled", false);
+            public static final FloatSetting FIRST_PERSON_SHADOW_TRANSMITTANCE =
+                    clampedFloat("caustica.rt.firstPersonShadowTransmittance",
+                            "entities.first-person-shadow-transmittance", 0.35f, 0.0f, 1.0f);
 
             private Entities() {
             }
@@ -957,7 +962,10 @@ public final class CausticaConfig {
     }
 
     private static FloatSetting clampedFloat(String key, String tomlPath, float fallback, float min, float max) {
-        return new FloatSetting(key, tomlPath, fallback, v -> v, v -> v, v -> Math.clamp(v, min, max));
+        // NaN is unordered, so Math.clamp would pass it straight through to the GPU; infinities clamp
+        // to the range ends like any other out-of-range value.
+        return new FloatSetting(key, tomlPath, fallback, v -> v, v -> v,
+                v -> Double.isNaN(v) ? fallback : Math.clamp(v, min, max));
     }
 
     private static FloatSetting radians(String key, String tomlPath, float fallbackDegrees) {

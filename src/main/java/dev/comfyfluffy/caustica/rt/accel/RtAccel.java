@@ -57,6 +57,7 @@ import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_COPY_ACCELERATION_STR
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_OPAQUE_BIT_KHR;
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_TYPE_INSTANCES_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_TYPE_TRIANGLES_KHR;
@@ -910,14 +911,22 @@ public final class RtAccel {
      * trace cull mask), and the base SBT hit-record offset. Terrain uses offset 0 so geometry index selects
      * the material bucket. Entities use {@link #SBT_ENTITY_OFFSET}; their fixed geometry index then selects
      * opaque or any-hit; the remaining two records in each four-record entity SBT block stay unused.
+     * {@code geometryFlags} carries extra per-instance VkGeometryInstanceFlags (e.g. force-no-opaque),
+     * OR-ed onto the fixed triangle-facing-cull-disable policy.
      */
-    public record Instance(float[] transform3x4, long blasDeviceAddress, int customIndex, int mask, int sbtRecordOffset) {
+    public record Instance(float[] transform3x4, long blasDeviceAddress, int customIndex, int mask,
+                           int sbtRecordOffset, int geometryFlags) {
         public Instance(float[] transform3x4, long blasDeviceAddress, int customIndex) {
-            this(transform3x4, blasDeviceAddress, customIndex, 0xFF, 0);
+            this(transform3x4, blasDeviceAddress, customIndex, 0xFF, 0, 0);
         }
 
         public Instance(float[] transform3x4, long blasDeviceAddress, int customIndex, int mask) {
-            this(transform3x4, blasDeviceAddress, customIndex, mask, 0);
+            this(transform3x4, blasDeviceAddress, customIndex, mask, 0, 0);
+        }
+
+        public Instance(float[] transform3x4, long blasDeviceAddress, int customIndex, int mask,
+                        int sbtRecordOffset) {
+            this(transform3x4, blasDeviceAddress, customIndex, mask, sbtRecordOffset, 0);
         }
     }
 
@@ -1023,7 +1032,7 @@ public final class RtAccel {
             record.instanceCustomIndex(instance.customIndex())
                     .mask(instance.mask())
                     .instanceShaderBindingTableRecordOffset(instance.sbtRecordOffset())
-                    .flags(VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR)
+                    .flags(VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR | instance.geometryFlags())
                     .accelerationStructureReference(instance.blasDeviceAddress());
         }
     }

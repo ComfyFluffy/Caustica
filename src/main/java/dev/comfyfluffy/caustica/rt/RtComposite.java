@@ -104,7 +104,9 @@ public final class RtComposite {
     // Hot addresses/frameIndex avoid unnecessary global-memory dereferences; WorldPushConstantsData is
     // generated from the same Slang module and owns this second ABI as well. debugView is no longer
     // part of it -- no world shader reads it anymore; debug views are a downstream compute pass.
-    private static final long PATH_RECORD_BYTES = 48L;
+    // Stride of segment.slang's PackedPathSegment (std430: float3 + 13 uints). The continuation queue
+    // below is allocated from it, so the two must move together.
+    private static final long PATH_RECORD_BYTES = 64L;
     private static int debugView() {
         return CausticaConfig.Rt.Composite.DEBUG_VIEW.value();
     }
@@ -1062,7 +1064,8 @@ public final class RtComposite {
             frameInvViewProj.set(frameProjection).mul(frameViewRotation).invert();
             // flags: camera-in-water (so the path tracer starts in the water medium when the eye is
             // submerged, fixing the air→water first-segment orientation) and animated water normals.
-            // Bit 1 remains unused to avoid conflicting with stale external readers.
+            // Bit 1 remains unused to avoid conflicting with stale external readers; bit 2 is written
+            // below, only from this frame's local-view publication fact.
             int flags = 0;
             var level = Minecraft.getInstance().level;
             if (level != null) {
@@ -1115,6 +1118,11 @@ public final class RtComposite {
             RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
                     terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
             frameEntities = fe;
+            // Same-frame, no hysteresis: the shader's transmission-continuity chain keys off exactly
+            // this frame's publication fact.
+            if (fe.localViewPublished()) {
+                flags |= 0b100;
+            }
             // Block-breaking overlay: resolves each destroy-stage RenderType's texture into the
             // SAME bindless entity-texture array (destroy_stage_N.png is a standalone Sampler0 texture,
             // not a block-atlas sprite — see ModelBakery.BREAKING_LOCATIONS/DESTROY_TYPES), so any newly
@@ -1156,7 +1164,9 @@ public final class RtComposite {
                     CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
                     // Must be the SAME value the exposure resolve divides out this frame (it reads it
                     // from the same RtExposure accessor), or the two stop cancelling.
-                    exposure.preExposure()
+                    exposure.preExposure(),
+                    new Float4(CausticaConfig.Rt.Entities.FIRST_PERSON_SHADOW_TRANSMITTANCE.value(),
+                            0.0f, 0.0f, 0.0f)
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.

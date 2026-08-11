@@ -20,6 +20,13 @@ repositories {
 		name = "Fabric"
 		url = "https://maven.fabricmc.net/"
 	}
+	maven {
+		name = "Modrinth"
+		url = "https://api.modrinth.com/maven"
+		content {
+			includeGroup "maven.modrinth"
+		}
+	}
 	mavenCentral()
 }
 
@@ -59,6 +66,11 @@ dependencies {
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
 	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// FirstPerson Model, referenced only by the optional compat bridge for its render-state marker
+	// interface. Compile-only: the mod is neither bundled nor required at runtime, and the coordinate
+	// pins the Modrinth version id because the plain version number is shared across loaders.
+	compileOnly "maven.modrinth:first-person-model:6sgz2HEq"
 	testImplementation platform("org.junit:junit-bom:5.12.2")
 	testImplementation "org.junit.jupiter:junit-jupiter"
 	testRuntimeOnly "org.junit.platform:junit-platform-launcher"

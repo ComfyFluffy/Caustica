@@ -23,6 +23,11 @@ static const float ENTITY_ALPHA_CUTOFF = 0.1; // entities: only discard near-ful
 // tinted pane still absorbs its own color on top of this.
 static const float TRANSLUCENT_NEUTRAL_EXTINCTION = 0.15;
 static const float WATER_SHADOW_TINT = 0.5;
+// Neutral per-interface shadow attenuation for ice-family terrain (MATERIAL_FEATURE_ICE): strong enough
+// that one block of ice (two interfaces, 0.15 squared) reads as near-opaque, removing the separated
+// second shadow and blue cast that colored transmission produced, while stacked ice keeps darkening
+// monotonically. Traversal still continues, so occluders behind the ice shadow normally.
+static const float ICE_SHADOW_TRANSMITTANCE = 0.15;
 
 // Progressive 8x8 blue-noise-style alpha threshold pattern, with a golden-ratio temporal rotation. This keeps
 // translucent entity hits stochastic, but trades per-pixel white noise for a stable spatial distribution
@@ -83,6 +88,20 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         // Radiance rays accept the surface and continue to closest-hit. Shadow rays use the same material
         // model here so entity dielectrics transmit instead of becoming opaque shadow blockers.
         bool shadowRay = (RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0u;
+        // The first-person world stand-in is semi-transmissive to shadow rays: one neutral multiply by
+        // the configured transmittance per ray, however many of its layers the ray crosses. roughMetal
+        // is the once-marker — the shadow path never consumes it and guide.rmiss never writes it.
+        // Traversal always continues, so opaque geometry behind the body still blackens the ray in any
+        // intersection order, and the flags sentinel stays untouched.
+        if (instanceKind == ENTITY_BIT && shadowRay
+                && (g.reserved.x & ENTITY_GEOM_WORLD_STAND_IN) != 0u) {
+            if (payload.roughMetal == 0u) {
+                packAlbedo(payload, unpackAlbedo(payload)
+                        * ConstPtr<WorldPush>(pc.worldPushAddr)[0].shadowPolicy.x);
+                payload.roughMetal = 1u;
+            }
+            IgnoreHit();
+        }
         if (instanceKind == ENTITY_BIT && shadowRay && materialHeader.model == MATERIAL_DIELECTRIC) {
             float3 tint709 = lerp(float3(1.0),
                     srgbToLinear(texel.rgb) * srgbToLinear(epr.tint.rgb), texel.a);
@@ -131,14 +150,21 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     if (bucket == BUCKET_TRANSLUCENT) {
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
         MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
-        float3 avgColor = max(bt709ToAcesCg(
-                materialHeader.average.rgb * srgbToLinear(pr.tint.rgb)), float3(1.0e-3));
-        float3 colorExtinction = max(-log(avgColor), float3(0.0, 0.0, 0.0));
-        // The neutral floor is a flat per-hit dimming, NOT scaled by alpha: vanilla clear glass has a low
-        // natural alpha, so folding it into the alpha-scaled term crushed it to near-zero for exactly the
-        // white/clear-glass case it's meant to cover.
-        packAlbedo(payload, unpackAlbedo(payload)
-                * exp(-colorExtinction * materialHeader.average.a - TRANSLUCENT_NEUTRAL_EXTINCTION));
+        // Ice replaces its colored Beer-Lambert tint with the fixed neutral attenuation, applied per
+        // interface with no marker and no termination; every other translucent material keeps the
+        // colored path below unchanged.
+        if ((materialHeader.features & MATERIAL_FEATURE_ICE) != 0u) {
+            packAlbedo(payload, unpackAlbedo(payload) * ICE_SHADOW_TRANSMITTANCE);
+        } else {
+            float3 avgColor = max(bt709ToAcesCg(
+                    materialHeader.average.rgb * srgbToLinear(pr.tint.rgb)), float3(1.0e-3));
+            float3 colorExtinction = max(-log(avgColor), float3(0.0, 0.0, 0.0));
+            // The neutral floor is a flat per-hit dimming, NOT scaled by alpha: vanilla clear glass has a
+            // low natural alpha, so folding it into the alpha-scaled term crushed it to near-zero for
+            // exactly the white/clear-glass case it's meant to cover.
+            packAlbedo(payload, unpackAlbedo(payload)
+                    * exp(-colorExtinction * materialHeader.average.a - TRANSLUCENT_NEUTRAL_EXTINCTION));
+        }
         IgnoreHit();
     }
 

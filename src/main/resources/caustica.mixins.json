@@ -11,6 +11,7 @@
 		"GpuDeviceAccessor",
 		"GlxMixin",
 		"GuiRendererMixin",
+		"LevelRendererAccessor",
 		"LevelRendererMixin",
 		"LevelExtractorMixin",
 		"MinecraftMixin",
