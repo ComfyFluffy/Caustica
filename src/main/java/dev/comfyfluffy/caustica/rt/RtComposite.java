@@ -136,6 +136,8 @@ public final class RtComposite {
     private static final float FROXEL_NEAR_DISTANCE = 0.3f;   // blocks
     private static final float FROXEL_TEMPORAL_BLEND = 0.12f; // weight of this frame's sample
     private static final float FROXEL_SHADOW_THICKNESS = 32f; // blocks
+    // VolumetricLightPush.flags bit 0: trace the TLAS for occlusion instead of marching the depth guide.
+    private static final int VOLUMETRIC_FLAG_TRACE_OCCLUSION = 1;
     // The versioned look package owns every photometric anchor and the sky geometry. Its sun illuminance is the
     // photometric solar constant at the top of the atmosphere; the shader's transmittance LUT brings that
     // to ~117,000 lux under a zenith sun and reddens/dims it through sunset, and because world.rmiss tints
@@ -1089,8 +1091,13 @@ public final class RtComposite {
      * rather than to the viewer: climb a mountain and the air actually thins, descend into a cave and it
      * does not keep thickening. {@code historyScale} rebases the previous frame's stored radiance onto
      * this frame's pre-exposure, which the froxel textures are scaled by.
+     *
+     * <p>{@code tracedOcclusion} switches injection from marching the depth guide to tracing the TLAS.
+     * The screen-space march can only see what the frame drew, so it leaks light into rooms whose window
+     * is off-screen and smears a dark tail behind on-screen silhouettes the light path never enters;
+     * tracing has neither failure mode, and it is what the option below turns off for weaker hardware.
      */
-    private VolumetricLightPushData volumetricPush(long worldPushAddress) {
+    private VolumetricLightPushData volumetricPush(long worldPushAddress, boolean tracedOcclusion) {
         float preExposure = exposure.preExposure();
         float historyScale = previousPreExposure > 0.0f ? preExposure / previousPreExposure : 1.0f;
         previousPreExposure = preExposure;
@@ -1113,6 +1120,7 @@ public final class RtComposite {
                 temporalBlend,
                 FROXEL_SHADOW_THICKNESS,
                 CausticaConfig.Rt.VolumetricLight.UNDERWATER_DENSITY.value(),
+                tracedOcclusion ? VOLUMETRIC_FLAG_TRACE_OCCLUSION : 0,
                 historyScale);
     }
 
@@ -1367,12 +1375,18 @@ public final class RtComposite {
             // stays after reconstruction. The enabled path injects, integrates, and composites the grid;
             // the disabled path is a 1:1 copy into the same canonical output, keeping every downstream
             // descriptor stable while avoiding the grid's cost entirely.
-            if (volumetricLightEnabled()) {
+            // Injection traces this frame's TLAS, the same one the path tracer just used, so the pass runs
+            // only once that structure exists; without it there is nothing to resolve occlusion against.
+            long volumetricTlas = currentTlasHandle;
+            if (volumetricLightEnabled() && volumetricTlas != 0L) {
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "volumetric light");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.volumetricLight")) {
                     int parity = (int) (frameCounter & 1L);
+                    boolean tracedOcclusion =
+                            CausticaConfig.Rt.VolumetricLight.RAY_TRACED_SHADOWS.value();
                     volumetricLightPipeline.dispatch(cmd, froxelScatter[parity], postProcessOutput,
-                            volumetricPush(pushBuf.deviceAddress), parity);
+                            volumetricPush(pushBuf.deviceAddress, tracedOcclusion), parity,
+                            volumetricTlas, graphicsUse);
                 }
             } else {
                 // Nothing wrote the grid this frame, so whatever it still holds belongs to an older

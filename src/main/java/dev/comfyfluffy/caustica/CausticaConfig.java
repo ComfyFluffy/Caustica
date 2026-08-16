@@ -100,7 +100,8 @@ public final class CausticaConfig {
         FILE.setComment("volumetric-light",
                 " Froxel volumetric light scattering (crepuscular rays, fog, and underwater shafts).\n"
                         + " strength scales ray brightness; fog-density sets how much air scatters;\n"
-                        + " quality (0-3) trades performance for grid resolution and shadow accuracy.");
+                        + " quality (0-3) trades performance for grid resolution and shadow accuracy.\n"
+                        + " ray-traced-shadows resolves shafts against world geometry instead of the screen.");
         FILE.setComment("exposure",
                 " Controls automatic exposure. manual-ev sets exposure in manual mode and adjusts it in auto mode.\n"
                         + " adapt-darken and adapt-brighten control adjustment speed in seconds.\n"
@@ -836,6 +837,15 @@ public final class CausticaConfig {
             public static final FloatSetting STRENGTH =
                     clampedFloat("caustica.rt.volumetricLight.strength",
                             "volumetric-light.strength", 1.0f, 0.0f, 3.0f);
+            /**
+             * Resolve occlusion by tracing the world acceleration structure instead of marching the
+             * primary depth guide. Tracing sees geometry the frame does not — occluders behind the camera
+             * or outside the frustum — and cannot invent the dark tails a depth-buffer march leaves behind
+             * on-screen silhouettes. Turning it off restores the cheaper screen-space march.
+             */
+            public static final BooleanSetting RAY_TRACED_SHADOWS =
+                    bool("caustica.rt.volumetricLight.rayTracedShadows",
+                            "volumetric-light.ray-traced-shadows", true);
             public static final List<Integer> QUALITY_STEPS = List.of(0, 1, 2, 3);
             public static final IntSetting QUALITY =
                     intChoice("caustica.rt.volumetricLight.quality",
@@ -884,16 +894,17 @@ public final class CausticaConfig {
              * Grid shape for a quality step: {@code tile} screen pixels per froxel column, {@code slices}
              * depth cells, and {@code shadowSteps} depth-guide taps per cell.
              *
-             * <p>Cost is the product of all three, so the steps scale them together. Slice count is the
-             * one that decides whether shafts read as smooth volumes or as stacked layers, which is why it
-             * climbs fastest.
+             * <p>Cost is the product of the first two; the tap count only applies to the screen-space
+             * fallback, since traced occlusion resolves a froxel with a single ray. Tile size decides how
+             * sharply a shadow edge can be drawn inside a shaft, and slice count decides whether shafts
+             * read as smooth volumes or as stacked layers.
              */
             public record Grid(int tile, int slices, int shadowSteps) {}
 
             private static final List<Grid> GRIDS = List.of(
-                    new Grid(24, 48, 8),
-                    new Grid(16, 64, 12),
-                    new Grid(12, 96, 16),
+                    new Grid(20, 48, 8),
+                    new Grid(12, 64, 12),
+                    new Grid(10, 96, 16),
                     new Grid(8, 128, 20));
 
             public static Grid grid() {

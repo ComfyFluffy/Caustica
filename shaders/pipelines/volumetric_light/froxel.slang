@@ -24,12 +24,25 @@ public static const float FROXEL_NOISE_SCALE = 0.055;    // cycles per block
 public static const float FROXEL_NOISE_STRENGTH = 0.42;  // peak fractional density deviation
 public static const float FROXEL_NOISE_DRIFT = 0.035;    // blocks per second
 
-// Screen-space shadow march. Sample distances follow a squared curve, so taps crowd near the froxel —
-// where the occluder that actually shapes a shaft's edge is — and spread out far away, where the depth
-// guide is coarse anyway. The curve reaches the same distance at every quality step: a lower step count
-// samples that reach more thinly instead of giving up on distant occluders, so window frames and cliff
-// edges keep casting shafts on Low.
+// Screen-space shadow march (the fallback path). Sample distances follow a squared curve, so taps crowd
+// near the froxel — where the occluder that shapes a shaft's edge is — and spread out far away, where the
+// depth guide is coarse anyway. The curve reaches the same distance at every quality step, so a lower
+// step count samples that reach more thinly instead of giving up on distant occluders.
 public static const float FROXEL_SHADOW_REACH = 72.0;    // blocks toward the light
+
+// Traced occlusion. The ray is bounded rather than infinite: beyond the streamed terrain radius there is
+// nothing in the acceleration structure to hit, so a longer ray only pays for BVH traversal that can
+// never change the result.
+public static const float FROXEL_RAY_REACH = 256.0;      // blocks toward the light
+public static const float FROXEL_RAY_BIAS = 0.03;        // blocks, keeps a froxel off a coincident face
+
+// Visibility mask of the secondary-ray class, matching the path tracer's own shadow rays: instances that
+// exist only for the primary view (the first-person camera owner's billboards) must not cast shafts.
+public static const uint FROXEL_CULL_MASK = 0x01u;
+
+// Terrain BLAS geometry order (RtAccel.BUCKET_*). Only the solid bucket carries VK_GEOMETRY_OPAQUE_BIT,
+// so the other three reach a ray query as candidates and this pass decides what light may pass through.
+public static const uint FROXEL_BUCKET_CUTOUT = 1u;
 
 // Air absorbs a little of what it scatters (soot, water droplets); extinction is therefore slightly
 // larger than scattering. Submerged, absorption is left out entirely: the path tracer already applied
@@ -187,18 +200,76 @@ public void froxelUnderwaterLight(WorldPush world, float3 posCamRel,
 // ---- Occlusion ------------------------------------------------------------------------------------
 
 /**
+ * A direction inside the light's own angular radius, from two uniform numbers.
+ *
+ * <p>The sun and moon are discs, not points, so their shadow edge has a penumbra that widens with the
+ * distance to the occluder. One jittered ray per froxel per frame, resolved by the temporal filter,
+ * integrates that disc over time — which is why the shaft edges are soft without any extra rays.
+ */
+public float3 froxelSampleLightCone(float3 lightDir, float halfAngle, float2 u) {
+    float cosMax = cos(clamp(halfAngle, 0.0, 0.2));
+    float cosTheta = lerp(cosMax, 1.0, u.x);
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    float phi = 2.0 * SKY_PI * u.y;
+    float3 up = abs(lightDir.y) < 0.95 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 tangent = normalize(cross(up, lightDir));
+    float3 bitangent = cross(lightDir, tangent);
+    return normalize(lightDir * cosTheta
+            + tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)));
+}
+
+/**
+ * Visibility of the celestial light from a froxel, traced against the world acceleration structure.
+ *
+ * <p>This is the same geometry the path tracer shades, so occluders behind the camera or outside the
+ * frustum shadow correctly, and nothing depends on what the frame happens to show. Inline ray queries
+ * cannot run the any-hit shaders the pipeline's shadow rays use, so alpha is resolved by geometry class
+ * instead: the solid bucket is flagged opaque and commits itself, the cutout bucket (leaves, grass,
+ * fences) is committed here so foliage casts shafts, and the translucent and water buckets are skipped so
+ * light still reaches through glass and through a water surface into a submerged view. Where the cutout
+ * bucket carries an opacity micromap, hardware already resolves the fully transparent and fully opaque
+ * parts of a texel grid before the candidate ever surfaces here.
+ */
+public float froxelTracedVisibility(RaytracingAccelerationStructure worldTlas,
+                                    float3 originRebased, float3 lightDir, float tmax) {
+    RayDesc ray;
+    ray.Origin = originRebased;
+    ray.TMin = FROXEL_RAY_BIAS;
+    ray.Direction = lightDir;
+    ray.TMax = max(tmax, FROXEL_RAY_BIAS * 2.0);
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+    query.TraceRayInline(worldTlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, FROXEL_CULL_MASK, ray);
+    while (query.Proceed()) {
+        if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            continue;
+        }
+        uint instance = query.CandidateInstanceID();
+        bool entity = (instance & ENTITY_BIT) != 0u;
+        // Particle billboards deliberately do not shadow: they are camera-facing quads whose shadow would
+        // be a flicker of the particle count rather than a feature of the scene.
+        bool particle = (instance & PARTICLE_BIT) != 0u;
+        bool cutout = !entity && !particle && query.CandidateGeometryIndex() == FROXEL_BUCKET_CUTOUT;
+        if (entity || cutout) {
+            query.CommitNonOpaqueTriangleHit();
+        }
+    }
+    return query.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
+}
+
+/**
  * Visibility of the celestial light from a froxel, resolved by marching the primary depth guide.
  *
- * <p>The guide is the only occlusion structure available after reconstruction, so this is a screen-space
- * shadow trace: each step is projected into the frame and compared against the depth the primary ray
- * recorded for that pixel. Both distances are measured from the eye along the SAME reconstructed ray, so
- * the comparison is exact rather than a depth-buffer heuristic.
+ * <p>The fallback for devices or settings without traced occlusion. Each step is projected into the frame
+ * and compared against the depth the primary ray recorded for that pixel; both distances are measured
+ * from the eye along the SAME reconstructed ray, so the comparison itself is exact.
  *
- * <p>Two rules bound what an unbacked screen-space test may claim. A step that lands beyond
- * {@code shadowThickness} behind a surface is treated as unknown and ends the march lit, because the
- * guide records one front face and cannot say how deep that object goes; a step that lands on a sky texel
- * ends the march lit as well, since the path has provably reached open air. A step that leaves the frame
- * also ends it — geometry outside the frustum was never rasterised, so nothing can be asserted about it.
+ * <p>What it cannot do is see past the frame. A step beyond {@code shadowThickness} behind a surface is
+ * unknowable — the guide records one front face and cannot say how deep that object goes — and a step
+ * that leaves the frustum or lands behind the camera was never rasterised at all. Both end the march lit,
+ * which is what leaks light into rooms whose window is off-screen, and a step that passes behind an
+ * on-screen silhouette without the light path actually entering it is what smears a dark tail along the
+ * light direction. Traced occlusion exists because neither is fixable from a depth buffer.
  */
 public float froxelShadow(WorldPush world, VolumetricLightPush pc, Sampler2D depthImage,
                           float3 posCamRel, float3 lightDir, float jitter) {

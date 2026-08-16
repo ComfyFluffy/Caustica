@@ -42,6 +42,8 @@
 	"caustica.options.rt.volumetricLightQuality.1": "Medium",
 	"caustica.options.rt.volumetricLightQuality.2": "High",
 	"caustica.options.rt.volumetricLightQuality.3": "Ultra",
+	"caustica.options.rt.volumetricLightRayTraced": "Ray-Traced Light Shafts",
+	"caustica.options.rt.volumetricLightRayTraced.tooltip": "Shadow the light shafts against world geometry instead of the screen. Off-screen walls and terrain block shafts correctly, and shadow edges are soft. Turn off for a cheaper screen-space approximation.",
 
 	"caustica.options.rt.hdr": "HDR Output",
 	"caustica.options.rt.hdr.tooltip": "Recreate the swapchain for HDR (ST.2084/PQ) or native SDR output. Applied at the next frame boundary.",

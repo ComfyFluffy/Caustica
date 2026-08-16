@@ -2,7 +2,9 @@ package dev.comfyfluffy.caustica.rt.pipeline;
 
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
+import dev.comfyfluffy.caustica.rt.overlay.RtOverlayPipelines;
 import dev.comfyfluffy.caustica.rt.gen.VolumetricLightPushData;
 import java.io.IOException;
 import java.io.InputStream;
@@ -42,6 +44,11 @@ import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.*;
  * <p>The two scattering volumes are ping-ponged: the frame's parity picks which one is written and which
  * is sampled as history. Both orientations get their own descriptor set, allocated once, so a frame never
  * rewrites a descriptor set an in-flight frame may still be reading.
+ *
+ * <p>Injection resolves occlusion by tracing the world TLAS, which is rebuilt every frame. Its handle
+ * therefore lives in a second, single-binding descriptor set taken from the shared ring the overlay
+ * occlusion pass uses, whose slots are recycled only after the graphics timeline says the frame that used
+ * them completed.
  */
 public final class RtVolumetricLightPipeline {
     private static final String SHADER_DIR = "/caustica/shaders/pipelines/volumetric_light/";
@@ -52,6 +59,7 @@ public final class RtVolumetricLightPipeline {
     private final long[] injectDescriptorSets;
     private final long injectPipelineLayout;
     private final long injectPipeline;
+    private final RtOverlayPipelines.AccelStructureSet injectAccelSet;
     private final long integrateDescriptorSetLayout;
     private final long[] integrateDescriptorSets;
     private final long integratePipelineLayout;
@@ -76,6 +84,7 @@ public final class RtVolumetricLightPipeline {
     private RtVolumetricLightPipeline(RtContext ctx, long descriptorPool,
                                       long injectDescriptorSetLayout, long[] injectDescriptorSets,
                                       long injectPipelineLayout, long injectPipeline,
+                                      RtOverlayPipelines.AccelStructureSet injectAccelSet,
                                       long integrateDescriptorSetLayout, long[] integrateDescriptorSets,
                                       long integratePipelineLayout, long integratePipeline,
                                       long compositeDescriptorSetLayout, long compositeDescriptorSet,
@@ -87,6 +96,7 @@ public final class RtVolumetricLightPipeline {
         this.injectDescriptorSets = injectDescriptorSets;
         this.injectPipelineLayout = injectPipelineLayout;
         this.injectPipeline = injectPipeline;
+        this.injectAccelSet = injectAccelSet;
         this.integrateDescriptorSetLayout = integrateDescriptorSetLayout;
         this.integrateDescriptorSets = integrateDescriptorSets;
         this.integratePipelineLayout = integratePipelineLayout;
@@ -159,27 +169,32 @@ public final class RtVolumetricLightPipeline {
             pushRange.get(0).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0)
                     .size(VolumetricLightPushData.BYTE_SIZE);
 
-            long injectLayout = createPipelineLayout(vk, stack, injectDsl, pushRange, "volumetric inject");
+            // Set 1 of the injection layout. The shared helper's single binding is index OVERLAY_TLAS,
+            // which is the same slot the shader declares as VOLUMETRIC_INJECT_TLAS in set 1.
+            RtOverlayPipelines.AccelStructureSet injectAccelSet = RtOverlayPipelines.accelStructureSet(
+                    ctx, VK10.VK_SHADER_STAGE_COMPUTE_BIT, "volumetric inject accel");
+            long injectLayout = createPipelineLayout(vk, stack,
+                    stack.longs(injectDsl, injectAccelSet.layout), pushRange, "volumetric inject");
             long injectPipeline = createComputePipeline(ctx, stack, injectLayout,
                     "inject.comp.spv", "volumetric inject");
-            long integrateLayout = createPipelineLayout(vk, stack, integrateDsl, pushRange,
+            long integrateLayout = createPipelineLayout(vk, stack, stack.longs(integrateDsl), pushRange,
                     "volumetric integrate");
             long integratePipeline = createComputePipeline(ctx, stack, integrateLayout,
                     "integrate.comp.spv", "volumetric integrate");
-            long compositeLayout = createPipelineLayout(vk, stack, compositeDsl, pushRange,
+            long compositeLayout = createPipelineLayout(vk, stack, stack.longs(compositeDsl), pushRange,
                     "volumetric composite");
             long compositePipeline = createComputePipeline(ctx, stack, compositeLayout,
                     "composite.comp.spv", "volumetric composite");
 
             // Trilinear filtering of the froxel volume is what upsamples it: it smooths across screen
             // tiles AND across depth slices, so neither the grid's coarse xy nor its slice boundaries
-            // survive into the image. The depth guide stays point-filtered so an opaque silhouette is
-            // never interpolated with the sky behind it.
+            // survive into the image. Injection keeps a point-filtered depth guide, where an interpolated
+            // silhouette would place a shadow test in front of or behind real geometry.
             long linearSampler = createSampler(ctx, stack, VK10.VK_FILTER_LINEAR, "volumetric linear sampler");
             long nearestSampler = createSampler(ctx, stack, VK10.VK_FILTER_NEAREST, "volumetric nearest sampler");
 
             return new RtVolumetricLightPipeline(ctx, pool,
-                    injectDsl, injectSets, injectLayout, injectPipeline,
+                    injectDsl, injectSets, injectLayout, injectPipeline, injectAccelSet,
                     integrateDsl, integrateSets, integrateLayout, integratePipeline,
                     compositeDsl, compositeSet, compositeLayout, compositePipeline,
                     linearSampler, nearestSampler);
@@ -232,8 +247,13 @@ public final class RtVolumetricLightPipeline {
                     VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, sourceView, VK10.VK_NULL_HANDLE);
             i = write(images, writes, i, compositeDescriptorSet, VOLUMETRIC_COMPOSITE_VOLUME,
                     VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, integratedView, linearSampler);
+            // The composite's depth fetch is FILTERED, unlike injection's. It only picks how far along the
+            // volume this pixel integrates, and the guide is at render resolution while this pass runs at
+            // display resolution, so a point fetch quantises every silhouette to a render texel and edges
+            // the fog with a blocky outline. Interpolating turns that step into a sub-texel ramp, which is
+            // what the edge would look like anyway.
             write(images, writes, i, compositeDescriptorSet, VOLUMETRIC_COMPOSITE_DEPTH,
-                    VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, depthView, nearestSampler);
+                    VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, depthView, linearSampler);
 
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }
@@ -250,12 +270,16 @@ public final class RtVolumetricLightPipeline {
     /**
      * Record injection, integration, and the display-resolution composite.
      *
-     * @param scatter the froxel volume this frame writes; its extent is the grid's dimensions
-     * @param parity  which ping-pong orientation {@code scatter} is (0 = A, 1 = B)
+     * @param scatter      the froxel volume this frame writes; its extent is the grid's dimensions
+     * @param parity       which ping-pong orientation {@code scatter} is (0 = A, 1 = B)
+     * @param tlas         this frame's world acceleration structure, traced for occlusion
+     * @param graphicsUse  the frame's graphics-timeline slot, which retires the TLAS descriptor ring entry
      */
     public void dispatch(VkCommandBuffer cmd, RtImage scatter, RtImage output,
-                         VolumetricLightPushData pushData, int parity) {
+                         VolumetricLightPushData pushData, int parity,
+                         long tlas, RtGpuExecutor.GraphicsUse graphicsUse) {
         int slot = parity & 1;
+        long accelSet = injectAccelSet.bind(ctx, tlas, graphicsUse);
         try (MemoryStack stack = MemoryStack.stackPush();
              RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "volumetric light scattering")) {
             ByteBuffer push = stack.malloc(VolumetricLightPushData.BYTE_SIZE);
@@ -263,7 +287,7 @@ public final class RtVolumetricLightPipeline {
 
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, injectPipeline);
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
-                    injectPipelineLayout, 0, stack.longs(injectDescriptorSets[slot]), null);
+                    injectPipelineLayout, 0, stack.longs(injectDescriptorSets[slot], accelSet), null);
             VK10.vkCmdPushConstants(cmd, injectPipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (scatter.width + 7) / 8, (scatter.height + 7) / 8, scatter.depth);
             com.mojang.blaze3d.vulkan.VulkanCommandEncoder.memoryBarrier(cmd, stack);
@@ -297,6 +321,7 @@ public final class RtVolumetricLightPipeline {
         VK10.vkDestroyPipelineLayout(vk, compositePipelineLayout, null);
         VK10.vkDestroyDescriptorPool(vk, descriptorPool, null);
         VK10.vkDestroyDescriptorSetLayout(vk, injectDescriptorSetLayout, null);
+        injectAccelSet.destroy(vk);
         VK10.vkDestroyDescriptorSetLayout(vk, integrateDescriptorSetLayout, null);
         VK10.vkDestroyDescriptorSetLayout(vk, compositeDescriptorSetLayout, null);
         VK10.vkDestroySampler(vk, linearSampler, null);
@@ -347,10 +372,10 @@ public final class RtVolumetricLightPipeline {
         return set.get(0);
     }
 
-    private static long createPipelineLayout(VkDevice vk, MemoryStack stack, long descriptorSetLayout,
+    private static long createPipelineLayout(VkDevice vk, MemoryStack stack, LongBuffer descriptorSetLayouts,
                                              VkPushConstantRange.Buffer pushRange, String operation) {
         VkPipelineLayoutCreateInfo info = VkPipelineLayoutCreateInfo.calloc(stack)
-                .sType$Default().pSetLayouts(stack.longs(descriptorSetLayout));
+                .sType$Default().pSetLayouts(descriptorSetLayouts);
         if (pushRange != null) {
             info.pPushConstantRanges(pushRange);
         }

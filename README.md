@@ -22,7 +22,7 @@ changes while the renderer is being built.
 - DLSS Ray Reconstruction support
 - DLSS Frame Generation support (experimental)
 - HDR output
-- Froxel volumetric lighting: light shafts, height fog, and underwater rays, cast from the sun or moon even when it is off-screen
+- Froxel volumetric lighting: light shafts, height fog, and underwater rays, ray-traced against world geometry so both the light and its occluders may be off-screen
 - Dynamic entity rendering in the ray-traced scene
 - LabPBR-style material support
 - OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations

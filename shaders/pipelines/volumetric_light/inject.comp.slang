@@ -19,6 +19,7 @@ import inject_bindings;
 [[vk::push_constant]] VolumetricLightPush pc;
 
 static const float3 BT709_LUMA = float3(0.2126, 0.7152, 0.0722);
+static const uint VOLUMETRIC_FLAG_TRACE_OCCLUSION = 1u;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -61,7 +62,18 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
             anisotropy = FROXEL_WATER_ANISOTROPY;
         }
         if (dot(illuminance, BT709_LUMA) > 1.0e-5) {
-            float shadow = froxelShadow(world, pc, depthImage, posCamRel, lightDir, cellNoise);
+            float shadow;
+            if ((pc.flags & VOLUMETRIC_FLAG_TRACE_OCCLUSION) != 0u) {
+                // One ray per froxel per frame, jittered across the light's disc. The grid's own temporal
+                // filter integrates those samples, so the penumbra widens with occluder distance the way
+                // a real one does instead of costing a ray per sample.
+                float2 discSample = float2(cellNoise, froxelHash(dispatchId, pc.frameIndex + 0x9E3779B9u));
+                float3 traceDir = froxelSampleLightCone(lightDir, light.halfAngle, discSample);
+                shadow = froxelTracedVisibility(worldTlas, posCamRel + world.camOffset,
+                        traceDir, FROXEL_RAY_REACH);
+            } else {
+                shadow = froxelShadow(world, pc, depthImage, posCamRel, lightDir, cellNoise);
+            }
             float phase = froxelPhase(dot(lightDir, viewDir), anisotropy);
             // Ambient stands in for sky and multiple scattering, which have no directional shadow: it is
             // the small unshadowed term that keeps deep shadow from reading as vacuum.
