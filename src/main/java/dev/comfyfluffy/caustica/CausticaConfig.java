@@ -98,8 +98,9 @@ public final class CausticaConfig {
         FILE.setComment("tonemap",
                 " Controls the final image. gamma: 1 is neutral; lower values brighten midtones.");
         FILE.setComment("volumetric-light",
-                " Screen-space volumetric light scattering (crepuscular rays).\n"
-                        + " intensity controls ray brightness; sample count trades performance for smoothness.");
+                " Froxel volumetric light scattering (crepuscular rays, fog, and underwater shafts).\n"
+                        + " strength scales ray brightness; fog-density sets how much air scatters;\n"
+                        + " quality (0-3) trades performance for grid resolution and shadow accuracy.");
         FILE.setComment("exposure",
                 " Controls automatic exposure. manual-ev sets exposure in manual mode and adjusts it in auto mode.\n"
                         + " adapt-darken and adapt-brighten control adjustment speed in seconds.\n"
@@ -822,26 +823,82 @@ public final class CausticaConfig {
         }
 
         /**
-         * Screen-space volumetric light scattering from the dominant sun or moon. The radial sampler runs
-         * after DLSS Ray Reconstruction so its synthetic shafts never enter temporal reconstruction, then
-         * the additive composite rejoins the scene before exposure, bloom, and the SDR/HDR display transforms.
+         * Froxel volumetric lighting from the dominant sun or moon. The frustum is voxelised, each cell
+         * evaluates the medium and the light's screen-space shadow once, and the accumulated volume is
+         * applied to the reconstructed scene. It runs after DLSS Ray Reconstruction — the volume carries
+         * its own temporal filter, so its shafts never enter RR's history — and rejoins the scene before
+         * exposure, bloom, and the SDR/HDR display transforms.
          */
         public static final class VolumetricLight {
             public static final BooleanSetting ENABLED =
                     bool("caustica.rt.volumetricLight", "volumetric-light.enabled", true);
-            public static final FloatSetting INTENSITY =
-                    clampedFloat("caustica.rt.volumetricLight.intensity",
-                            "volumetric-light.intensity", 0.20f, 0.0f, 2.0f);
-            public static final List<Integer> SAMPLE_STEPS = List.of(16, 24, 32, 48, 64);
-            public static final IntSetting SAMPLES =
-                    intChoice("caustica.rt.volumetricLight.samples",
-                            "volumetric-light.samples", 32, SAMPLE_STEPS);
+            /** Artistic multiplier on in-scattered radiance. Transmittance stays physical at any value. */
+            public static final FloatSetting STRENGTH =
+                    clampedFloat("caustica.rt.volumetricLight.strength",
+                            "volumetric-light.strength", 1.0f, 0.0f, 3.0f);
+            public static final List<Integer> QUALITY_STEPS = List.of(0, 1, 2, 3);
+            public static final IntSetting QUALITY =
+                    intChoice("caustica.rt.volumetricLight.quality",
+                            "volumetric-light.quality", 1, QUALITY_STEPS);
+            /**
+             * Scattering coefficient of air at sea level, 1/block. This is what makes shafts visible at
+             * all, and also what hazes distant terrain: the default costs roughly a third of the light
+             * over the grid's full reach, which reads as aerial perspective rather than as fog.
+             */
             public static final FloatSetting DENSITY =
                     clampedFloat("caustica.rt.volumetricLight.density",
-                            "volumetric-light.density", 0.92f, 0.1f, 1.5f);
-            public static final FloatSetting DECAY =
-                    clampedFloat("caustica.rt.volumetricLight.decay",
-                            "volumetric-light.decay", 0.96f, 0.5f, 1.0f);
+                            "volumetric-light.fog-density", 0.0035f, 0.0f, 0.05f);
+            /**
+             * Henyey-Greenstein g. Higher values concentrate the glow around the light's own direction,
+             * so shafts flare when looking toward the sun and fade when looking away from it. The default
+             * keeps that contrast about sixteen-fold, which reads as haze rather than as a spotlight.
+             */
+            public static final FloatSetting ANISOTROPY =
+                    clampedFloat("caustica.rt.volumetricLight.anisotropy",
+                            "volumetric-light.anisotropy", 0.60f, 0.0f, 0.95f);
+            /** Far boundary of the froxel grid, blocks. Beyond it the scene receives no fog at all. */
+            public static final FloatSetting DISTANCE =
+                    clampedFloat("caustica.rt.volumetricLight.distance",
+                            "volumetric-light.distance", 160.0f, 32.0f, 512.0f);
+            /** Height above sea level at which air density has fallen to 1/e, blocks. */
+            public static final FloatSetting HEIGHT_FALLOFF =
+                    clampedFloat("caustica.rt.volumetricLight.heightFalloff",
+                            "volumetric-light.height-falloff", 60.0f, 4.0f, 512.0f);
+            /**
+             * Unshadowed fraction of the celestial illuminance, standing in for sky light and multiple
+             * scattering. Zero makes shadowed air perfectly clear; large values flatten shafts into haze.
+             */
+            public static final FloatSetting AMBIENT =
+                    clampedFloat("caustica.rt.volumetricLight.ambient",
+                            "volumetric-light.ambient", 0.035f, 0.0f, 0.5f);
+            /**
+             * Scattering coefficient used while the camera eye is submerged, 1/block. Water scatters
+             * orders of magnitude more than air, which is why submerged shafts are visible at all; the
+             * biome tint's absorption is not added here because the path tracer already applied it.
+             */
+            public static final FloatSetting UNDERWATER_DENSITY =
+                    clampedFloat("caustica.rt.volumetricLight.underwaterDensity",
+                            "volumetric-light.underwater-density", 0.05f, 0.0f, 0.5f);
+
+            /**
+             * Grid shape for a quality step: {@code tile} screen pixels per froxel column, {@code slices}
+             * depth cells, and {@code shadowSteps} depth-guide taps per cell.
+             *
+             * <p>Cost is the product of all three, so the steps scale them together. Slice count is the
+             * one that decides whether shafts read as smooth volumes or as stacked layers, which is why it
+             * climbs fastest.
+             */
+            public record Grid(int tile, int slices, int shadowSteps) {}
+
+            private static final List<Grid> GRIDS = List.of(
+                    new Grid(24, 48, 8),
+                    new Grid(16, 64, 12),
+                    new Grid(12, 96, 16),
+                    new Grid(8, 128, 20));
+
+            public static Grid grid() {
+                return GRIDS.get(Math.clamp(QUALITY.value(), 0, GRIDS.size() - 1));
+            }
 
             private VolumetricLight() {
             }

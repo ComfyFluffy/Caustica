@@ -28,6 +28,11 @@ import net.minecraft.network.chat.Component;
  * {@code quality} changes (see {@code RtDlssRr.ensureFeature}), so it is safe to expose here.
  */
 public final class RtVideoOptions {
+    // The fog-density slider is shown as a percentage of the config default, which keeps a 1/block
+    // scattering coefficient out of a settings screen while still spanning nothing to twice the default.
+    private static final float FOG_DENSITY_REFERENCE = 0.0035f;
+    private static final int FOG_DENSITY_MAX_PERCENT = 200;
+
     private RtVideoOptions() {
     }
 
@@ -51,6 +56,7 @@ public final class RtVideoOptions {
             waterWaves(),
             volumetricLight(),
             volumetricLightIntensity(),
+            volumetricLightDensity(),
             volumetricLightQuality(),
             dlssQuality()
         ));
@@ -143,22 +149,35 @@ public final class RtVideoOptions {
     }
 
     private static OptionInstance<Integer> volumetricLightIntensity() {
-        FloatSetting setting = CausticaConfig.Rt.VolumetricLight.INTENSITY;
+        FloatSetting setting = CausticaConfig.Rt.VolumetricLight.STRENGTH;
         return new OptionInstance<>(
             "caustica.options.rt.volumetricLightIntensity",
             OptionInstance.cachedConstantTooltip(Component.translatable(
                     "caustica.options.rt.volumetricLightIntensity.tooltip")),
             (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
-            new OptionInstance.IntRange(0, 200),
-            Math.clamp(Math.round(setting.value() * 100.0f), 0, 200),
+            new OptionInstance.IntRange(0, 300),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 300),
             percent -> setting.set(percent / 100.0f));
     }
 
+    /** How much air scatters, in percent of the default sea-level coefficient. */
+    private static OptionInstance<Integer> volumetricLightDensity() {
+        FloatSetting setting = CausticaConfig.Rt.VolumetricLight.DENSITY;
+        return new OptionInstance<>(
+            "caustica.options.rt.volumetricLightDensity",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.volumetricLightDensity.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, FOG_DENSITY_MAX_PERCENT),
+            Math.clamp(Math.round(setting.value() / FOG_DENSITY_REFERENCE * 100.0f), 0, FOG_DENSITY_MAX_PERCENT),
+            percent -> setting.set(percent * FOG_DENSITY_REFERENCE / 100.0f));
+    }
+
     private static OptionInstance<Integer> volumetricLightQuality() {
-        IntSetting setting = CausticaConfig.Rt.VolumetricLight.SAMPLES;
-        List<Integer> steps = CausticaConfig.Rt.VolumetricLight.SAMPLE_STEPS;
-        int initialSamples = steps.contains(setting.value()) ? setting.value() : 32;
-        int initialPosition = steps.indexOf(initialSamples);
+        IntSetting setting = CausticaConfig.Rt.VolumetricLight.QUALITY;
+        List<Integer> steps = CausticaConfig.Rt.VolumetricLight.QUALITY_STEPS;
+        int initialQuality = steps.contains(setting.value()) ? setting.value() : steps.get(1);
+        int initialPosition = steps.indexOf(initialQuality);
         return new OptionInstance<>(
             "caustica.options.rt.volumetricLightQuality",
             OptionInstance.cachedConstantTooltip(Component.translatable(

@@ -352,3 +352,9 @@ public float3 srgbToLinear(float3 color) {
     float3 hi = pow((color + 0.055) / 1.055, float3(2.4));
     return lerp(lo, hi, step(float3(0.04045), color));
 }
+
+// Water is a smooth dielectric; its absorption model lives in medium.slang, but the index of refraction
+// is needed outside the ray-tracing pipeline too — the volumetric passes refract the celestial light
+// through the surface above a submerged camera and must bend it by exactly the same amount the water
+// interface does.
+public static const float WATER_IOR = 1.333;
