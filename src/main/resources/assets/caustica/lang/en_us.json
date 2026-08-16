@@ -30,6 +30,18 @@
 	"caustica.options.rt.waterWaves": "Animated Water",
 	"caustica.options.rt.waterWaves.tooltip": "Animate water-surface normals for moving wave highlights.",
 
+	"caustica.options.rt.volumetricLight": "Volumetric Light Scattering",
+	"caustica.options.rt.volumetricLight.tooltip": "Add screen-space crepuscular rays from the visible sun or moon after ray reconstruction.",
+	"caustica.options.rt.volumetricLightIntensity": "Crepuscular Ray Strength",
+	"caustica.options.rt.volumetricLightIntensity.tooltip": "Brightness of the additive light shafts. Higher values make rays through gaps and around silhouettes more pronounced.",
+	"caustica.options.rt.volumetricLightQuality": "Volumetric Ray Quality",
+	"caustica.options.rt.volumetricLightQuality.tooltip": "Number of radial post-process samples. Higher quality produces smoother shafts but costs more GPU time.",
+	"caustica.options.rt.volumetricLightQuality.16": "Low",
+	"caustica.options.rt.volumetricLightQuality.24": "Medium",
+	"caustica.options.rt.volumetricLightQuality.32": "High",
+	"caustica.options.rt.volumetricLightQuality.48": "Very High",
+	"caustica.options.rt.volumetricLightQuality.64": "Ultra",
+
 	"caustica.options.rt.hdr": "HDR Output",
 	"caustica.options.rt.hdr.tooltip": "Recreate the swapchain for HDR (ST.2084/PQ) or native SDR output. Applied at the next frame boundary.",
 

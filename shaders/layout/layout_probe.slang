@@ -94,3 +94,14 @@ void probeBloomPush(uint3 id : SV_DispatchThreadID) {
         float sink = float(bloomPushProbe.mode) + bloomPushProbe.radius;
     }
 }
+
+[[vk::push_constant]] VolumetricLightPush volumetricLightPushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeVolumetricLightPush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = float(volumetricLightPushProbe.worldPushAddr)
+                + float(volumetricLightPushProbe.sampleCount)
+                + volumetricLightPushProbe.intensity;
+    }
+}

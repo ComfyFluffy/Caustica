@@ -19,4 +19,19 @@ final class CausticaConfigTest {
             setting.set(previous);
         }
     }
+
+    @Test
+    void volumetricSampleCountUsesSupportedQualitySteps() {
+        CausticaConfig.IntSetting setting = CausticaConfig.Rt.VolumetricLight.SAMPLES;
+        int previous = setting.value();
+        try {
+            setting.set(48);
+            assertEquals(48, setting.value());
+
+            setting.set(47);
+            assertEquals(32, setting.value());
+        } finally {
+            setting.set(previous);
+        }
+    }
 }

@@ -86,6 +86,16 @@ public struct BloomPush {
     public float radius;        // upsample tent radius in SOURCE texels; resolution-independent
 };
 
+// Radial additive-sampling state for the post-RR crepuscular-ray pass. The world-push address lets the
+// shader derive and project the exact dominant celestial direction used by the path tracer and sky LUT.
+public struct VolumetricLightPush {
+    public uint64_t worldPushAddr;
+    public uint sampleCount;
+    public float intensity;
+    public float density;
+    public float decay;
+};
+
 public struct DebugPresentPush {
     public uint debugView;     // 1..9; this pass is only dispatched for debugView != 0
     public float centerWeightSigma;
