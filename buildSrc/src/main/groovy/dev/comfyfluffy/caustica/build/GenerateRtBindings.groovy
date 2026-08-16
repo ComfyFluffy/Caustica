@@ -47,6 +47,11 @@ abstract class GenerateRtBindings extends DefaultTask {
                     HIST_BINS: "histBins", IMAGE: "exposureImage", STATE: "stateBuf"]],
             [prefix: "BLOOM", source: "pipelines/bloom/main.comp.slang", resources: [
                     OUTPUT: "dstImage", SOURCE: "srcImage", EXPOSURE: "exposureImage"]],
+            [prefix: "VOLUMETRIC_SCATTER", source: "pipelines/volumetric_light/scatter.comp.slang", resources: [
+                    OUTPUT: "scatterImage", SOURCE: "sourceImage", DEPTH: "depthImage",
+                    TRANSMITTANCE: "transmittanceLut"]],
+            [prefix: "VOLUMETRIC_COMPOSITE", source: "pipelines/volumetric_light/composite.comp.slang", resources: [
+                    OUTPUT: "outputImage", SOURCE: "sourceImage", SCATTER: "scatterImage"]],
             [prefix: "SKY_LUT", source: "pipelines/sky_lut/view.comp.slang", resources: [
                     TRANSMITTANCE_IMAGE: "transmittanceImage", MULTISCATTER_IMAGE: "multiScatterImage",
                     SKY_VIEW_IMAGE: "skyViewImage", TRANSMITTANCE_SAMPLER: "transmittanceLut",

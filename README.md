@@ -22,6 +22,7 @@ changes while the renderer is being built.
 - DLSS Ray Reconstruction support
 - DLSS Frame Generation support (experimental)
 - HDR output
+- Configurable volumetric light scattering and crepuscular rays
 - Dynamic entity rendering in the ray-traced scene
 - LabPBR-style material support
 - OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations

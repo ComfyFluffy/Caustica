@@ -49,6 +49,9 @@ public final class RtVideoOptions {
             entities(),
             particles(),
             waterWaves(),
+            volumetricLight(),
+            volumetricLightIntensity(),
+            volumetricLightQuality(),
             dlssQuality()
         ));
         if (CausticaConfig.Rt.Hdr.swapchainPqAvailable()) {
@@ -133,6 +136,38 @@ public final class RtVideoOptions {
 
     private static OptionInstance<Boolean> waterWaves() {
         return bool("caustica.options.rt.waterWaves", CausticaConfig.Rt.Composite.WATER_WAVES);
+    }
+
+    private static OptionInstance<Boolean> volumetricLight() {
+        return bool("caustica.options.rt.volumetricLight", CausticaConfig.Rt.VolumetricLight.ENABLED);
+    }
+
+    private static OptionInstance<Integer> volumetricLightIntensity() {
+        FloatSetting setting = CausticaConfig.Rt.VolumetricLight.INTENSITY;
+        return new OptionInstance<>(
+            "caustica.options.rt.volumetricLightIntensity",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.volumetricLightIntensity.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, 200),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 200),
+            percent -> setting.set(percent / 100.0f));
+    }
+
+    private static OptionInstance<Integer> volumetricLightQuality() {
+        IntSetting setting = CausticaConfig.Rt.VolumetricLight.SAMPLES;
+        List<Integer> steps = CausticaConfig.Rt.VolumetricLight.SAMPLE_STEPS;
+        int initialSamples = steps.contains(setting.value()) ? setting.value() : 32;
+        int initialPosition = steps.indexOf(initialSamples);
+        return new OptionInstance<>(
+            "caustica.options.rt.volumetricLightQuality",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.volumetricLightQuality.tooltip")),
+            (caption, position) -> Options.genericValueLabel(caption,
+                    Component.translatable("caustica.options.rt.volumetricLightQuality." + steps.get(position))),
+            new OptionInstance.IntRange(0, steps.size() - 1),
+            initialPosition,
+            position -> setting.set(steps.get(position)));
     }
 
     private static OptionInstance<Integer> dlssQuality() {

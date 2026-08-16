@@ -69,6 +69,7 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtSdrPresentPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtExposure;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtToneLut;
+import dev.comfyfluffy.caustica.rt.pipeline.RtVolumetricLightPipeline;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 
 import java.nio.ByteBuffer;
@@ -78,9 +79,9 @@ import java.util.Objects;
 
 /**
  * On-screen composite. Each frame, ray-trace into a render-res storage image (+ guide buffers), use
- * DLSS Ray Reconstruction to denoise and upscale it to display res, write that into a storage-capable
- * copy of the world color, and copy the result back to the world target at the
- * end-of-world seam. Gated by {@code -Dcaustica.rt=true}.
+ * DLSS Ray Reconstruction to denoise and upscale it to display res, apply screen-space post-processing,
+ * write that into a storage-capable copy of the world color, and copy the result back to the world target
+ * at the end-of-world seam. Gated by {@code -Dcaustica.rt=true}.
  *
  * <p>The path tracer and its guide buffers run at the configured render scale of display res with a per-frame
  * sub-pixel camera jitter; DLSS-RR ({@link RtDlssRr}) reconstructs the display-res image. With RR
@@ -119,6 +120,11 @@ public final class RtComposite {
 
     private static boolean waterWaves() {
         return CausticaConfig.Rt.Composite.WATER_WAVES.value();
+    }
+
+    private static boolean volumetricLightEnabled() {
+        return CausticaConfig.Rt.VolumetricLight.ENABLED.value()
+                && CausticaConfig.Rt.VolumetricLight.INTENSITY.value() > 0.0f;
     }
 
     private static final int WATER_ANCHOR_MASK = 4095;
@@ -174,6 +180,7 @@ public final class RtComposite {
     private int pushSlot;
     private RtDisplayPipeline displayPipeline;
     private RtBloomPipeline bloomPipeline;
+    private RtVolumetricLightPipeline volumetricLightPipeline;
     // Atmosphere LUTs (transmittance + multiple scattering + this frame's sky view). Device-lifetime; the
     // two static tables are baked on the first frame that records the pass.
     private RtSkyLut skyLut;
@@ -244,9 +251,15 @@ public final class RtComposite {
     private RtImage gMotion;
     private RtImage gSpecAlbedo;
     private RtImage gSpecMotion;
-    // Display-res RT image the display mapper reads: DLSS-RR writes it (render -> display denoise+upscale), or a
+    // Display-res reconstructed RT image: DLSS-RR writes it (render -> display denoise+upscale), or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
+    // Volumetric light scattering runs after RR: radial additive sampling writes a half-resolution soft
+    // shaft signal, then a full-resolution composite adds it to rrOutput. Even while the option is off,
+    // postProcessOutput receives a 1:1 copy so every downstream descriptor stays fixed and live toggles
+    // never update a descriptor set that an earlier frame may still be using.
+    private RtImage volumetricLightImage;
+    private RtImage postProcessOutput;
     private final RtExposure exposure = new RtExposure();
 
     // Trace + guide buffers run at render res; composite (display-mapping) runs at display res.
@@ -349,7 +362,7 @@ public final class RtComposite {
     public boolean exportLatestResidualExposureExr(Path outputPath) throws java.io.IOException {
         RenderSystem.assertOnRenderThread();
         RtContext ctx = RtContext.currentOrNull();
-        if (!enabled() || failed || ctx == null || rrOutput == null || exposure.image() == null
+        if (!enabled() || failed || ctx == null || postProcessOutput == null || exposure.image() == null
                 || displayW <= 0 || displayH <= 0 || pendingGraphicsUse != null) {
             return false;
         }
@@ -363,7 +376,7 @@ public final class RtComposite {
         }
 
         // All ordinary frame commands have been submitted before the F2 key is handled. Drain them before
-        // a private one-shot copy so rrOutput and the exposure image describe the same completed frame.
+        // a private one-shot copy so the post-process output and exposure image describe one completed frame.
         ctx.waitIdle();
         RtBuffer readback = ctx.createReadbackBuffer(totalBytes, "residual-exposure EXR readback");
         try {
@@ -413,7 +426,7 @@ public final class RtComposite {
                     .dstAccessMask(VK10.VK_ACCESS_TRANSFER_READ_BIT)
                     .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
                     .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
-                    .image(rrOutput.image);
+                    .image(postProcessOutput.image);
             imageBarriers.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
                     .levelCount(1).layerCount(1);
             imageBarriers.get(1).sType$Default()
@@ -432,7 +445,7 @@ public final class RtComposite {
             sceneCopy.get(0).bufferOffset(0L);
             sceneCopy.get(0).imageSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1);
             sceneCopy.get(0).imageExtent().set(displayW, displayH, 1);
-            VK10.vkCmdCopyImageToBuffer(cmd, rrOutput.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
+            VK10.vkCmdCopyImageToBuffer(cmd, postProcessOutput.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                     readback.handle, sceneCopy);
 
             VkBufferImageCopy.Buffer exposureCopy = VkBufferImageCopy.calloc(1, stack);
@@ -594,6 +607,9 @@ public final class RtComposite {
             if (bloomPipeline == null) {
                 bloomPipeline = RtBloomPipeline.create(ctx);
             }
+            if (volumetricLightPipeline == null) {
+                volumetricLightPipeline = RtVolumetricLightPipeline.create(ctx);
+            }
             if (skyLut == null) {
                 // Normally already created by ensureWorld before the pipeline exists at all; this only
                 // fires if render() somehow runs before the tick-driven ensureResourcesReady has, which
@@ -648,13 +664,15 @@ public final class RtComposite {
             // hdrToneLut/lookLut may have been hot-swapped just above; setImages is a no-op if the bound
             // views already match, so this is cheap on every other frame.
             RtToneLut boundLookLut = lookLut;
-            displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayImage.view,
+            displayPipeline.setImages(displayImage.view, postProcessOutput.view, exposure.image().view, hdrDisplayImage.view,
                     sdrToneLut.view(), sdrToneLut.sampler(), hdrToneLut.view(), hdrToneLut.sampler(),
                     boundLookLut.view(), boundLookLut.sampler(), bloomLevels[0].view, bloomPipeline.sampler());
-            bloomPipeline.setImages(rrOutput.view, exposure.image().view, bloomLevels);
+            bloomPipeline.setImages(postProcessOutput.view, exposure.image().view, bloomLevels);
             debugPresentPipeline.setImages(displayImage.view, gNormal.view, gAlbedo.view, gDepth.view,
-                    gMotion.view, gSpecAlbedo.view, gSpecMotion.view, rrOutput.view, exposure.image().view,
+                    gMotion.view, gSpecAlbedo.view, gSpecMotion.view, postProcessOutput.view, exposure.image().view,
                     exposure.stateBuffer());
+            volumetricLightPipeline.setImages(postProcessOutput.view, volumetricLightImage.view,
+                    rrOutput.view, gDepth.view, skyLut.transmittanceView(), skyLut.sampler());
             // Cheap idempotent check every frame (not just on resize): if the exposure mode is switched
             // manual -> auto at runtime (video settings), the auto-mode histogram/state/pipeline must be
             // allocated before recordFrame's exposure.record() below needs them, or it throws.
@@ -888,6 +906,14 @@ public final class RtComposite {
             rrOutput.destroy();
             rrOutput = null;
         }
+        if (volumetricLightImage != null) {
+            volumetricLightImage.destroy();
+            volumetricLightImage = null;
+        }
+        if (postProcessOutput != null) {
+            postProcessOutput.destroy();
+            postProcessOutput = null;
+        }
     }
 
     private void ensureOutput(RtContext ctx, int width, int height) {
@@ -898,6 +924,7 @@ public final class RtComposite {
         int rrQuality = rrEnabled ? RtDlssRr.quality() : Integer.MIN_VALUE;
         if (output != null && continuationQueue != null
                 && displayImage != null && hdrDisplayImage != null && rrOutput != null
+                && volumetricLightImage != null && postProcessOutput != null
                 && bloomLevels.length > 0 && exposure.ready()
                 && displayW == width && displayH == height
                 && renderSizeRrEnabled == rrEnabled && renderSizeRrQuality == rrQuality) {
@@ -968,8 +995,19 @@ public final class RtComposite {
         gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide motion " + renderW + "x" + renderH);
         gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderW + "x" + renderH);
         gSpecMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderW + "x" + renderH);
-        // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
-        rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
+        // Display-res reconstructed scene plus the post-process pair. Additive radial sampling is
+        // half-resolution because its output is deliberately soft; the composite remains full resolution
+        // so every downstream stage has one canonical post-process scene image.
+        rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                "DLSS-RR output " + width + "x" + height);
+        int volumetricWidth = Math.max(1, (width + 1) / 2);
+        int volumetricHeight = Math.max(1, (height + 1) / 2);
+        volumetricLightImage = ctx.createStorageImage(volumetricWidth, volumetricHeight,
+                VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                "volumetric light " + volumetricWidth + "x" + volumetricHeight);
+        postProcessOutput = ctx.createStorageImage(width, height,
+                VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                "post-process scene " + width + "x" + height);
         exposure.ensureResources(ctx);
 
         mvHasPrev = false; // recreated images -> first MV frame is zero
@@ -979,13 +1017,15 @@ public final class RtComposite {
             bindGuideImages();
         }
         RtToneLut boundLookLut = lookLut;
-        displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayImage.view,
+        displayPipeline.setImages(displayImage.view, postProcessOutput.view, exposure.image().view, hdrDisplayImage.view,
                 sdrToneLut.view(), sdrToneLut.sampler(), hdrToneLut.view(), hdrToneLut.sampler(),
                 boundLookLut.view(), boundLookLut.sampler(), bloomLevels[0].view, bloomPipeline.sampler());
-        bloomPipeline.setImages(rrOutput.view, exposure.image().view, bloomLevels);
+        bloomPipeline.setImages(postProcessOutput.view, exposure.image().view, bloomLevels);
         debugPresentPipeline.setImages(displayImage.view, gNormal.view, gAlbedo.view, gDepth.view,
-                gMotion.view, gSpecAlbedo.view, gSpecMotion.view, rrOutput.view, exposure.image().view,
+                gMotion.view, gSpecAlbedo.view, gSpecMotion.view, postProcessOutput.view, exposure.image().view,
                 exposure.stateBuffer());
+        volumetricLightPipeline.setImages(postProcessOutput.view, volumetricLightImage.view,
+                rrOutput.view, gDepth.view, skyLut.transmittanceView(), skyLut.sampler());
     }
 
     private void destroyBloomLevels() {
@@ -1233,18 +1273,36 @@ public final class RtComposite {
                     blitUpscale(cmd, stack, output, rrOutput);
                 }
             }
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to exposure histogram
+            VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to post-processing
 
-            // Auto-exposure meters rrOutput (the post-RR, denoised/converged image), not the raw
-            // pre-RR trace: RR has no notion of exposure (DLSS-RR Integration Guide §3.7 — ignore
-            // exposure/auto-exposure/sharpness entirely for RR), so this is purely our own metering
-            // choice, independent of RR's pipeline placement. Metering the noisy pre-RR buffer made
-            // the histogram's log-luminance average biased by Monte-Carlo noise (Jensen's inequality
-            // on the concave log()), so the computed exposure drifted with SPP; rrOutput is stable
-            // regardless of SPP, keeping exposure consistent.
+            // Crepuscular rays are a screen-space effect with no valid world motion, so they stay after
+            // temporal reconstruction. The enabled path performs half-res radial additive sampling and a
+            // full-res add; the disabled path is a 1:1 copy into the same canonical output, keeping every
+            // downstream descriptor stable while avoiding the expensive sample walk.
+            if (volumetricLightEnabled()) {
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "volumetric light");
+                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.volumetricLight")) {
+                    volumetricLightPipeline.dispatch(cmd, volumetricLightImage, postProcessOutput,
+                            pushBuf.deviceAddress,
+                            CausticaConfig.Rt.VolumetricLight.SAMPLES.value(),
+                            CausticaConfig.Rt.VolumetricLight.INTENSITY.value(),
+                            CausticaConfig.Rt.VolumetricLight.DENSITY.value(),
+                            CausticaConfig.Rt.VolumetricLight.DECAY.value());
+                }
+            } else {
+                VK10.vkCmdCopyImage(cmd, rrOutput.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                        postProcessOutput.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                        copyRegion(stack, displayW, displayH));
+            }
+            VulkanCommandEncoder.memoryBarrier(cmd, stack); // post-process scene visible downstream
+
+            // Auto-exposure meters the post-RR, post-process scene rather than the raw pre-RR trace.
+            // Metering the noisy pre-RR buffer made the histogram's log-luminance average biased by
+            // Monte-Carlo noise (Jensen's inequality), while the reconstructed/post-process image is stable
+            // regardless of SPP and includes the light shafts that the player actually sees.
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.exposure")) {
-                exposure.record(ctx, cmd, stack, rrOutput, gDepth, gAlbedo);
+                exposure.record(ctx, cmd, stack, postProcessOutput, gDepth, gAlbedo);
                 exposure.recordStateReadback(cmd, stack);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // exposure image visible to the display mapper
@@ -1502,6 +1560,10 @@ public final class RtComposite {
         if (bloomPipeline != null) {
             bloomPipeline.destroy();
             bloomPipeline = null;
+        }
+        if (volumetricLightPipeline != null) {
+            volumetricLightPipeline.destroy();
+            volumetricLightPipeline = null;
         }
         if (skyLut != null) {
             skyLut.destroy();
