@@ -35,9 +35,10 @@ public static const float FROXEL_SHADOW_REACH = 72.0;    // blocks toward the li
 // never change the result.
 public static const float FROXEL_RAY_REACH = 256.0;      // blocks toward the light
 public static const float FROXEL_RAY_BIAS = 0.03;        // blocks, keeps a froxel off a coincident face
-// Sky-access probe length. A roof, a canopy or an overhang is close by definition, so a short ray answers
-// "can light from the sky reach this point at all" for a fraction of the cost of a full escape ray.
-public static const float FROXEL_SKY_REACH = 40.0;       // blocks toward the sky
+// Sky-access probe length. This has to be long enough that a GRAZING sample cannot be satisfied by a
+// stretch of open cave: escaping forty blocks down a cavern is not sky access, and treating it as such
+// put full daylight into caves. A ray this long has to leave the cave system to escape at all.
+public static const float FROXEL_SKY_REACH = 128.0;      // blocks toward the sky
 // Fraction of the sky's own luminance a point in the open sees. The sky covers a hemisphere, so half of
 // an isotropic sphere's worth reaches any point with clear access to it.
 public static const float FROXEL_SKY_HEMISPHERE = 0.5;
@@ -127,17 +128,19 @@ public float froxelSliceJitter(uint frameIndex) {
 }
 
 /**
- * A stable per-position dither pair in [0,1).
+ * The frame's sample position in a unit square, from the R2 low-discrepancy sequence.
  *
- * <p>Keyed on a half-block lattice in world space, NOT on the frame: an estimator that is sampled
- * stochastically per frame turns a binary visibility test into flicker, while dithering it across space
- * lets the grid's own trilinear filter average neighbouring cells instead. World-locked rather than
- * grid-locked, so the pattern belongs to the world and a turning camera does not drag it around.
+ * <p>Shared by every froxel, which is the point. These sample directions inside a cone or a hemisphere,
+ * and both tests they feed are binary, so any per-froxel variation shows up directly as structure in the
+ * image: keyed on the frame the whole grid answers the same question at once and the temporal blend
+ * integrates the domain over successive frames, leaving no spatial pattern to notice. Keyed per froxel,
+ * even deterministically, neighbouring cells disagree and the difference is visible as blotches the size
+ * of whatever lattice generated them.
  */
-public float2 froxelWorldDither(float3 posRebased) {
-    int3 lattice = int3(floor(posRebased * 2.0)) + 0x4000;
-    uint3 key = uint3(max(lattice, int3(0)));
-    return float2(froxelHash(key, 0u), froxelHash(key, 0x9E3779B9u));
+public float2 froxelFrameSample(uint frameIndex, float offset) {
+    // Reciprocal powers of the plastic constant: the 2D generalisation of the golden ratio.
+    const float2 R2 = float2(0.7548776662466927, 0.5698402909980532);
+    return frac(float(frameIndex) * R2 + offset);
 }
 
 float froxelValueHash(float3 cell) {

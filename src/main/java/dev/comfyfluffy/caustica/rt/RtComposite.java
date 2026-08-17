@@ -130,11 +130,13 @@ public final class RtComposite {
 
     private static final int WATER_ANCHOR_MASK = 4095;
     // Froxel constants that describe the algorithm rather than a taste: the near boundary is where the
-    // grid starts (closer than this the eye is inside the first cell anyway), the temporal weight is the
-    // per-frame share of a new jittered sample, and the thickness bound is how deep behind a depth-guide
-    // surface a shadow test may still claim occlusion before the guide stops being evidence.
+    // grid starts (closer than this the eye is inside the first cell anyway), and the thickness bound is
+    // how deep behind a depth-guide surface a shadow test may still claim occlusion before the guide
+    // stops being evidence. The temporal weight is the per-frame share of a new sample: the visibility
+    // tests it averages are binary, so this doubles as how much of their residual variance survives into
+    // the image, and it is set low enough that a shaft edge crossing a slice boundary cannot shimmer.
     private static final float FROXEL_NEAR_DISTANCE = 0.3f;   // blocks
-    private static final float FROXEL_TEMPORAL_BLEND = 0.12f; // weight of this frame's sample
+    private static final float FROXEL_TEMPORAL_BLEND = 0.09f; // weight of this frame's sample
     private static final float FROXEL_SHADOW_THICKNESS = 32f; // blocks
     // VolumetricLightPush.flags bit 0: trace the TLAS for occlusion instead of marching the depth guide.
     private static final int VOLUMETRIC_FLAG_TRACE_OCCLUSION = 1;

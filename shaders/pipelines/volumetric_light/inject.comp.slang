@@ -34,6 +34,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     bool underwater = (world.flags & 1u) != 0u;
 
     float2 uv = (float2(dispatchId.xy) + 0.5) / float2(gridWidth, gridHeight);
+    // Only the screen-space fallback still wants a per-froxel offset: its march is a sum of many taps
+    // rather than one binary test, so decorrelating it turns quantisation into noise the blend removes.
     float cellNoise = froxelHash(dispatchId, pc.frameIndex);
     float sliceCoord = (float(dispatchId.z) + froxelSliceJitter(pc.frameIndex)) / float(gridDepth);
     float sampleDistance = froxelSliceDistance(pc.nearDistance, pc.maxDistance, sliceCoord);
@@ -70,8 +72,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
                 // One ray per froxel per frame, jittered across the light's disc. The grid's own temporal
                 // filter integrates those samples, so the penumbra widens with occluder distance the way
                 // a real one does instead of costing a ray per sample.
-                float2 discSample = float2(cellNoise, froxelHash(dispatchId, pc.frameIndex + 0x9E3779B9u));
-                float3 traceDir = froxelSampleLightCone(lightDir, light.halfAngle, discSample);
+                float3 traceDir = froxelSampleLightCone(lightDir, light.halfAngle,
+                        froxelFrameSample(pc.frameIndex, 0.0));
                 shadow = froxelTracedVisibility(worldTlas, originRebased, traceDir, FROXEL_RAY_REACH);
             } else {
                 shadow = froxelShadow(world, pc, depthImage, posCamRel, lightDir, cellNoise);
@@ -97,10 +99,12 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
         // partial under a canopy or an overhang.
         float skyAccess = 1.0;
         if (dot(ambientRadiance, BT709_LUMA) > FROXEL_AMBIENT_PROBE_FLOOR) {
-            // Dithered across world space and constant in time. One random direction per frame would make
-            // this binary probe flicker wherever the answer is genuinely mixed — a cave mouth, the edge of
-            // a canopy — which no affordable amount of temporal blending removes.
-            float3 skyDir = froxelSampleSkyDirection(froxelWorldDither(originRebased));
+            // One direction for the whole grid this frame, integrated over frames by the temporal blend.
+            // Dithering the direction per froxel instead makes each cell answer a different question, and
+            // since the answer is a hard 0 or 1 the disagreement is visible directly: a quarter of a
+            // cosine-weighted hemisphere lies more than sixty degrees off vertical, so in a cave those
+            // cells escaped down the cavern and lit up with full daylight while their neighbours did not.
+            float3 skyDir = froxelSampleSkyDirection(froxelFrameSample(pc.frameIndex, 0.5));
             skyAccess = traced
                     ? froxelTracedVisibility(worldTlas, originRebased, skyDir, FROXEL_SKY_REACH)
                     : froxelShadow(world, pc, depthImage, posCamRel, skyDir, cellNoise);
