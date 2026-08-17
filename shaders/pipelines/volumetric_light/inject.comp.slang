@@ -1,10 +1,10 @@
 // Froxel injection: per-cell in-scattered radiance and extinction, temporally accumulated.
 //
-// Each froxel evaluates the medium once at a jittered depth inside its own slice, asks the primary depth
-// guide whether the dominant celestial light reaches that point, and stores
+// Each froxel evaluates the medium once at a jittered depth inside its own slice, traces the world
+// acceleration structure to find whether the dominant celestial light reaches that point, and stores
 // (scattered radiance per unit length, extinction). Nothing here samples the rendered frame, so a shaft
-// never inherits the shape of the drawn sun, moon, or star field, and the light needs no on-screen
-// position at all — an off-screen or behind-the-camera sun casts the same shafts as one in view.
+// never inherits the shape of the drawn sun, moon, or star field, and neither the light nor its occluders
+// need to be on screen — an off-screen sun and an off-screen wall both behave as they should.
 //
 // The pass runs after DLSS Ray Reconstruction, so it also owns its own temporal filter: this frame's
 // jittered sample is blended into the previous grid reprojected through prevViewProj. Successive frames
@@ -19,7 +19,6 @@ import inject_bindings;
 [[vk::push_constant]] VolumetricLightPush pc;
 
 static const float3 BT709_LUMA = float3(0.2126, 0.7152, 0.0722);
-static const uint VOLUMETRIC_FLAG_TRACE_OCCLUSION = 1u;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -34,9 +33,6 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     bool underwater = (world.flags & 1u) != 0u;
 
     float2 uv = (float2(dispatchId.xy) + 0.5) / float2(gridWidth, gridHeight);
-    // Only the screen-space fallback still wants a per-froxel offset: its march is a sum of many taps
-    // rather than one binary test, so decorrelating it turns quantisation into noise the blend removes.
-    float cellNoise = froxelHash(dispatchId, pc.frameIndex);
     float sliceCoord = (float(dispatchId.z) + froxelSliceJitter(pc.frameIndex)) / float(gridDepth);
     float sampleDistance = froxelSliceDistance(pc.nearDistance, pc.maxDistance, sliceCoord);
     float3 viewDir = froxelViewDirection(world, uv);
@@ -62,22 +58,16 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
             froxelUnderwaterLight(world, posCamRel, lightDir, illuminance);
             anisotropy = FROXEL_WATER_ANISOTROPY;
         }
-        bool traced = (pc.flags & VOLUMETRIC_FLAG_TRACE_OCCLUSION) != 0u;
         float3 originRebased = posCamRel + world.camOffset;
 
         float3 direct = float3(0.0);
         if (dot(illuminance, BT709_LUMA) > 1.0e-5) {
-            float shadow;
-            if (traced) {
-                // One ray per froxel per frame, jittered across the light's disc. The grid's own temporal
-                // filter integrates those samples, so the penumbra widens with occluder distance the way
-                // a real one does instead of costing a ray per sample.
-                float3 traceDir = froxelSampleLightCone(lightDir, light.halfAngle,
-                        froxelFrameSample(pc.frameIndex, 0.0));
-                shadow = froxelTracedVisibility(worldTlas, originRebased, traceDir, FROXEL_RAY_REACH);
-            } else {
-                shadow = froxelShadow(world, pc, depthImage, posCamRel, lightDir, cellNoise);
-            }
+            // One ray per froxel per frame, jittered across the light's disc. The grid's own temporal
+            // filter integrates those samples, so the penumbra widens with occluder distance the way a
+            // real one does instead of costing a ray per sample.
+            float3 traceDir = froxelSampleLightCone(lightDir, light.halfAngle,
+                    froxelFrameSample(pc.frameIndex, 0.0));
+            float shadow = froxelTracedVisibility(worldTlas, originRebased, traceDir, FROXEL_RAY_REACH);
             direct = illuminance * (froxelPhase(dot(lightDir, viewDir), anisotropy) * shadow);
         }
 
@@ -106,10 +96,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
             uint probes = clamp(pc.skyProbes, 1u, 8u);
             float visible = 0.0;
             for (uint probe = 0u; probe < probes; ++probe) {
-                float3 skyDir = froxelSkyProbeDirection(probe, probes);
-                visible += traced
-                        ? froxelTracedVisibility(worldTlas, originRebased, skyDir, FROXEL_SKY_REACH)
-                        : froxelShadow(world, pc, depthImage, posCamRel, skyDir, cellNoise);
+                visible += froxelTracedVisibility(worldTlas, originRebased,
+                        froxelSkyProbeDirection(probe, probes), FROXEL_SKY_REACH);
             }
             skyAccess = visible / float(probes);
         }

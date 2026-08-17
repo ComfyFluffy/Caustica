@@ -24,12 +24,6 @@ public static const float FROXEL_NOISE_SCALE = 0.055;    // cycles per block
 public static const float FROXEL_NOISE_STRENGTH = 0.42;  // peak fractional density deviation
 public static const float FROXEL_NOISE_DRIFT = 0.035;    // blocks per second
 
-// Screen-space shadow march (the fallback path). Sample distances follow a squared curve, so taps crowd
-// near the froxel — where the occluder that shapes a shaft's edge is — and spread out far away, where the
-// depth guide is coarse anyway. The curve reaches the same distance at every quality step, so a lower
-// step count samples that reach more thinly instead of giving up on distant occluders.
-public static const float FROXEL_SHADOW_REACH = 72.0;    // blocks toward the light
-
 // Traced occlusion. The ray is bounded rather than infinite: beyond the streamed terrain radius there is
 // nothing in the acceleration structure to hit, so a longer ray only pays for BVH traversal that can
 // never change the result.
@@ -313,52 +307,4 @@ public float froxelTracedVisibility(RaytracingAccelerationStructure worldTlas,
         }
     }
     return query.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
-}
-
-/**
- * Visibility of the celestial light from a froxel, resolved by marching the primary depth guide.
- *
- * <p>The fallback for devices or settings without traced occlusion. Each step is projected into the frame
- * and compared against the depth the primary ray recorded for that pixel; both distances are measured
- * from the eye along the SAME reconstructed ray, so the comparison itself is exact.
- *
- * <p>What it cannot do is see past the frame. A step beyond {@code shadowThickness} behind a surface is
- * unknowable — the guide records one front face and cannot say how deep that object goes — and a step
- * that leaves the frustum or lands behind the camera was never rasterised at all. Both end the march lit,
- * which is what leaks light into rooms whose window is off-screen, and a step that passes behind an
- * on-screen silhouette without the light path actually entering it is what smears a dark tail along the
- * light direction. Traced occlusion exists because neither is fixable from a depth buffer.
- */
-public float froxelShadow(WorldPush world, VolumetricLightPush pc, Sampler2D depthImage,
-                          float3 posCamRel, float3 lightDir, float jitter) {
-    uint steps = clamp(pc.sampleCount, 2u, 64u);
-    float invSteps = 1.0 / float(steps);
-    for (uint i = 0u; i < steps; ++i) {
-        // The jitter advances the whole schedule by a fraction of a step, so consecutive frames test
-        // different points and the temporal blend turns the march into a continuous occlusion estimate.
-        float u = (float(i) + jitter) * invSteps;
-        float3 p = posCamRel + lightDir * (FROXEL_SHADOW_REACH * u * u);
-
-        float4 clip = mul(world.curViewProj, float4(p, 1.0));
-        if (clip.w <= 1.0e-5) {
-            break;
-        }
-        float2 uv = clip.xy / clip.w * 0.5 + 0.5;
-        if (any(uv < float2(0.0)) || any(uv > float2(1.0))) {
-            break;
-        }
-        float depth = depthImage.SampleLevel(uv, 0.0).r;
-        if (depth <= 1.0e-6) {
-            break; // sky texel: the march has reached open air
-        }
-        float sceneDistance = length(froxelUnproject(world, uv, depth));
-        float behind = length(p) - sceneDistance;
-        // Bias grows with distance: one depth-guide texel covers more world space the farther it is, and
-        // a fixed bias would self-shadow the very surfaces the shafts graze.
-        float bias = max(0.05, 0.02 * sceneDistance);
-        if (behind > bias) {
-            return behind < pc.shadowThickness ? 0.0 : 1.0;
-        }
-    }
-    return 1.0;
 }

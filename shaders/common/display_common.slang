@@ -92,9 +92,8 @@ public struct BloomPush {
 // celestial direction, illuminance, and pre-exposure the path tracer and sky LUT already agreed on.
 public struct VolumetricLightPush {
     public uint64_t worldPushAddr;
-    public uint  sampleCount;       // screen-space shadow march steps per froxel
     public uint  skyProbes;         // fixed directions tested for sky access per froxel
-    public uint  frameIndex;        // drives the slice jitter and the per-froxel march offset
+    public uint  frameIndex;        // drives the slice jitter and the light's disc sample
     public float intensity;         // artistic multiplier on in-scattered radiance only (never on transmittance)
     public float density;           // scattering coefficient at the fog base height, 1/block
     public float anisotropy;        // Henyey-Greenstein g of the aerosol phase function
@@ -104,12 +103,7 @@ public struct VolumetricLightPush {
     public float cameraAltitude;    // camera height above the density model's base (sea level), blocks
     public float ambient;           // unshadowed fraction of the celestial illuminance (sky/multiscatter stand-in)
     public float temporalBlend;     // weight of this frame's froxel sample against the reprojected history
-    public float shadowThickness;   // how far behind a depth-guide surface still counts as occluded, blocks
     public float underwaterDensity; // scattering coefficient used while the camera eye is submerged, 1/block
-    // Bit 0: resolve occlusion by tracing the world acceleration structure instead of marching the depth
-    // guide. Cleared when the TLAS is unavailable or the option is off, which is the only case the
-    // screen-space fallback still runs in.
-    public uint flags;
     // Ratio of this frame's pre-exposure to the previous frame's. The froxel textures store pre-exposed
     // radiance (fp16 headroom), so the reprojected history has to be rescaled when auto-exposure moves or
     // the fog would lag the scene by the temporal blend's time constant.

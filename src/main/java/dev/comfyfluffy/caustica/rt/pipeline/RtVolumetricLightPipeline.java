@@ -118,7 +118,6 @@ public final class RtVolumetricLightPipeline {
                     VkDescriptorSetLayoutBinding.calloc(VOLUMETRIC_INJECT_BINDING_COUNT, stack);
             storageImage(injectBindings, VOLUMETRIC_INJECT_OUTPUT);
             sampledImage(injectBindings, VOLUMETRIC_INJECT_HISTORY);
-            sampledImage(injectBindings, VOLUMETRIC_INJECT_DEPTH);
             sampledImage(injectBindings, VOLUMETRIC_INJECT_TRANSMITTANCE);
             long injectDsl = createSetLayout(ctx, stack, injectBindings, "volumetric inject");
 
@@ -139,7 +138,7 @@ public final class RtVolumetricLightPipeline {
             // 5 sets: two ping-pong orientations each for inject and integrate, one composite.
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(2, stack);
             poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(8);
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(8);
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(6);
             VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
                     .sType$Default().maxSets(5).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(vk, poolInfo, null, handle),
@@ -188,8 +187,8 @@ public final class RtVolumetricLightPipeline {
 
             // Trilinear filtering of the froxel volume is what upsamples it: it smooths across screen
             // tiles AND across depth slices, so neither the grid's coarse xy nor its slice boundaries
-            // survive into the image. The depth guide is point-filtered wherever it is read, since an
-            // interpolated silhouette is a distance that belongs to neither surface.
+            // survive into the image. The composite's depth guide is point-filtered, since an interpolated
+            // reversed-Z silhouette is a distance that belongs to neither surface.
             long linearSampler = createSampler(ctx, stack, VK10.VK_FILTER_LINEAR, "volumetric linear sampler");
             long nearestSampler = createSampler(ctx, stack, VK10.VK_FILTER_NEAREST, "volumetric nearest sampler");
 
@@ -203,7 +202,9 @@ public final class RtVolumetricLightPipeline {
 
     /**
      * Bind this frame's images. {@code scatterViewA}/{@code scatterViewB} are the ping-pong froxel
-     * volumes; {@code integratedView} receives the accumulated volume the composite samples.
+     * volumes; {@code integratedView} receives the accumulated volume the composite samples. The depth
+     * guide is the composite's alone — injection resolves visibility by tracing, so it reads nothing the
+     * frame drew.
      */
     public void setImages(long outputView, long sourceView, long depthView,
                           long transmittanceView, long transmittanceSampler,
@@ -230,8 +231,6 @@ public final class RtVolumetricLightPipeline {
                         VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, writeView, VK10.VK_NULL_HANDLE);
                 i = write(images, writes, i, injectDescriptorSets[parity], VOLUMETRIC_INJECT_HISTORY,
                         VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, historyView, linearSampler);
-                i = write(images, writes, i, injectDescriptorSets[parity], VOLUMETRIC_INJECT_DEPTH,
-                        VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, depthView, nearestSampler);
                 i = write(images, writes, i, injectDescriptorSets[parity], VOLUMETRIC_INJECT_TRANSMITTANCE,
                         VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, transmittanceView, transmittanceSampler);
 

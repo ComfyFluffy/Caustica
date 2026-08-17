@@ -48,8 +48,7 @@ abstract class GenerateRtBindings extends DefaultTask {
             [prefix: "BLOOM", source: "pipelines/bloom/main.comp.slang", resources: [
                     OUTPUT: "dstImage", SOURCE: "srcImage", EXPOSURE: "exposureImage"]],
             [prefix: "VOLUMETRIC_INJECT", source: "pipelines/volumetric_light/inject.comp.slang", resources: [
-                    OUTPUT: "scatterImage", HISTORY: "historyImage", DEPTH: "depthImage",
-                    TRANSMITTANCE: "transmittanceLut"],
+                    OUTPUT: "scatterImage", HISTORY: "historyImage", TRANSMITTANCE: "transmittanceLut"],
              // The TLAS is rebuilt every frame, so it is bound from its own ring of single-binding sets
              // rather than from the image set, which is written once per resize.
              accelResources: [TLAS: "worldTlas"]],

@@ -137,9 +137,10 @@ public final class RtComposite {
     // the image, and it is set low enough that a shaft edge crossing a slice boundary cannot shimmer.
     private static final float FROXEL_NEAR_DISTANCE = 0.3f;   // blocks
     private static final float FROXEL_TEMPORAL_BLEND = 0.09f; // weight of this frame's sample
-    private static final float FROXEL_SHADOW_THICKNESS = 32f; // blocks
-    // VolumetricLightPush.flags bit 0: trace the TLAS for occlusion instead of marching the depth guide.
-    private static final int VOLUMETRIC_FLAG_TRACE_OCCLUSION = 1;
+    // Ceiling on froxels per volume, enforced by coarsening the tile size. Three volumes of eight bytes a
+    // cell means this is the difference between a couple of hundred megabytes and a gigabyte of video
+    // memory, and the finest quality steps at 4K would sail past that without ever being playable.
+    private static final long FROXEL_BUDGET = 8_000_000L;
     // The versioned look package owns every photometric anchor and the sky geometry. Its sun illuminance is the
     // photometric solar constant at the top of the atmosphere; the shader's transmittance LUT brings that
     // to ~117,000 lux under a zenith sun and reddens/dims it through sunset, and because world.rmiss tints
@@ -1057,9 +1058,18 @@ public final class RtComposite {
      * grid while writing this one.
      */
     private void createFroxelVolumes(RtContext ctx, CausticaConfig.Rt.VolumetricLight.Grid grid) {
-        int gridW = Math.max(1, (displayW + grid.tile() - 1) / grid.tile());
-        int gridH = Math.max(1, (displayH + grid.tile() - 1) / grid.tile());
         int gridD = Math.max(1, grid.slices());
+        int tile = Math.max(1, grid.tile());
+        int gridW = Math.max(1, (displayW + tile - 1) / tile);
+        int gridH = Math.max(1, (displayH + tile - 1) / tile);
+        // A quality step names a tile size, not a cell count, so the same step costs four times as much at
+        // 4K as at 1080p. Coarsen the tiles until the volume fits the budget rather than letting the
+        // allocation grow without bound.
+        while ((long) gridW * gridH * gridD > FROXEL_BUDGET && tile < displayW) {
+            tile++;
+            gridW = Math.max(1, (displayW + tile - 1) / tile);
+            gridH = Math.max(1, (displayH + tile - 1) / tile);
+        }
         String extent = gridW + "x" + gridH + "x" + gridD;
         for (int i = 0; i < froxelScatter.length; i++) {
             froxelScatter[i] = ctx.createStorageImage3D(gridW, gridH, gridD,
@@ -1093,13 +1103,8 @@ public final class RtComposite {
      * rather than to the viewer: climb a mountain and the air actually thins, descend into a cave and it
      * does not keep thickening. {@code historyScale} rebases the previous frame's stored radiance onto
      * this frame's pre-exposure, which the froxel textures are scaled by.
-     *
-     * <p>{@code tracedOcclusion} switches injection from marching the depth guide to tracing the TLAS.
-     * The screen-space march can only see what the frame drew, so it leaks light into rooms whose window
-     * is off-screen and smears a dark tail behind on-screen silhouettes the light path never enters;
-     * tracing has neither failure mode, and it is what the option below turns off for weaker hardware.
      */
-    private VolumetricLightPushData volumetricPush(long worldPushAddress, boolean tracedOcclusion) {
+    private VolumetricLightPushData volumetricPush(long worldPushAddress) {
         float preExposure = exposure.preExposure();
         float historyScale = previousPreExposure > 0.0f ? preExposure / previousPreExposure : 1.0f;
         previousPreExposure = preExposure;
@@ -1109,7 +1114,6 @@ public final class RtComposite {
         float seaLevel = level != null ? level.getSeaLevel() : 0f;
         return new VolumetricLightPushData(
                 worldPushAddress,
-                froxelGrid.shadowSteps(),
                 froxelGrid.skyProbes(),
                 (int) frameCounter,
                 CausticaConfig.Rt.VolumetricLight.STRENGTH.value(),
@@ -1121,9 +1125,7 @@ public final class RtComposite {
                 (float) (camY - seaLevel),
                 CausticaConfig.Rt.VolumetricLight.AMBIENT.value(),
                 temporalBlend,
-                FROXEL_SHADOW_THICKNESS,
                 CausticaConfig.Rt.VolumetricLight.UNDERWATER_DENSITY.value(),
-                tracedOcclusion ? VOLUMETRIC_FLAG_TRACE_OCCLUSION : 0,
                 historyScale);
     }
 
@@ -1385,11 +1387,8 @@ public final class RtComposite {
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "volumetric light");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.volumetricLight")) {
                     int parity = (int) (frameCounter & 1L);
-                    boolean tracedOcclusion =
-                            CausticaConfig.Rt.VolumetricLight.RAY_TRACED_SHADOWS.value();
                     volumetricLightPipeline.dispatch(cmd, froxelScatter[parity], postProcessOutput,
-                            volumetricPush(pushBuf.deviceAddress, tracedOcclusion), parity,
-                            volumetricTlas, graphicsUse);
+                            volumetricPush(pushBuf.deviceAddress), parity, volumetricTlas, graphicsUse);
                 }
             } else {
                 // Nothing wrote the grid this frame, so whatever it still holds belongs to an older

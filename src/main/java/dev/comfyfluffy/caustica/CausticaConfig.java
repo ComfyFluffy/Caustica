@@ -100,8 +100,7 @@ public final class CausticaConfig {
         FILE.setComment("volumetric-light",
                 " Froxel volumetric light scattering (crepuscular rays, fog, and underwater shafts).\n"
                         + " strength scales ray brightness; fog-density sets how much air scatters;\n"
-                        + " quality (0-3) trades performance for grid resolution and shadow accuracy.\n"
-                        + " ray-traced-shadows resolves shafts against world geometry instead of the screen.");
+                        + " quality (0-4) trades performance for the resolution of the volumetric grid.");
         FILE.setComment("exposure",
                 " Controls automatic exposure. manual-ev sets exposure in manual mode and adjusts it in auto mode.\n"
                         + " adapt-darken and adapt-brighten control adjustment speed in seconds.\n"
@@ -825,10 +824,10 @@ public final class CausticaConfig {
 
         /**
          * Froxel volumetric lighting from the dominant sun or moon. The frustum is voxelised, each cell
-         * evaluates the medium and the light's screen-space shadow once, and the accumulated volume is
-         * applied to the reconstructed scene. It runs after DLSS Ray Reconstruction — the volume carries
-         * its own temporal filter, so its shafts never enter RR's history — and rejoins the scene before
-         * exposure, bloom, and the SDR/HDR display transforms.
+         * traces the world for the light's visibility and for its own sky access, and the accumulated
+         * volume is applied to the reconstructed scene. It runs after DLSS Ray Reconstruction — the volume
+         * carries its own temporal filter, so its shafts never enter RR's history — and rejoins the scene
+         * before exposure, bloom, and the SDR/HDR display transforms.
          */
         public static final class VolumetricLight {
             public static final BooleanSetting ENABLED =
@@ -837,16 +836,7 @@ public final class CausticaConfig {
             public static final FloatSetting STRENGTH =
                     clampedFloat("caustica.rt.volumetricLight.strength",
                             "volumetric-light.strength", 1.0f, 0.0f, 3.0f);
-            /**
-             * Resolve occlusion by tracing the world acceleration structure instead of marching the
-             * primary depth guide. Tracing sees geometry the frame does not — occluders behind the camera
-             * or outside the frustum — and cannot invent the dark tails a depth-buffer march leaves behind
-             * on-screen silhouettes. Turning it off restores the cheaper screen-space march.
-             */
-            public static final BooleanSetting RAY_TRACED_SHADOWS =
-                    bool("caustica.rt.volumetricLight.rayTracedShadows",
-                            "volumetric-light.ray-traced-shadows", true);
-            public static final List<Integer> QUALITY_STEPS = List.of(0, 1, 2, 3);
+            public static final List<Integer> QUALITY_STEPS = List.of(0, 1, 2, 3, 4);
             public static final IntSetting QUALITY =
                     intChoice("caustica.rt.volumetricLight.quality",
                             "volumetric-light.quality", 1, QUALITY_STEPS);
@@ -892,23 +882,23 @@ public final class CausticaConfig {
 
             /**
              * Grid shape for a quality step: {@code tile} screen pixels per froxel column, {@code slices}
-             * depth cells, {@code shadowSteps} depth-guide taps per cell, and {@code skyProbes} fixed
-             * directions tested for sky access.
+             * depth cells, and {@code skyProbes} fixed directions tested for sky access.
              *
-             * <p>Cost is the product of the first two, times one ray for the light plus {@code skyProbes}
-             * for the ambient term; the tap count only applies to the screen-space fallback, since traced
-             * occlusion resolves the light with a single ray. Tile size decides how sharply a shadow edge
-             * can be drawn inside a shaft, slice count decides whether shafts read as smooth volumes or as
-             * stacked layers, and the probe count decides how finely partial sky cover — a canopy, a
-             * ledge — is quantised, since those directions are a fixed set rather than a random sample.
+             * <p>Cell count is the frame divided by the tile size, times the slices; each cell traces one
+             * ray for the light plus {@code skyProbes} for the ambient term, so cost scales with the
+             * product of all three. Tile size decides how sharply a shadow edge can be drawn inside a
+             * shaft, slice count decides whether shafts read as smooth volumes or as stacked layers, and
+             * the probe count decides how finely partial sky cover — a canopy, a ledge — is quantised,
+             * since those directions are a fixed set rather than a random sample.
              */
-            public record Grid(int tile, int slices, int shadowSteps, int skyProbes) {}
+            public record Grid(int tile, int slices, int skyProbes) {}
 
             private static final List<Grid> GRIDS = List.of(
-                    new Grid(20, 48, 8, 1),
-                    new Grid(12, 64, 12, 2),
-                    new Grid(10, 96, 16, 3),
-                    new Grid(8, 128, 20, 4));
+                    new Grid(20, 48, 1),
+                    new Grid(12, 64, 2),
+                    new Grid(10, 96, 3),
+                    new Grid(8, 128, 4),
+                    new Grid(6, 160, 4));
 
             public static Grid grid() {
                 return GRIDS.get(Math.clamp(QUALITY.value(), 0, GRIDS.size() - 1));

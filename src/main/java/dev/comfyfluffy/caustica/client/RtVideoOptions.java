@@ -58,7 +58,6 @@ public final class RtVideoOptions {
             volumetricLightIntensity(),
             volumetricLightDensity(),
             volumetricLightQuality(),
-            volumetricLightRayTraced(),
             dlssQuality()
         ));
         if (CausticaConfig.Rt.Hdr.swapchainPqAvailable()) {
@@ -188,11 +187,6 @@ public final class RtVideoOptions {
             new OptionInstance.IntRange(0, steps.size() - 1),
             initialPosition,
             position -> setting.set(steps.get(position)));
-    }
-
-    private static OptionInstance<Boolean> volumetricLightRayTraced() {
-        return bool("caustica.options.rt.volumetricLightRayTraced",
-                CausticaConfig.Rt.VolumetricLight.RAY_TRACED_SHADOWS);
     }
 
     private static OptionInstance<Integer> dlssQuality() {
