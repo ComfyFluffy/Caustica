@@ -892,20 +892,23 @@ public final class CausticaConfig {
 
             /**
              * Grid shape for a quality step: {@code tile} screen pixels per froxel column, {@code slices}
-             * depth cells, and {@code shadowSteps} depth-guide taps per cell.
+             * depth cells, {@code shadowSteps} depth-guide taps per cell, and {@code skyProbes} fixed
+             * directions tested for sky access.
              *
-             * <p>Cost is the product of the first two; the tap count only applies to the screen-space
-             * fallback, since traced occlusion resolves a froxel with a single ray. Tile size decides how
-             * sharply a shadow edge can be drawn inside a shaft, and slice count decides whether shafts
-             * read as smooth volumes or as stacked layers.
+             * <p>Cost is the product of the first two, times one ray for the light plus {@code skyProbes}
+             * for the ambient term; the tap count only applies to the screen-space fallback, since traced
+             * occlusion resolves the light with a single ray. Tile size decides how sharply a shadow edge
+             * can be drawn inside a shaft, slice count decides whether shafts read as smooth volumes or as
+             * stacked layers, and the probe count decides how finely partial sky cover — a canopy, a
+             * ledge — is quantised, since those directions are a fixed set rather than a random sample.
              */
-            public record Grid(int tile, int slices, int shadowSteps) {}
+            public record Grid(int tile, int slices, int shadowSteps, int skyProbes) {}
 
             private static final List<Grid> GRIDS = List.of(
-                    new Grid(20, 48, 8),
-                    new Grid(12, 64, 12),
-                    new Grid(10, 96, 16),
-                    new Grid(8, 128, 20));
+                    new Grid(20, 48, 8, 1),
+                    new Grid(12, 64, 12, 2),
+                    new Grid(10, 96, 16, 3),
+                    new Grid(8, 128, 20, 4));
 
             public static Grid grid() {
                 return GRIDS.get(Math.clamp(QUALITY.value(), 0, GRIDS.size() - 1));

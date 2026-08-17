@@ -99,15 +99,19 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
         // partial under a canopy or an overhang.
         float skyAccess = 1.0;
         if (dot(ambientRadiance, BT709_LUMA) > FROXEL_AMBIENT_PROBE_FLOOR) {
-            // One direction for the whole grid this frame, integrated over frames by the temporal blend.
-            // Dithering the direction per froxel instead makes each cell answer a different question, and
-            // since the answer is a hard 0 or 1 the disagreement is visible directly: a quarter of a
-            // cosine-weighted hemisphere lies more than sixty degrees off vertical, so in a cave those
-            // cells escaped down the cavern and lit up with full daylight while their neighbours did not.
-            float3 skyDir = froxelSampleSkyDirection(froxelFrameSample(pc.frameIndex, 0.5));
-            skyAccess = traced
-                    ? froxelTracedVisibility(worldTlas, originRebased, skyDir, FROXEL_SKY_REACH)
-                    : froxelShadow(world, pc, depthImage, posCamRel, skyDir, cellNoise);
+            // A fixed set of directions, identical every frame in every cell. Enclosed space answers zero
+            // from all of them and open sky answers one from all of them, so neither can vary at all; only
+            // genuinely partial cover — a canopy, a ledge, a cave mouth — lands between, and it lands
+            // there consistently instead of flickering between the two.
+            uint probes = clamp(pc.skyProbes, 1u, 8u);
+            float visible = 0.0;
+            for (uint probe = 0u; probe < probes; ++probe) {
+                float3 skyDir = froxelSkyProbeDirection(probe, probes);
+                visible += traced
+                        ? froxelTracedVisibility(worldTlas, originRebased, skyDir, FROXEL_SKY_REACH)
+                        : froxelShadow(world, pc, depthImage, posCamRel, skyDir, cellNoise);
+            }
+            skyAccess = visible / float(probes);
         }
 
         scattered = density * (direct + ambientRadiance * skyAccess);

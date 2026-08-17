@@ -1110,6 +1110,7 @@ public final class RtComposite {
         return new VolumetricLightPushData(
                 worldPushAddress,
                 froxelGrid.shadowSteps(),
+                froxelGrid.skyProbes(),
                 (int) frameCounter,
                 CausticaConfig.Rt.VolumetricLight.STRENGTH.value(),
                 CausticaConfig.Rt.VolumetricLight.DENSITY.value(),

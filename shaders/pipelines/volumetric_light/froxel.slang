@@ -257,6 +257,26 @@ public float3 froxelSampleSkyDirection(float2 u) {
 }
 
 /**
+ * Probe direction {@code index} of {@code count}, a FIXED cosine-weighted set — no frame, no position.
+ *
+ * <p>Sky access is a hemispherical integral estimated with a handful of binary tests, and both ways of
+ * hiding that estimator's variance failed in play. Spread across space, neighbouring cells disagreed and
+ * the disagreement read as block-sized patches. Spread across time with one direction per frame, the
+ * whole grid agreed with itself and disagreed with the previous frame, so a cave flashed on and off at
+ * frame rate. Fixing the set removes the variance instead of moving it: the estimate is quantised to
+ * {@code count + 1} levels, but it is the same estimate every frame from every cell, so it is stable, and
+ * whatever structure it has follows geometry rather than a sampling pattern.
+ *
+ * <p>Elevations are stratified across the cosine distribution and azimuths are spread by the golden
+ * ratio, so even two directions bracket the hemisphere rather than clustering.
+ */
+public float3 froxelSkyProbeDirection(uint index, uint count) {
+    float elevation = (float(index) + 0.5) / float(max(count, 1u));
+    float azimuth = frac(float(index) * 0.6180339887498949 + 0.125);
+    return froxelSampleSkyDirection(float2(elevation, azimuth));
+}
+
+/**
  * Visibility of the celestial light from a froxel, traced against the world acceleration structure.
  *
  * <p>This is the same geometry the path tracer shades, so occluders behind the camera or outside the

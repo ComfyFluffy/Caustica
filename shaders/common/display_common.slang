@@ -93,6 +93,7 @@ public struct BloomPush {
 public struct VolumetricLightPush {
     public uint64_t worldPushAddr;
     public uint  sampleCount;       // screen-space shadow march steps per froxel
+    public uint  skyProbes;         // fixed directions tested for sky access per froxel
     public uint  frameIndex;        // drives the slice jitter and the per-froxel march offset
     public float intensity;         // artistic multiplier on in-scattered radiance only (never on transmittance)
     public float density;           // scattering coefficient at the fog base height, 1/block
