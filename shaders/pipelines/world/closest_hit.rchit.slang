@@ -115,8 +115,40 @@ float3 perturbNormal(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float
 static const float PARALLAX_MIN_NDOTV = 0.1;   // below this the offset diverges faster than taps can track
 static const float PARALLAX_FADE_FRACTION = 0.25; // last quarter of the range fades back to flat
 
-float parallaxHeight(uint page, float2 pageUv, float lod) {
-    return samplePageNormalAo(page, pageUv, lod).a;
+/**
+ * Height at a page UV, optionally filtered.
+ *
+ * <p>Material pages are point-sampled, which is what keeps Minecraft's texels crisp everywhere else, but
+ * it also means the height field the march walks is a grid of flat plateaus. At 16x those plateaus ARE
+ * the art; at 128x and above they are terracing across relief the pack meant to be continuous. The
+ * filtered path interpolates the four surrounding texels with an eased fraction, so the surface curves
+ * between them instead of stepping, and blends toward it by {@code smoothing} — zero skips the extra
+ * taps entirely, which is why the option costs nothing when it is off.
+ */
+float parallaxHeight(uint page, float2 pageUv, float lod, float2 pageTexels, float smoothing) {
+    if (smoothing <= 0.0) {
+        return samplePageNormalAo(page, pageUv, lod).a;
+    }
+    float2 texel = pageUv * pageTexels - 0.5;
+    float2 base = floor(texel);
+    float2 fraction = texel - base;
+    float2 originUv = (base + 0.5) / pageTexels;
+    float2 stepUv = 1.0 / pageTexels;
+    float h00 = samplePageNormalAo(page, originUv, lod).a;
+    float h10 = samplePageNormalAo(page, originUv + float2(stepUv.x, 0.0), lod).a;
+    float h01 = samplePageNormalAo(page, originUv + float2(0.0, stepUv.y), lod).a;
+    float h11 = samplePageNormalAo(page, originUv + stepUv, lod).a;
+
+    // Smoothstep the fraction rather than interpolating it linearly: a linear blend meets each texel
+    // centre with a corner, which trades the staircase for a faceted surface instead of a rounded one.
+    float2 eased = fraction * fraction * (3.0 - 2.0 * fraction);
+    float filtered = lerp(lerp(h00, h10, eased.x), lerp(h01, h11, eased.x), eased.y);
+
+    // The unfiltered end of the blend is the nearest of the four taps, so partial strengths interpolate
+    // between exactly the crisp result and the smooth one without a fifth fetch.
+    float2 nearest = step(0.5, fraction);
+    float crisp = lerp(lerp(h00, h10, nearest.x), lerp(h01, h11, nearest.x), nearest.y);
+    return lerp(crisp, filtered, saturate(smoothing));
 }
 
 /**
@@ -179,6 +211,12 @@ float2 parallaxAtlasUv(MaterialHeader header, float2 atlasUv, float lod, float3 
     uint page = header.texturePage;
     float2 pageOrigin = header.materialUv.xy;
     float2 pageExtent = header.materialUv.zw;
+    // Texel grid of the mip the march samples, which is what the smoothing filter steps across.
+    float smoothing = pc.parallaxSmoothing;
+    float2 pageTexels = smoothing > 0.0
+            ? max(texSizePx(materialNormalAoTex[NonUniformResourceIndex(page)]) / exp2(materialLod),
+                  float2(1.0))
+            : float2(1.0);
 
     // Steps scale with how oblique the view is, because that is what stretches the search: head-on there
     // is almost nothing to march, at a grazing angle the same depth sweeps across many texels.
@@ -189,21 +227,23 @@ float2 parallaxAtlasUv(MaterialHeader header, float2 atlasUv, float lod, float3 
 
     float rayDepth = 0.0;
     float2 currentUv = localUv;
-    float surfaceDepth = 1.0 - parallaxHeight(page, pageOrigin + currentUv * pageExtent, materialLod);
+    float surfaceDepth = 1.0
+            - parallaxHeight(page, pageOrigin + currentUv * pageExtent, materialLod, pageTexels, smoothing);
     if (surfaceDepth <= 0.0) {
         return atlasUv; // authored flat here (or a pack with no height at all): nothing to march
     }
     for (uint i = 0u; i < steps && rayDepth < surfaceDepth; ++i) {
         currentUv = clamp(currentUv + deltaUv, float2(0.0), float2(1.0));
         rayDepth += layer;
-        surfaceDepth = 1.0 - parallaxHeight(page, pageOrigin + currentUv * pageExtent, materialLod);
+        surfaceDepth = 1.0
+                - parallaxHeight(page, pageOrigin + currentUv * pageExtent, materialLod, pageTexels, smoothing);
     }
 
     // One secant step between the last pair brackets the crossing without another texture fetch, which
     // is what keeps a coarse march from quantising the displacement into visible stair steps.
     float2 previousUv = clamp(currentUv - deltaUv, float2(0.0), float2(1.0));
-    float previousSurfaceDepth =
-            1.0 - parallaxHeight(page, pageOrigin + previousUv * pageExtent, materialLod);
+    float previousSurfaceDepth = 1.0
+            - parallaxHeight(page, pageOrigin + previousUv * pageExtent, materialLod, pageTexels, smoothing);
     float after = surfaceDepth - rayDepth;
     float before = previousSurfaceDepth - (rayDepth - layer);
     float weight = saturate(after / max(after - before, 1.0e-6));

@@ -62,6 +62,7 @@ public final class RtVideoOptions {
             parallaxDepth(),
             parallaxQuality(),
             parallaxDistance(),
+            parallaxSmoothing(),
             dlssQuality()
         ));
         if (CausticaConfig.Rt.Hdr.swapchainPqAvailable()) {
@@ -236,6 +237,18 @@ public final class RtVideoOptions {
             new OptionInstance.IntRange(4, 128),
             Math.clamp(Math.round(setting.value()), 4, 128),
             blocks -> setting.set((float) blocks));
+    }
+
+    private static OptionInstance<Integer> parallaxSmoothing() {
+        FloatSetting setting = CausticaConfig.Rt.Parallax.SMOOTHING;
+        return new OptionInstance<>(
+            "caustica.options.rt.parallaxSmoothing",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.parallaxSmoothing.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, 100),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 100),
+            percent -> setting.set(percent / 100.0f));
     }
 
     private static OptionInstance<Integer> dlssQuality() {

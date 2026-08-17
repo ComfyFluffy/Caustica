@@ -104,7 +104,8 @@ public final class CausticaConfig {
         FILE.setComment("parallax",
                 " Parallax occlusion mapping from a resource pack's LabPBR height channel.\n"
                         + " depth is how far the surface pushes in, in blocks; steps trades performance for\n"
-                        + " accuracy at grazing angles; distance is where it fades back to a flat surface.");
+                        + " accuracy at grazing angles; distance is where it fades back to a flat surface.\n"
+                        + " smoothing rounds the height field between texels, for packs above 16x; 0 is off.");
         FILE.setComment("exposure",
                 " Controls automatic exposure. manual-ev sets exposure in manual mode and adjusts it in auto mode.\n"
                         + " adapt-darken and adapt-brighten control adjustment speed in seconds.\n"
@@ -937,6 +938,15 @@ public final class CausticaConfig {
              */
             public static final IntSetting STEPS =
                     intChoice("caustica.rt.parallax.steps", "parallax.steps", 32, STEP_CHOICES);
+            /**
+             * Strength of the height field's smoothing filter. Material pages are point-sampled to keep
+             * Minecraft's texels crisp, so the marched height is a grid of flat plateaus: at 16x those
+             * plateaus are the art, while a high-resolution pack authors continuous relief that the same
+             * sampling turns into terracing. Off by default — it costs four height taps per march step
+             * where one would do, and it rounds off detail a default-resolution pack wants kept square.
+             */
+            public static final FloatSetting SMOOTHING =
+                    clampedFloat("caustica.rt.parallax.smoothing", "parallax.smoothing", 0.0f, 0.0f, 1.0f);
 
             private Parallax() {
             }

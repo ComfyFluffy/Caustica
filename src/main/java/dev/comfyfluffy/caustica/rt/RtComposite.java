@@ -1339,7 +1339,8 @@ public final class RtComposite {
                     (int) frameCounter,
                     parallax ? CausticaConfig.Rt.Parallax.DEPTH.value() : 0f,
                     CausticaConfig.Rt.Parallax.DISTANCE.value(),
-                    CausticaConfig.Rt.Parallax.STEPS.value()).write(pushConstants);
+                    CausticaConfig.Rt.Parallax.STEPS.value(),
+                    CausticaConfig.Rt.Parallax.SMOOTHING.value()).write(pushConstants);
             // Sky LUTs, from the same WorldPush slot the trace is about to read: the sky the LUT holds and
             // the sky the frame shades are built from one set of angles, not two. Recorded here (after the
             // push flush, before the trace) so the miss shader's very first fetch sees this frame's dome.

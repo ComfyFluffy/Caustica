@@ -35,6 +35,10 @@ public struct WorldPushConstants {
     public float parallaxDepth;
     public float parallaxDistance;
     public uint  parallaxSteps;
+    // Strength of the height field's smoothing filter, 0 disabling it and its cost outright. The material
+    // pages are point-sampled to keep Minecraft's crisp texels, so the march otherwise descends a
+    // staircase of texel plateaus; that reads as relief at 16x and as terracing on a high-resolution pack.
+    public float parallaxSmoothing;
 };
 
 // Minimal push block for the compute passes that only need to dereference the frame's WorldPush: the sky

@@ -57,6 +57,8 @@
 	"caustica.options.rt.parallaxQuality.128": "Extreme",
 	"caustica.options.rt.parallaxDistance": "Parallax Distance",
 	"caustica.options.rt.parallaxDistance.tooltip": "Distance at which the depth fades back to a flat surface. Shorter keeps the cost near the camera, where a texel is still larger than a pixel.",
+	"caustica.options.rt.parallaxSmoothing": "Parallax Smoothing",
+	"caustica.options.rt.parallaxSmoothing.tooltip": "Round the height field between texels instead of stepping from one to the next. Intended for resource packs above 16x, whose relief is continuous; at default resolution it softens detail that is meant to be square. Off by default and costs extra samples while marching.",
 
 	"caustica.options.rt.hdr": "HDR Output",
 	"caustica.options.rt.hdr.tooltip": "Recreate the swapchain for HDR (ST.2084/PQ) or native SDR output. Applied at the next frame boundary.",
