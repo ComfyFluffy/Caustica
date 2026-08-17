@@ -112,21 +112,32 @@ public float froxelHash(uint3 cell, uint frameIndex) {
 }
 
 /**
- * R3 low-discrepancy offset of this frame's whole grid inside one cell, in all three axes.
+ * Golden-ratio (R1) offset of this frame's slice centres within their slice, shared by the whole grid.
  *
- * <p>Successive frames evaluate a different point within every froxel, and the temporal blend turns that
- * sequence into an integral over the cell. On the z axis that is what dissolves the layered "slabs" a
- * fixed slice centre produces at any affordable slice count; on x and y it is what keeps a shadow edge
- * from stepping along the grid's screen tiles, since the edge lands at a different sub-tile position each
- * frame instead of snapping to the same one.
+ * <p>Successive frames evaluate a different depth inside every froxel, and the temporal blend turns that
+ * sequence into an integral over the cell, which is what dissolves the layered "slabs" a fixed slice
+ * centre produces at any affordable slice count.
  *
- * <p>The offset is uniform across the grid rather than per cell: a shared shift accumulates into a
- * finer-sampled lattice, while a per-cell shift would only add spatial noise for the blend to remove.
+ * <p>Deliberately depth-only. Jittering x and y as well samples a finer lattice in principle, but it
+ * walks each froxel's sample point across block silhouettes from frame to frame, and since visibility
+ * there is a hard 0 or 1 the blend cannot converge — it flickers along every edge instead.
  */
-public float3 froxelGridJitter(uint frameIndex) {
-    // Successive reciprocal powers of the plastic constant, the 3D generalisation of the golden ratio.
-    const float3 R3 = float3(0.8191725133961645, 0.6710436067037893, 0.5497004779019701);
-    return frac(float(frameIndex) * R3);
+public float froxelSliceJitter(uint frameIndex) {
+    return frac(float(frameIndex) * 0.6180339887498949);
+}
+
+/**
+ * A stable per-position dither pair in [0,1).
+ *
+ * <p>Keyed on a half-block lattice in world space, NOT on the frame: an estimator that is sampled
+ * stochastically per frame turns a binary visibility test into flicker, while dithering it across space
+ * lets the grid's own trilinear filter average neighbouring cells instead. World-locked rather than
+ * grid-locked, so the pattern belongs to the world and a turning camera does not drag it around.
+ */
+public float2 froxelWorldDither(float3 posRebased) {
+    int3 lattice = int3(floor(posRebased * 2.0)) + 0x4000;
+    uint3 key = uint3(max(lattice, int3(0)));
+    return float2(froxelHash(key, 0u), froxelHash(key, 0x9E3779B9u));
 }
 
 float froxelValueHash(float3 cell) {

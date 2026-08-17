@@ -188,8 +188,8 @@ public final class RtVolumetricLightPipeline {
 
             // Trilinear filtering of the froxel volume is what upsamples it: it smooths across screen
             // tiles AND across depth slices, so neither the grid's coarse xy nor its slice boundaries
-            // survive into the image. Injection keeps a point-filtered depth guide, where an interpolated
-            // silhouette would place a shadow test in front of or behind real geometry.
+            // survive into the image. The depth guide is point-filtered wherever it is read, since an
+            // interpolated silhouette is a distance that belongs to neither surface.
             long linearSampler = createSampler(ctx, stack, VK10.VK_FILTER_LINEAR, "volumetric linear sampler");
             long nearestSampler = createSampler(ctx, stack, VK10.VK_FILTER_NEAREST, "volumetric nearest sampler");
 
@@ -247,13 +247,13 @@ public final class RtVolumetricLightPipeline {
                     VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, sourceView, VK10.VK_NULL_HANDLE);
             i = write(images, writes, i, compositeDescriptorSet, VOLUMETRIC_COMPOSITE_VOLUME,
                     VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, integratedView, linearSampler);
-            // The composite's depth fetch is FILTERED, unlike injection's. It only picks how far along the
-            // volume this pixel integrates, and the guide is at render resolution while this pass runs at
-            // display resolution, so a point fetch quantises every silhouette to a render texel and edges
-            // the fog with a blocky outline. Interpolating turns that step into a sub-texel ramp, which is
-            // what the edge would look like anyway.
+            // Both depth fetches are POINT sampled, and the composite's especially must stay that way.
+            // Reversed-Z is hyperbolic, so interpolating across a silhouette does not blend the two
+            // distances: a block three blocks away and a background sixty blocks away average to about
+            // six, snapping the edge texel to the foreground. That put a rim of far-too-short fog around
+            // every silhouette, and sub-pixel camera motion made the rim flicker.
             write(images, writes, i, compositeDescriptorSet, VOLUMETRIC_COMPOSITE_DEPTH,
-                    VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, depthView, linearSampler);
+                    VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, depthView, nearestSampler);
 
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }

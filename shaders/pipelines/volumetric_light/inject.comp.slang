@@ -33,10 +33,9 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     WorldPush world = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
     bool underwater = (world.flags & 1u) != 0u;
 
-    float3 gridJitter = froxelGridJitter(pc.frameIndex);
-    float2 uv = (float2(dispatchId.xy) + gridJitter.xy) / float2(gridWidth, gridHeight);
+    float2 uv = (float2(dispatchId.xy) + 0.5) / float2(gridWidth, gridHeight);
     float cellNoise = froxelHash(dispatchId, pc.frameIndex);
-    float sliceCoord = (float(dispatchId.z) + gridJitter.z) / float(gridDepth);
+    float sliceCoord = (float(dispatchId.z) + froxelSliceJitter(pc.frameIndex)) / float(gridDepth);
     float sampleDistance = froxelSliceDistance(pc.nearDistance, pc.maxDistance, sliceCoord);
     float3 viewDir = froxelViewDirection(world, uv);
     float3 posCamRel = viewDir * sampleDistance;
@@ -98,9 +97,10 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
         // partial under a canopy or an overhang.
         float skyAccess = 1.0;
         if (dot(ambientRadiance, BT709_LUMA) > FROXEL_AMBIENT_PROBE_FLOOR) {
-            float2 skySample = float2(froxelHash(dispatchId, pc.frameIndex + 0x51ED270Bu),
-                                      froxelHash(dispatchId, pc.frameIndex + 0x2545F491u));
-            float3 skyDir = froxelSampleSkyDirection(skySample);
+            // Dithered across world space and constant in time. One random direction per frame would make
+            // this binary probe flicker wherever the answer is genuinely mixed — a cave mouth, the edge of
+            // a canopy — which no affordable amount of temporal blending removes.
+            float3 skyDir = froxelSampleSkyDirection(froxelWorldDither(originRebased));
             skyAccess = traced
                     ? froxelTracedVisibility(worldTlas, originRebased, skyDir, FROXEL_SKY_REACH)
                     : froxelShadow(world, pc, depthImage, posCamRel, skyDir, cellNoise);
