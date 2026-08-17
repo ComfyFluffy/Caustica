@@ -35,6 +35,15 @@ public static const float FROXEL_SHADOW_REACH = 72.0;    // blocks toward the li
 // never change the result.
 public static const float FROXEL_RAY_REACH = 256.0;      // blocks toward the light
 public static const float FROXEL_RAY_BIAS = 0.03;        // blocks, keeps a froxel off a coincident face
+// Sky-access probe length. A roof, a canopy or an overhang is close by definition, so a short ray answers
+// "can light from the sky reach this point at all" for a fraction of the cost of a full escape ray.
+public static const float FROXEL_SKY_REACH = 40.0;       // blocks toward the sky
+// Fraction of the sky's own luminance a point in the open sees. The sky covers a hemisphere, so half of
+// an isotropic sphere's worth reaches any point with clear access to it.
+public static const float FROXEL_SKY_HEMISPHERE = 0.5;
+// Below this in-scattered luminance the ambient term cannot be seen against anything, so its sky probe is
+// skipped outright — which is what keeps a moonless night from paying for a ray per froxel.
+public static const float FROXEL_AMBIENT_PROBE_FLOOR = 1.0e-3; // cd/m²
 
 // Visibility mask of the secondary-ray class, matching the path tracer's own shadow rays: instances that
 // exist only for the primary view (the first-person camera owner's billboards) must not cast shafts.
@@ -103,13 +112,21 @@ public float froxelHash(uint3 cell, uint frameIndex) {
 }
 
 /**
- * Golden-ratio (R1) low-discrepancy offset of this frame's slice centres inside their slice. Successive
- * frames land on different depths within the same cell, and the temporal blend below turns that sequence
- * into a continuous depth integral — this is what dissolves the layered "slabs" a fixed slice centre
- * produces at any affordable slice count.
+ * R3 low-discrepancy offset of this frame's whole grid inside one cell, in all three axes.
+ *
+ * <p>Successive frames evaluate a different point within every froxel, and the temporal blend turns that
+ * sequence into an integral over the cell. On the z axis that is what dissolves the layered "slabs" a
+ * fixed slice centre produces at any affordable slice count; on x and y it is what keeps a shadow edge
+ * from stepping along the grid's screen tiles, since the edge lands at a different sub-tile position each
+ * frame instead of snapping to the same one.
+ *
+ * <p>The offset is uniform across the grid rather than per cell: a shared shift accumulates into a
+ * finer-sampled lattice, while a per-cell shift would only add spatial noise for the blend to remove.
  */
-public float froxelSliceJitter(uint frameIndex) {
-    return frac(float(frameIndex) * 0.6180339887498949);
+public float3 froxelGridJitter(uint frameIndex) {
+    // Successive reciprocal powers of the plastic constant, the 3D generalisation of the golden ratio.
+    const float3 R3 = float3(0.8191725133961645, 0.6710436067037893, 0.5497004779019701);
+    return frac(float(frameIndex) * R3);
 }
 
 float froxelValueHash(float3 cell) {
@@ -216,6 +233,13 @@ public float3 froxelSampleLightCone(float3 lightDir, float halfAngle, float2 u) 
     float3 bitangent = cross(lightDir, tangent);
     return normalize(lightDir * cosTheta
             + tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)));
+}
+
+/** Cosine-weighted direction about +Y, which is the distribution a flat sky illuminates a point with. */
+public float3 froxelSampleSkyDirection(float2 u) {
+    float radius = sqrt(saturate(u.x));
+    float phi = 2.0 * SKY_PI * u.y;
+    return normalize(float3(radius * cos(phi), sqrt(max(1.0 - u.x, 1.0e-4)), radius * sin(phi)));
 }
 
 /**

@@ -33,10 +33,10 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     WorldPush world = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
     bool underwater = (world.flags & 1u) != 0u;
 
-    float2 uv = (float2(dispatchId.xy) + 0.5) / float2(gridWidth, gridHeight);
-    float sliceJitter = froxelSliceJitter(pc.frameIndex);
+    float3 gridJitter = froxelGridJitter(pc.frameIndex);
+    float2 uv = (float2(dispatchId.xy) + gridJitter.xy) / float2(gridWidth, gridHeight);
     float cellNoise = froxelHash(dispatchId, pc.frameIndex);
-    float sliceCoord = (float(dispatchId.z) + sliceJitter) / float(gridDepth);
+    float sliceCoord = (float(dispatchId.z) + gridJitter.z) / float(gridDepth);
     float sampleDistance = froxelSliceDistance(pc.nearDistance, pc.maxDistance, sliceCoord);
     float3 viewDir = froxelViewDirection(world, uv);
     float3 posCamRel = viewDir * sampleDistance;
@@ -61,24 +61,52 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
             froxelUnderwaterLight(world, posCamRel, lightDir, illuminance);
             anisotropy = FROXEL_WATER_ANISOTROPY;
         }
+        bool traced = (pc.flags & VOLUMETRIC_FLAG_TRACE_OCCLUSION) != 0u;
+        float3 originRebased = posCamRel + world.camOffset;
+
+        float3 direct = float3(0.0);
         if (dot(illuminance, BT709_LUMA) > 1.0e-5) {
             float shadow;
-            if ((pc.flags & VOLUMETRIC_FLAG_TRACE_OCCLUSION) != 0u) {
+            if (traced) {
                 // One ray per froxel per frame, jittered across the light's disc. The grid's own temporal
                 // filter integrates those samples, so the penumbra widens with occluder distance the way
                 // a real one does instead of costing a ray per sample.
                 float2 discSample = float2(cellNoise, froxelHash(dispatchId, pc.frameIndex + 0x9E3779B9u));
                 float3 traceDir = froxelSampleLightCone(lightDir, light.halfAngle, discSample);
-                shadow = froxelTracedVisibility(worldTlas, posCamRel + world.camOffset,
-                        traceDir, FROXEL_RAY_REACH);
+                shadow = froxelTracedVisibility(worldTlas, originRebased, traceDir, FROXEL_RAY_REACH);
             } else {
                 shadow = froxelShadow(world, pc, depthImage, posCamRel, lightDir, cellNoise);
             }
-            float phase = froxelPhase(dot(lightDir, viewDir), anisotropy);
-            // Ambient stands in for sky and multiple scattering, which have no directional shadow: it is
-            // the small unshadowed term that keeps deep shadow from reading as vacuum.
-            scattered = density * illuminance * (phase * shadow + pc.ambient * ISOTROPIC_PHASE);
+            direct = illuminance * (froxelPhase(dot(lightDir, viewDir), anisotropy) * shadow);
         }
+
+        // Ambient: the sky's own radiance, which is what a point sees when it looks away from the body.
+        // It uses the UNREFRACTED illuminance and only the water's tint, because the surface pattern that
+        // bands a submerged shaft belongs to the direct path, not to skylight. The night floor is the
+        // luminance the sky keeps with no moon at all (airglow plus unresolved stars); without it, fog
+        // extinction would dim distant terrain after dark with nothing scattering back, which is not what
+        // haze does.
+        float3 ambientTint = underwater ? clamp(world.waterParams.xyz, 0.0, 1.0) : float3(1.0);
+        float3 ambientRadiance = max(light.illuminance * ambientTint * (pc.ambient * ISOTROPIC_PHASE),
+                float3(frameSky.airglowLuminance * FROXEL_SKY_HEMISPHERE));
+
+        // Gate it on whether this point can see the sky at all. Left unoccluded, it put a full day's worth
+        // of veiling in-scatter inside caves and buildings — invisible at night only because the moon
+        // delivers a rounding error of the sun's illuminance, which is exactly why it read as a
+        // daytime-only fog. A cosine-weighted probe of the hemisphere above, accumulated by the same
+        // temporal filter, turns it into a soft sky-occlusion factor: open outdoors, nothing under rock,
+        // partial under a canopy or an overhang.
+        float skyAccess = 1.0;
+        if (dot(ambientRadiance, BT709_LUMA) > FROXEL_AMBIENT_PROBE_FLOOR) {
+            float2 skySample = float2(froxelHash(dispatchId, pc.frameIndex + 0x51ED270Bu),
+                                      froxelHash(dispatchId, pc.frameIndex + 0x2545F491u));
+            float3 skyDir = froxelSampleSkyDirection(skySample);
+            skyAccess = traced
+                    ? froxelTracedVisibility(worldTlas, originRebased, skyDir, FROXEL_SKY_REACH)
+                    : froxelShadow(world, pc, depthImage, posCamRel, skyDir, cellNoise);
+        }
+
+        scattered = density * (direct + ambientRadiance * skyAccess);
     }
 
     // Stored pre-exposed, matching the scene image's domain and keeping fp16 values near unity.
