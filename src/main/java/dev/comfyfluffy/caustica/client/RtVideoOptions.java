@@ -58,6 +58,10 @@ public final class RtVideoOptions {
             volumetricLightIntensity(),
             volumetricLightDensity(),
             volumetricLightQuality(),
+            parallax(),
+            parallaxDepth(),
+            parallaxQuality(),
+            parallaxDistance(),
             dlssQuality()
         ));
         if (CausticaConfig.Rt.Hdr.swapchainPqAvailable()) {
@@ -187,6 +191,51 @@ public final class RtVideoOptions {
             new OptionInstance.IntRange(0, steps.size() - 1),
             initialPosition,
             position -> setting.set(steps.get(position)));
+    }
+
+    private static OptionInstance<Boolean> parallax() {
+        return bool("caustica.options.rt.parallax", CausticaConfig.Rt.Parallax.ENABLED);
+    }
+
+    /** Depth in hundredths of a block, which is a unit a player can reason about: a block is 100. */
+    private static OptionInstance<Integer> parallaxDepth() {
+        FloatSetting setting = CausticaConfig.Rt.Parallax.DEPTH;
+        return new OptionInstance<>(
+            "caustica.options.rt.parallaxDepth",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.parallaxDepth.tooltip")),
+            (caption, hundredths) -> Options.genericValueLabel(caption,
+                    Component.literal(String.format(Locale.ROOT, "%.2f", hundredths / 100.0f))),
+            new OptionInstance.IntRange(0, 25),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 25),
+            hundredths -> setting.set(hundredths / 100.0f));
+    }
+
+    private static OptionInstance<Integer> parallaxQuality() {
+        IntSetting setting = CausticaConfig.Rt.Parallax.STEPS;
+        List<Integer> steps = CausticaConfig.Rt.Parallax.STEP_CHOICES;
+        int initialSteps = steps.contains(setting.value()) ? setting.value() : 32;
+        return new OptionInstance<>(
+            "caustica.options.rt.parallaxQuality",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.parallaxQuality.tooltip")),
+            (caption, position) -> Options.genericValueLabel(caption,
+                    Component.translatable("caustica.options.rt.parallaxQuality." + steps.get(position))),
+            new OptionInstance.IntRange(0, steps.size() - 1),
+            steps.indexOf(initialSteps),
+            position -> setting.set(steps.get(position)));
+    }
+
+    private static OptionInstance<Integer> parallaxDistance() {
+        FloatSetting setting = CausticaConfig.Rt.Parallax.DISTANCE;
+        return new OptionInstance<>(
+            "caustica.options.rt.parallaxDistance",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.parallaxDistance.tooltip")),
+            (caption, blocks) -> Options.genericValueLabel(caption, Component.literal(blocks + " blocks")),
+            new OptionInstance.IntRange(4, 128),
+            Math.clamp(Math.round(setting.value()), 4, 128),
+            blocks -> setting.set((float) blocks));
     }
 
     private static OptionInstance<Integer> dlssQuality() {

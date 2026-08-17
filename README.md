@@ -24,7 +24,7 @@ changes while the renderer is being built.
 - HDR output
 - Froxel volumetric lighting: light shafts, height fog, and underwater rays, ray-traced against world geometry so both the light and its occluders may be off-screen
 - Dynamic entity rendering in the ray-traced scene
-- LabPBR-style material support
+- LabPBR-style material support, including parallax occlusion mapping of a pack's height channel
 - OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations
 
 ## Requirements

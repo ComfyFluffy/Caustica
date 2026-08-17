@@ -37,6 +37,21 @@ final class CausticaConfigTest {
     }
 
     @Test
+    void parallaxStepsUseSupportedChoices() {
+        CausticaConfig.IntSetting setting = CausticaConfig.Rt.Parallax.STEPS;
+        int previous = setting.value();
+        try {
+            setting.set(64);
+            assertEquals(64, setting.value());
+
+            setting.set(50);
+            assertEquals(32, setting.value());
+        } finally {
+            setting.set(previous);
+        }
+    }
+
+    @Test
     void volumetricQualityStepsScaleTheFroxelGridTogether() {
         CausticaConfig.IntSetting setting = CausticaConfig.Rt.VolumetricLight.QUALITY;
         int previous = setting.value();

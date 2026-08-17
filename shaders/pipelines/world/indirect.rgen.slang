@@ -83,10 +83,10 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         // roulette, and paths guaranteed to end at the bounce cap in separate coherence groups.
         uint pathPhaseHint = bounce >= maxBounces ? 2u : (bounce >= rrStart ? 1u : 0u);
         traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
-                               showCelestial, rayConeWidth, rayConeSpread, pathPhaseHint);
+                               showCelestial, rayConeWidth, rayConeSpread, pathPhaseHint, bounce == 0);
 #else
         traceRadiance(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
-                      showCelestial, rayConeWidth, rayConeSpread);
+                      showCelestial, rayConeWidth, rayConeSpread, bounce == 0);
 #endif
 
         if (payload.hitT < 0.0) {

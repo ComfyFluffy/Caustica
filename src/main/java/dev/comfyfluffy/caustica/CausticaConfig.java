@@ -59,7 +59,7 @@ public final class CausticaConfig {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.VolumetricLight.ENABLED, Rt.FrameStats.ENABLED,
-            Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
+            Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Rt.Parallax.ENABLED, Ngx.PATH,
         };
     }
 
@@ -101,6 +101,10 @@ public final class CausticaConfig {
                 " Froxel volumetric light scattering (crepuscular rays, fog, and underwater shafts).\n"
                         + " strength scales ray brightness; fog-density sets how much air scatters;\n"
                         + " quality (0-4) trades performance for the resolution of the volumetric grid.");
+        FILE.setComment("parallax",
+                " Parallax occlusion mapping from a resource pack's LabPBR height channel.\n"
+                        + " depth is how far the surface pushes in, in blocks; steps trades performance for\n"
+                        + " accuracy at grazing angles; distance is where it fades back to a flat surface.");
         FILE.setComment("exposure",
                 " Controls automatic exposure. manual-ev sets exposure in manual mode and adjusts it in auto mode.\n"
                         + " adapt-darken and adapt-brighten control adjustment speed in seconds.\n"
@@ -905,6 +909,36 @@ public final class CausticaConfig {
             }
 
             private VolumetricLight() {
+            }
+        }
+
+        /**
+         * Parallax occlusion mapping of a resource pack's LabPBR height channel (the {@code _n} texture's
+         * alpha), marched in the closest-hit material path.
+         *
+         * <p>Applied to the camera's own hit only. Shadow and bounce rays keep the flat surface, which
+         * costs some self-shadowing accuracy and buys stability: the geometry, the depth guide, and the
+         * motion vectors all keep describing one undisplaced surface, so reconstruction has nothing to
+         * disagree with.
+         */
+        public static final class Parallax {
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.parallax", "parallax.enabled", true);
+            /** How far the surface pushes in, in blocks. A block face is one texture tile across. */
+            public static final FloatSetting DEPTH =
+                    clampedFloat("caustica.rt.parallax.depth", "parallax.depth", 0.06f, 0.0f, 0.25f);
+            /** Distance in blocks at which the effect has faded back to a flat surface. */
+            public static final FloatSetting DISTANCE =
+                    clampedFloat("caustica.rt.parallax.distance", "parallax.distance", 24.0f, 4.0f, 128.0f);
+            public static final List<Integer> STEP_CHOICES = List.of(8, 16, 32, 64, 128);
+            /**
+             * Ceiling on march steps. The shader spends the full count only at grazing angles, where the
+             * search sweeps across many texels; head-on there is almost nothing to march.
+             */
+            public static final IntSetting STEPS =
+                    intChoice("caustica.rt.parallax.steps", "parallax.steps", 32, STEP_CHOICES);
+
+            private Parallax() {
             }
         }
 

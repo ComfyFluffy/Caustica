@@ -1328,12 +1328,18 @@ public final class RtComposite {
             // WorldPush at all, and the RIS light buffers are read from world.rgen's hot inner loop, so
             // none of them should cost an extra BDA dereference to find.
             ByteBuffer pushConstants = stack.malloc(WorldPushConstantsData.BYTE_SIZE);
+            // Depth of zero is what the hit shader reads as "do not march", so the toggle needs no bit of
+            // its own: a disabled effect and a zero-depth one are the same surface.
+            boolean parallax = CausticaConfig.Rt.Parallax.ENABLED.value();
             new WorldPushConstantsData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
                     RtMaterialRegistry.INSTANCE.tableAddress(),
                     terrain.lightBufferAddress(), terrain.lightAliasBufferAddress(),
                     terrain.lightLocalAliasBufferAddress(), terrain.lightGridCellBufferAddress(),
                     terrain.lightGridSpanBufferAddress(), continuationQueue.deviceAddress,
-                    (int) frameCounter).write(pushConstants);
+                    (int) frameCounter,
+                    parallax ? CausticaConfig.Rt.Parallax.DEPTH.value() : 0f,
+                    CausticaConfig.Rt.Parallax.DISTANCE.value(),
+                    CausticaConfig.Rt.Parallax.STEPS.value()).write(pushConstants);
             // Sky LUTs, from the same WorldPush slot the trace is about to read: the sky the LUT holds and
             // the sky the frame shades are built from one set of angles, not two. Recorded here (after the
             // push flush, before the trace) so the miss shader's very first fetch sees this frame's dome.
