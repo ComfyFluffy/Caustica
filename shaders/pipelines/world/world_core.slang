@@ -61,8 +61,6 @@ public static CelestialLight celestialLight = {};
 public static const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 public static const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
 
-// Water is a smooth dielectric. IOR 1.333; absorption is per-block Beer-Lambert extinction.
-public static const float WATER_IOR = 1.333;
 public static const float3 SKY_SPEC_ALBEDO = float3(0.5, 0.5, 0.5); // RR guide default for sky pixels.
 public static const float3 SKY_DIFF_ALBEDO = float3(0.5, 0.5, 0.5);
 

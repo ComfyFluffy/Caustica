@@ -28,6 +28,11 @@ import net.minecraft.network.chat.Component;
  * {@code quality} changes (see {@code RtDlssRr.ensureFeature}), so it is safe to expose here.
  */
 public final class RtVideoOptions {
+    // The fog-density slider is shown as a percentage of the config default, which keeps a 1/block
+    // scattering coefficient out of a settings screen while still spanning nothing to twice the default.
+    private static final float FOG_DENSITY_REFERENCE = 0.0035f;
+    private static final int FOG_DENSITY_MAX_PERCENT = 200;
+
     private RtVideoOptions() {
     }
 
@@ -51,7 +56,13 @@ public final class RtVideoOptions {
             waterWaves(),
             volumetricLight(),
             volumetricLightIntensity(),
+            volumetricLightDensity(),
             volumetricLightQuality(),
+            parallax(),
+            parallaxDepth(),
+            parallaxQuality(),
+            parallaxDistance(),
+            parallaxSmoothing(),
             dlssQuality()
         ));
         if (CausticaConfig.Rt.Hdr.swapchainPqAvailable()) {
@@ -143,22 +154,35 @@ public final class RtVideoOptions {
     }
 
     private static OptionInstance<Integer> volumetricLightIntensity() {
-        FloatSetting setting = CausticaConfig.Rt.VolumetricLight.INTENSITY;
+        FloatSetting setting = CausticaConfig.Rt.VolumetricLight.STRENGTH;
         return new OptionInstance<>(
             "caustica.options.rt.volumetricLightIntensity",
             OptionInstance.cachedConstantTooltip(Component.translatable(
                     "caustica.options.rt.volumetricLightIntensity.tooltip")),
             (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
-            new OptionInstance.IntRange(0, 200),
-            Math.clamp(Math.round(setting.value() * 100.0f), 0, 200),
+            new OptionInstance.IntRange(0, 300),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 300),
             percent -> setting.set(percent / 100.0f));
     }
 
+    /** How much air scatters, in percent of the default sea-level coefficient. */
+    private static OptionInstance<Integer> volumetricLightDensity() {
+        FloatSetting setting = CausticaConfig.Rt.VolumetricLight.DENSITY;
+        return new OptionInstance<>(
+            "caustica.options.rt.volumetricLightDensity",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.volumetricLightDensity.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, FOG_DENSITY_MAX_PERCENT),
+            Math.clamp(Math.round(setting.value() / FOG_DENSITY_REFERENCE * 100.0f), 0, FOG_DENSITY_MAX_PERCENT),
+            percent -> setting.set(percent * FOG_DENSITY_REFERENCE / 100.0f));
+    }
+
     private static OptionInstance<Integer> volumetricLightQuality() {
-        IntSetting setting = CausticaConfig.Rt.VolumetricLight.SAMPLES;
-        List<Integer> steps = CausticaConfig.Rt.VolumetricLight.SAMPLE_STEPS;
-        int initialSamples = steps.contains(setting.value()) ? setting.value() : 32;
-        int initialPosition = steps.indexOf(initialSamples);
+        IntSetting setting = CausticaConfig.Rt.VolumetricLight.QUALITY;
+        List<Integer> steps = CausticaConfig.Rt.VolumetricLight.QUALITY_STEPS;
+        int initialQuality = steps.contains(setting.value()) ? setting.value() : steps.get(1);
+        int initialPosition = steps.indexOf(initialQuality);
         return new OptionInstance<>(
             "caustica.options.rt.volumetricLightQuality",
             OptionInstance.cachedConstantTooltip(Component.translatable(
@@ -168,6 +192,63 @@ public final class RtVideoOptions {
             new OptionInstance.IntRange(0, steps.size() - 1),
             initialPosition,
             position -> setting.set(steps.get(position)));
+    }
+
+    private static OptionInstance<Boolean> parallax() {
+        return bool("caustica.options.rt.parallax", CausticaConfig.Rt.Parallax.ENABLED);
+    }
+
+    /** Depth in hundredths of a block, which is a unit a player can reason about: a block is 100. */
+    private static OptionInstance<Integer> parallaxDepth() {
+        FloatSetting setting = CausticaConfig.Rt.Parallax.DEPTH;
+        return new OptionInstance<>(
+            "caustica.options.rt.parallaxDepth",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.parallaxDepth.tooltip")),
+            (caption, hundredths) -> Options.genericValueLabel(caption,
+                    Component.literal(String.format(Locale.ROOT, "%.2f", hundredths / 100.0f))),
+            new OptionInstance.IntRange(0, 25),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 25),
+            hundredths -> setting.set(hundredths / 100.0f));
+    }
+
+    private static OptionInstance<Integer> parallaxQuality() {
+        IntSetting setting = CausticaConfig.Rt.Parallax.STEPS;
+        List<Integer> steps = CausticaConfig.Rt.Parallax.STEP_CHOICES;
+        int initialSteps = steps.contains(setting.value()) ? setting.value() : 32;
+        return new OptionInstance<>(
+            "caustica.options.rt.parallaxQuality",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.parallaxQuality.tooltip")),
+            (caption, position) -> Options.genericValueLabel(caption,
+                    Component.translatable("caustica.options.rt.parallaxQuality." + steps.get(position))),
+            new OptionInstance.IntRange(0, steps.size() - 1),
+            steps.indexOf(initialSteps),
+            position -> setting.set(steps.get(position)));
+    }
+
+    private static OptionInstance<Integer> parallaxDistance() {
+        FloatSetting setting = CausticaConfig.Rt.Parallax.DISTANCE;
+        return new OptionInstance<>(
+            "caustica.options.rt.parallaxDistance",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.parallaxDistance.tooltip")),
+            (caption, blocks) -> Options.genericValueLabel(caption, Component.literal(blocks + " blocks")),
+            new OptionInstance.IntRange(4, 128),
+            Math.clamp(Math.round(setting.value()), 4, 128),
+            blocks -> setting.set((float) blocks));
+    }
+
+    private static OptionInstance<Integer> parallaxSmoothing() {
+        FloatSetting setting = CausticaConfig.Rt.Parallax.SMOOTHING;
+        return new OptionInstance<>(
+            "caustica.options.rt.parallaxSmoothing",
+            OptionInstance.cachedConstantTooltip(Component.translatable(
+                    "caustica.options.rt.parallaxSmoothing.tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(0, 100),
+            Math.clamp(Math.round(setting.value() * 100.0f), 0, 100),
+            percent -> setting.set(percent / 100.0f));
     }
 
     private static OptionInstance<Integer> dlssQuality() {

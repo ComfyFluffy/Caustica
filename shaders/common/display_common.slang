@@ -86,14 +86,28 @@ public struct BloomPush {
     public float radius;        // upsample tent radius in SOURCE texels; resolution-independent
 };
 
-// Radial additive-sampling state for the post-RR crepuscular-ray pass. The world-push address lets the
-// shader derive and project the exact dominant celestial direction used by the path tracer and sky LUT.
+// Froxel (view-frustum voxel grid) volumetric lighting. One block drives all three passes — injection,
+// front-to-back integration, and the full-resolution composite — so the slice distribution and medium
+// model cannot disagree between them. The world-push address lets the shader derive the exact dominant
+// celestial direction, illuminance, and pre-exposure the path tracer and sky LUT already agreed on.
 public struct VolumetricLightPush {
     public uint64_t worldPushAddr;
-    public uint sampleCount;
-    public float intensity;
-    public float density;
-    public float decay;
+    public uint  skyProbes;         // fixed directions tested for sky access per froxel
+    public uint  frameIndex;        // drives the slice jitter and the light's disc sample
+    public float intensity;         // artistic multiplier on in-scattered radiance only (never on transmittance)
+    public float density;           // scattering coefficient at the fog base height, 1/block
+    public float anisotropy;        // Henyey-Greenstein g of the aerosol phase function
+    public float nearDistance;      // distance of the first slice boundary, blocks
+    public float maxDistance;       // distance of the last slice boundary, blocks
+    public float heightFalloff;     // e-folding height of the density model, blocks
+    public float cameraAltitude;    // camera height above the density model's base (sea level), blocks
+    public float ambient;           // unshadowed fraction of the celestial illuminance (sky/multiscatter stand-in)
+    public float temporalBlend;     // weight of this frame's froxel sample against the reprojected history
+    public float underwaterDensity; // scattering coefficient used while the camera eye is submerged, 1/block
+    // Ratio of this frame's pre-exposure to the previous frame's. The froxel textures store pre-exposed
+    // radiance (fp16 headroom), so the reprojected history has to be rescaled when auto-exposure moves or
+    // the fog would lag the scene by the temporal blend's time constant.
+    public float historyScale;
 };
 
 public struct DebugPresentPush {

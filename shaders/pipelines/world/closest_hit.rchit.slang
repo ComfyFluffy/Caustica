@@ -101,6 +101,157 @@ float3 perturbNormal(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float
     return nm;
 }
 
+// ---- Parallax occlusion mapping -------------------------------------------------------------------
+//
+// LabPBR keeps a height field in the _n texture's alpha, where 1 is the original surface and 0 the
+// deepest point, and the material compiler already carries it through the semantic mip chain. Marching
+// it displaces which texel the camera sees, which is what turns a flat quad into apparent depth.
+//
+// This runs on the camera's own hit only. Applying it to shadow and bounce rays as well would be more
+// correct, but every one of those rays would have to agree on the same displaced point to avoid
+// shimmering against each other, and the cost lands on the rays a path tracer spends most of its budget
+// on. Primary-only keeps the geometry, the depth guide, and the motion vectors describing the same
+// undisplaced surface, so reconstruction stays stable.
+static const float PARALLAX_MIN_NDOTV = 0.1;   // below this the offset diverges faster than taps can track
+static const float PARALLAX_FADE_FRACTION = 0.25; // last quarter of the range fades back to flat
+
+/**
+ * Height at a page UV, optionally filtered.
+ *
+ * <p>Material pages are point-sampled, which is what keeps Minecraft's texels crisp everywhere else, but
+ * it also means the height field the march walks is a grid of flat plateaus. At 16x those plateaus ARE
+ * the art; at 128x and above they are terracing across relief the pack meant to be continuous. The
+ * filtered path interpolates the four surrounding texels with an eased fraction, so the surface curves
+ * between them instead of stepping, and blends toward it by {@code smoothing} — zero skips the extra
+ * taps entirely, which is why the option costs nothing when it is off.
+ */
+float parallaxHeight(uint page, float2 pageUv, float lod, float2 pageTexels, float smoothing) {
+    if (smoothing <= 0.0) {
+        return samplePageNormalAo(page, pageUv, lod).a;
+    }
+    float2 texel = pageUv * pageTexels - 0.5;
+    float2 base = floor(texel);
+    float2 fraction = texel - base;
+    float2 originUv = (base + 0.5) / pageTexels;
+    float2 stepUv = 1.0 / pageTexels;
+    float h00 = samplePageNormalAo(page, originUv, lod).a;
+    float h10 = samplePageNormalAo(page, originUv + float2(stepUv.x, 0.0), lod).a;
+    float h01 = samplePageNormalAo(page, originUv + float2(0.0, stepUv.y), lod).a;
+    float h11 = samplePageNormalAo(page, originUv + stepUv, lod).a;
+
+    // Smoothstep the fraction rather than interpolating it linearly: a linear blend meets each texel
+    // centre with a corner, which trades the staircase for a faceted surface instead of a rounded one.
+    float2 eased = fraction * fraction * (3.0 - 2.0 * fraction);
+    float filtered = lerp(lerp(h00, h10, eased.x), lerp(h01, h11, eased.x), eased.y);
+
+    // The unfiltered end of the blend is the nearest of the four taps, so partial strengths interpolate
+    // between exactly the crisp result and the smooth one without a fifth fetch.
+    float2 nearest = step(0.5, fraction);
+    float crisp = lerp(lerp(h00, h10, nearest.x), lerp(h01, h11, nearest.x), nearest.y);
+    return lerp(crisp, filtered, saturate(smoothing));
+}
+
+/**
+ * Displaced atlas UV for a hit, or the original when the march cannot help.
+ *
+ * <p>The march happens in the sprite's own [0,1] space, where one unit is one block face, so the depth
+ * push is expressible in blocks. Tangents come from the same triangle data the normal map's frame is
+ * built from, but scaled into that local space, so the offset is in the units the height field is
+ * authored in rather than in atlas units, which differ per sprite.
+ */
+float2 parallaxAtlasUv(MaterialHeader header, float2 atlasUv, float lod, float3 n,
+        float3 p0, float3 p1, float3 p2, float2 t0, float2 t1, float2 t2,
+        float3 vdir, float hitDistance) {
+    float depth = pc.parallaxDepth;
+    if (depth <= 0.0 || hitDistance >= pc.parallaxDistance) {
+        return atlasUv;
+    }
+    // Fade the push out with distance instead of cutting it: a texel that suddenly flattens is far more
+    // noticeable than a shallow one, and the march is worth least where a texel is smaller than a pixel.
+    float fadeStart = pc.parallaxDistance * (1.0 - PARALLAX_FADE_FRACTION);
+    depth *= 1.0 - smoothstep(fadeStart, pc.parallaxDistance, hitDistance);
+    if (depth <= 0.0) {
+        return atlasUv;
+    }
+
+    float2 invExtent = header.albedoUv.zw;
+    float2 g1 = (t1 - t0) * invExtent;
+    float2 g2 = (t2 - t0) * invExtent;
+    float det = g1.x * g2.y - g1.y * g2.x;
+    if (abs(det) <= 1.0e-12) {
+        return atlasUv;
+    }
+    float r = 1.0 / det;
+    float3 dPdu = ((p1 - p0) * g2.y - (p2 - p0) * g1.y) * r;   // blocks per unit of local u
+    float3 dPdv = ((p2 - p0) * g1.x - (p1 - p0) * g2.x) * r;
+    float scaleU = length(dPdu);
+    float scaleV = length(dPdv);
+    if (scaleU <= 1.0e-6 || scaleV <= 1.0e-6) {
+        return atlasUv;
+    }
+    // Fade out rather than cut off at grazing angles: the offset grows as 1/cos and the march would
+    // need unbounded taps to track it, but a hard threshold puts a visible seam across every surface at
+    // the angle it trips.
+    float viewN = dot(vdir, n);
+    float grazing = smoothstep(PARALLAX_MIN_NDOTV, PARALLAX_MIN_NDOTV * 2.5, viewN);
+    if (grazing <= 0.0) {
+        return atlasUv;
+    }
+    depth *= grazing;
+    float viewU = dot(vdir, dPdu / scaleU);
+    float viewV = dot(vdir, dPdv / scaleV);
+
+    // Local UV the ray would reach at full depth: the view ray's tangential travel over the depth it
+    // takes to descend that far, converted from blocks into local units by the tangent scales.
+    float2 fullOffset = -float2(viewU / scaleU, viewV / scaleV) * (depth / viewN);
+    float2 localUv = clamp((atlasUv - header.albedoUv.xy) * invExtent, float2(0.0), float2(1.0));
+
+    float maxMaterialLod = float((header.features >> MATERIAL_MAX_LOD_SHIFT) & MATERIAL_MAX_LOD_MASK);
+    float materialLod = min(lod, maxMaterialLod);
+    uint page = header.texturePage;
+    float2 pageOrigin = header.materialUv.xy;
+    float2 pageExtent = header.materialUv.zw;
+    // Texel grid of the mip the march samples, which is what the smoothing filter steps across.
+    float smoothing = pc.parallaxSmoothing;
+    float2 pageTexels = smoothing > 0.0
+            ? max(texSizePx(materialNormalAoTex[NonUniformResourceIndex(page)]) / exp2(materialLod),
+                  float2(1.0))
+            : float2(1.0);
+
+    // Steps scale with how oblique the view is, because that is what stretches the search: head-on there
+    // is almost nothing to march, at a grazing angle the same depth sweeps across many texels.
+    uint maxSteps = clamp(pc.parallaxSteps, 4u, 128u);
+    uint steps = uint(max(4.0, lerp(4.0, float(maxSteps), saturate(1.0 - viewN))));
+    float layer = 1.0 / float(steps);
+    float2 deltaUv = fullOffset * layer;
+
+    float rayDepth = 0.0;
+    float2 currentUv = localUv;
+    float surfaceDepth = 1.0
+            - parallaxHeight(page, pageOrigin + currentUv * pageExtent, materialLod, pageTexels, smoothing);
+    if (surfaceDepth <= 0.0) {
+        return atlasUv; // authored flat here (or a pack with no height at all): nothing to march
+    }
+    for (uint i = 0u; i < steps && rayDepth < surfaceDepth; ++i) {
+        currentUv = clamp(currentUv + deltaUv, float2(0.0), float2(1.0));
+        rayDepth += layer;
+        surfaceDepth = 1.0
+                - parallaxHeight(page, pageOrigin + currentUv * pageExtent, materialLod, pageTexels, smoothing);
+    }
+
+    // One secant step between the last pair brackets the crossing without another texture fetch, which
+    // is what keeps a coarse march from quantising the displacement into visible stair steps.
+    float2 previousUv = clamp(currentUv - deltaUv, float2(0.0), float2(1.0));
+    float previousSurfaceDepth = 1.0
+            - parallaxHeight(page, pageOrigin + previousUv * pageExtent, materialLod, pageTexels, smoothing);
+    float after = surfaceDepth - rayDepth;
+    float before = previousSurfaceDepth - (rayDepth - layer);
+    float weight = saturate(after / max(after - before, 1.0e-6));
+    float2 hitUv = lerp(currentUv, previousUv, weight);
+
+    return header.albedoUv.xy + hitUv / invExtent;
+}
+
 struct Surface {
     float3 normal;
     float3 f0;
@@ -366,6 +517,19 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     float3 vdir = -WorldRayDirection(); // toward the viewer
     if (dot(n, vdir) < 0.0) {
         n = -n;
+    }
+
+    // Parallax displaces which texel the camera sees, so it has to happen before ANY channel is read:
+    // albedo, the normal map, and the LabPBR surface channels all have to describe the same displaced
+    // point or the surface lights as one texel and looks like another. Only the camera's own hit carries
+    // PAYLOAD_PARALLAX, and only opaque terrain has a height field worth marching — water carries a
+    // biome tint rather than a texture, and a displaced glass pane would disagree with the refraction
+    // the interface already computed from flat geometry.
+    if ((payload.flags & PAYLOAD_PARALLAX) != 0u
+            && (materialHeader.features & MATERIAL_FEATURE_NORMAL) != 0u
+            && materialHeader.model == MATERIAL_OPAQUE) {
+        uv = parallaxAtlasUv(materialHeader, uv, blockLod, n, tp0, tp1, tp2, uv0, uv1, uv2,
+                vdir, RayTCurrent());
     }
 
     // Stained glass / ice: a thin colored filter resolved in raygen

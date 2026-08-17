@@ -2,7 +2,9 @@ package dev.comfyfluffy.caustica.rt.pipeline;
 
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
+import dev.comfyfluffy.caustica.rt.overlay.RtOverlayPipelines;
 import dev.comfyfluffy.caustica.rt.gen.VolumetricLightPushData;
 import java.io.IOException;
 import java.io.InputStream;
@@ -31,23 +33,38 @@ import static dev.comfyfluffy.caustica.rt.RtContext.check;
 import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.*;
 
 /**
- * Post-RR volumetric light scattering. A half-resolution radial additive-sampling pass derives the exact
- * dominant celestial source from the frame's {@code WorldPush}, masks source radiance with the current
- * primary depth guide, then a full-resolution pass adds the resulting crepuscular rays back to the
- * reconstructed scene. The output remains pre-exposed scene-linear ACEScg for the ordinary exposure,
- * bloom, debug, EXR, and SDR/HDR display chain.
+ * Post-RR froxel volumetric lighting: three compute passes over a voxelised view frustum.
+ *
+ * <p>Injection evaluates the medium and the celestial light's screen-space shadow once per froxel and
+ * accumulates the result into the previous frame's grid; integration turns each depth column into
+ * prefix-accumulated in-scattering and transmittance; the composite applies the volume to the
+ * reconstructed scene at display resolution. Output stays pre-exposed scene-linear ACEScg for the
+ * ordinary exposure, bloom, debug, EXR, and SDR/HDR display chain.
+ *
+ * <p>The two scattering volumes are ping-ponged: the frame's parity picks which one is written and which
+ * is sampled as history. Both orientations get their own descriptor set, allocated once, so a frame never
+ * rewrites a descriptor set an in-flight frame may still be reading.
+ *
+ * <p>Injection resolves occlusion by tracing the world TLAS, which is rebuilt every frame. Its handle
+ * therefore lives in a second, single-binding descriptor set taken from the shared ring the overlay
+ * occlusion pass uses, whose slots are recycled only after the graphics timeline says the frame that used
+ * them completed.
  */
 public final class RtVolumetricLightPipeline {
     private static final String SHADER_DIR = "/caustica/shaders/pipelines/volumetric_light/";
 
     private final RtContext ctx;
-    private final long scatterDescriptorSetLayout;
-    private final long scatterDescriptorPool;
-    private final long scatterDescriptorSet;
-    private final long scatterPipelineLayout;
-    private final long scatterPipeline;
+    private final long descriptorPool;
+    private final long injectDescriptorSetLayout;
+    private final long[] injectDescriptorSets;
+    private final long injectPipelineLayout;
+    private final long injectPipeline;
+    private final RtOverlayPipelines.AccelStructureSet injectAccelSet;
+    private final long integrateDescriptorSetLayout;
+    private final long[] integrateDescriptorSets;
+    private final long integratePipelineLayout;
+    private final long integratePipeline;
     private final long compositeDescriptorSetLayout;
-    private final long compositeDescriptorPool;
     private final long compositeDescriptorSet;
     private final long compositePipelineLayout;
     private final long compositePipeline;
@@ -55,28 +72,36 @@ public final class RtVolumetricLightPipeline {
     private final long nearestSampler;
 
     private long boundOutputView;
-    private long boundScatterView;
     private long boundSourceView;
     private long boundDepthView;
     private long boundTransmittanceView;
     private long boundTransmittanceSampler;
+    private long boundScatterViewA;
+    private long boundScatterViewB;
+    private long boundIntegratedView;
     private boolean destroyed;
 
-    private RtVolumetricLightPipeline(RtContext ctx,
-                                      long scatterDescriptorSetLayout, long scatterDescriptorPool,
-                                      long scatterDescriptorSet, long scatterPipelineLayout,
-                                      long scatterPipeline,
-                                      long compositeDescriptorSetLayout, long compositeDescriptorPool,
-                                      long compositeDescriptorSet, long compositePipelineLayout,
-                                      long compositePipeline, long linearSampler, long nearestSampler) {
+    private RtVolumetricLightPipeline(RtContext ctx, long descriptorPool,
+                                      long injectDescriptorSetLayout, long[] injectDescriptorSets,
+                                      long injectPipelineLayout, long injectPipeline,
+                                      RtOverlayPipelines.AccelStructureSet injectAccelSet,
+                                      long integrateDescriptorSetLayout, long[] integrateDescriptorSets,
+                                      long integratePipelineLayout, long integratePipeline,
+                                      long compositeDescriptorSetLayout, long compositeDescriptorSet,
+                                      long compositePipelineLayout, long compositePipeline,
+                                      long linearSampler, long nearestSampler) {
         this.ctx = ctx;
-        this.scatterDescriptorSetLayout = scatterDescriptorSetLayout;
-        this.scatterDescriptorPool = scatterDescriptorPool;
-        this.scatterDescriptorSet = scatterDescriptorSet;
-        this.scatterPipelineLayout = scatterPipelineLayout;
-        this.scatterPipeline = scatterPipeline;
+        this.descriptorPool = descriptorPool;
+        this.injectDescriptorSetLayout = injectDescriptorSetLayout;
+        this.injectDescriptorSets = injectDescriptorSets;
+        this.injectPipelineLayout = injectPipelineLayout;
+        this.injectPipeline = injectPipeline;
+        this.injectAccelSet = injectAccelSet;
+        this.integrateDescriptorSetLayout = integrateDescriptorSetLayout;
+        this.integrateDescriptorSets = integrateDescriptorSets;
+        this.integratePipelineLayout = integratePipelineLayout;
+        this.integratePipeline = integratePipeline;
         this.compositeDescriptorSetLayout = compositeDescriptorSetLayout;
-        this.compositeDescriptorPool = compositeDescriptorPool;
         this.compositeDescriptorSet = compositeDescriptorSet;
         this.compositePipelineLayout = compositePipelineLayout;
         this.compositePipeline = compositePipeline;
@@ -89,189 +114,196 @@ public final class RtVolumetricLightPipeline {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             LongBuffer handle = stack.mallocLong(1);
 
-            VkDescriptorSetLayoutBinding.Buffer scatterBindings =
-                    VkDescriptorSetLayoutBinding.calloc(VOLUMETRIC_SCATTER_BINDING_COUNT, stack);
-            scatterBindings.get(VOLUMETRIC_SCATTER_OUTPUT).binding(VOLUMETRIC_SCATTER_OUTPUT)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
-                    .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
-            scatterBindings.get(VOLUMETRIC_SCATTER_SOURCE).binding(VOLUMETRIC_SCATTER_SOURCE)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
-                    .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
-            scatterBindings.get(VOLUMETRIC_SCATTER_DEPTH).binding(VOLUMETRIC_SCATTER_DEPTH)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
-                    .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
-            scatterBindings.get(VOLUMETRIC_SCATTER_TRANSMITTANCE).binding(VOLUMETRIC_SCATTER_TRANSMITTANCE)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
-                    .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
-            VkDescriptorSetLayoutCreateInfo scatterLayoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
-                    .sType$Default().pBindings(scatterBindings);
-            check(VK10.vkCreateDescriptorSetLayout(vk, scatterLayoutInfo, null, handle),
-                    "vkCreateDescriptorSetLayout(rt volumetric scatter)");
-            long scatterDsl = handle.get(0);
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, scatterDsl,
-                    "volumetric scatter descriptor set layout");
+            VkDescriptorSetLayoutBinding.Buffer injectBindings =
+                    VkDescriptorSetLayoutBinding.calloc(VOLUMETRIC_INJECT_BINDING_COUNT, stack);
+            storageImage(injectBindings, VOLUMETRIC_INJECT_OUTPUT);
+            sampledImage(injectBindings, VOLUMETRIC_INJECT_HISTORY);
+            sampledImage(injectBindings, VOLUMETRIC_INJECT_TRANSMITTANCE);
+            long injectDsl = createSetLayout(ctx, stack, injectBindings, "volumetric inject");
 
-            VkDescriptorPoolSize.Buffer scatterPoolSizes = VkDescriptorPoolSize.calloc(2, stack);
-            scatterPoolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1);
-            scatterPoolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(3);
-            VkDescriptorPoolCreateInfo scatterPoolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
-                    .sType$Default().maxSets(1).pPoolSizes(scatterPoolSizes);
-            check(VK10.vkCreateDescriptorPool(vk, scatterPoolInfo, null, handle),
-                    "vkCreateDescriptorPool(rt volumetric scatter)");
-            long scatterPool = handle.get(0);
-            long scatterSet = allocateSet(vk, stack, scatterPool, scatterDsl,
-                    "volumetric scatter descriptor set");
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, scatterPool,
-                    "volumetric scatter descriptor pool");
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, scatterSet,
-                    "volumetric scatter descriptor set");
-
-            VkPushConstantRange.Buffer scatterPushRange = VkPushConstantRange.calloc(1, stack);
-            scatterPushRange.get(0).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0)
-                    .size(VolumetricLightPushData.BYTE_SIZE);
-            long scatterPipelineLayout = createPipelineLayout(vk, stack, scatterDsl,
-                    scatterPushRange, "volumetric scatter");
-            long scatterPipeline = createComputePipeline(ctx, stack, scatterPipelineLayout,
-                    "scatter.comp.spv", "volumetric scatter");
+            VkDescriptorSetLayoutBinding.Buffer integrateBindings =
+                    VkDescriptorSetLayoutBinding.calloc(VOLUMETRIC_INTEGRATE_BINDING_COUNT, stack);
+            storageImage(integrateBindings, VOLUMETRIC_INTEGRATE_OUTPUT);
+            storageImage(integrateBindings, VOLUMETRIC_INTEGRATE_SCATTER);
+            long integrateDsl = createSetLayout(ctx, stack, integrateBindings, "volumetric integrate");
 
             VkDescriptorSetLayoutBinding.Buffer compositeBindings =
                     VkDescriptorSetLayoutBinding.calloc(VOLUMETRIC_COMPOSITE_BINDING_COUNT, stack);
-            compositeBindings.get(VOLUMETRIC_COMPOSITE_OUTPUT).binding(VOLUMETRIC_COMPOSITE_OUTPUT)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
-                    .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
-            compositeBindings.get(VOLUMETRIC_COMPOSITE_SOURCE).binding(VOLUMETRIC_COMPOSITE_SOURCE)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
-                    .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
-            compositeBindings.get(VOLUMETRIC_COMPOSITE_SCATTER).binding(VOLUMETRIC_COMPOSITE_SCATTER)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
-                    .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
-            VkDescriptorSetLayoutCreateInfo compositeLayoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
-                    .sType$Default().pBindings(compositeBindings);
-            check(VK10.vkCreateDescriptorSetLayout(vk, compositeLayoutInfo, null, handle),
-                    "vkCreateDescriptorSetLayout(rt volumetric composite)");
-            long compositeDsl = handle.get(0);
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, compositeDsl,
-                    "volumetric composite descriptor set layout");
+            storageImage(compositeBindings, VOLUMETRIC_COMPOSITE_OUTPUT);
+            storageImage(compositeBindings, VOLUMETRIC_COMPOSITE_SOURCE);
+            sampledImage(compositeBindings, VOLUMETRIC_COMPOSITE_VOLUME);
+            sampledImage(compositeBindings, VOLUMETRIC_COMPOSITE_DEPTH);
+            long compositeDsl = createSetLayout(ctx, stack, compositeBindings, "volumetric composite");
 
-            VkDescriptorPoolSize.Buffer compositePoolSizes = VkDescriptorPoolSize.calloc(2, stack);
-            compositePoolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(2);
-            compositePoolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
-            VkDescriptorPoolCreateInfo compositePoolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
-                    .sType$Default().maxSets(1).pPoolSizes(compositePoolSizes);
-            check(VK10.vkCreateDescriptorPool(vk, compositePoolInfo, null, handle),
-                    "vkCreateDescriptorPool(rt volumetric composite)");
-            long compositePool = handle.get(0);
-            long compositeSet = allocateSet(vk, stack, compositePool, compositeDsl,
+            // 5 sets: two ping-pong orientations each for inject and integrate, one composite.
+            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(2, stack);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(8);
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(6);
+            VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
+                    .sType$Default().maxSets(5).pPoolSizes(poolSizes);
+            check(VK10.vkCreateDescriptorPool(vk, poolInfo, null, handle),
+                    "vkCreateDescriptorPool(rt volumetric)");
+            long pool = handle.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool, "volumetric descriptor pool");
+
+            long[] injectSets = {
+                    allocateSet(vk, stack, pool, injectDsl, "volumetric inject descriptor set 0"),
+                    allocateSet(vk, stack, pool, injectDsl, "volumetric inject descriptor set 1")};
+            long[] integrateSets = {
+                    allocateSet(vk, stack, pool, integrateDsl, "volumetric integrate descriptor set 0"),
+                    allocateSet(vk, stack, pool, integrateDsl, "volumetric integrate descriptor set 1")};
+            long compositeSet = allocateSet(vk, stack, pool, compositeDsl,
                     "volumetric composite descriptor set");
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, compositePool,
-                    "volumetric composite descriptor pool");
+            for (int i = 0; i < injectSets.length; i++) {
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, injectSets[i],
+                        "volumetric inject descriptor set " + i);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, integrateSets[i],
+                        "volumetric integrate descriptor set " + i);
+            }
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, compositeSet,
                     "volumetric composite descriptor set");
 
-            long compositePipelineLayout = createPipelineLayout(vk, stack, compositeDsl, null,
-                    "volumetric composite");
-            long compositePipeline = createComputePipeline(ctx, stack, compositePipelineLayout,
-                    "composite.comp.spv", "volumetric composite");
-            long linearSampler = createSampler(ctx, stack, VK10.VK_FILTER_LINEAR,
-                    "volumetric linear sampler");
-            long nearestSampler = createSampler(ctx, stack, VK10.VK_FILTER_NEAREST,
-                    "volumetric depth sampler");
+            // All three passes read the same push block, so one range description serves them all.
+            VkPushConstantRange.Buffer pushRange = VkPushConstantRange.calloc(1, stack);
+            pushRange.get(0).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT).offset(0)
+                    .size(VolumetricLightPushData.BYTE_SIZE);
 
-            return new RtVolumetricLightPipeline(ctx,
-                    scatterDsl, scatterPool, scatterSet, scatterPipelineLayout, scatterPipeline,
-                    compositeDsl, compositePool, compositeSet, compositePipelineLayout,
-                    compositePipeline, linearSampler, nearestSampler);
+            // Set 1 of the injection layout. The shared helper's single binding is index OVERLAY_TLAS,
+            // which is the same slot the shader declares as VOLUMETRIC_INJECT_TLAS in set 1.
+            RtOverlayPipelines.AccelStructureSet injectAccelSet = RtOverlayPipelines.accelStructureSet(
+                    ctx, VK10.VK_SHADER_STAGE_COMPUTE_BIT, "volumetric inject accel");
+            long injectLayout = createPipelineLayout(vk, stack,
+                    stack.longs(injectDsl, injectAccelSet.layout), pushRange, "volumetric inject");
+            long injectPipeline = createComputePipeline(ctx, stack, injectLayout,
+                    "inject.comp.spv", "volumetric inject");
+            long integrateLayout = createPipelineLayout(vk, stack, stack.longs(integrateDsl), pushRange,
+                    "volumetric integrate");
+            long integratePipeline = createComputePipeline(ctx, stack, integrateLayout,
+                    "integrate.comp.spv", "volumetric integrate");
+            long compositeLayout = createPipelineLayout(vk, stack, stack.longs(compositeDsl), pushRange,
+                    "volumetric composite");
+            long compositePipeline = createComputePipeline(ctx, stack, compositeLayout,
+                    "composite.comp.spv", "volumetric composite");
+
+            // Trilinear filtering of the froxel volume is what upsamples it: it smooths across screen
+            // tiles AND across depth slices, so neither the grid's coarse xy nor its slice boundaries
+            // survive into the image. The composite's depth guide is point-filtered, since an interpolated
+            // reversed-Z silhouette is a distance that belongs to neither surface.
+            long linearSampler = createSampler(ctx, stack, VK10.VK_FILTER_LINEAR, "volumetric linear sampler");
+            long nearestSampler = createSampler(ctx, stack, VK10.VK_FILTER_NEAREST, "volumetric nearest sampler");
+
+            return new RtVolumetricLightPipeline(ctx, pool,
+                    injectDsl, injectSets, injectLayout, injectPipeline, injectAccelSet,
+                    integrateDsl, integrateSets, integrateLayout, integratePipeline,
+                    compositeDsl, compositeSet, compositeLayout, compositePipeline,
+                    linearSampler, nearestSampler);
         }
     }
 
-    public void setImages(long outputView, long scatterView, long sourceView, long depthView,
-                          long transmittanceView, long transmittanceSampler) {
-        if (boundOutputView == outputView && boundScatterView == scatterView
-                && boundSourceView == sourceView && boundDepthView == depthView
-                && boundTransmittanceView == transmittanceView
-                && boundTransmittanceSampler == transmittanceSampler) {
+    /**
+     * Bind this frame's images. {@code scatterViewA}/{@code scatterViewB} are the ping-pong froxel
+     * volumes; {@code integratedView} receives the accumulated volume the composite samples. The depth
+     * guide is the composite's alone — injection resolves visibility by tracing, so it reads nothing the
+     * frame drew.
+     */
+    public void setImages(long outputView, long sourceView, long depthView,
+                          long transmittanceView, long transmittanceSampler,
+                          long scatterViewA, long scatterViewB, long integratedView) {
+        if (boundOutputView == outputView && boundSourceView == sourceView
+                && boundDepthView == depthView && boundTransmittanceView == transmittanceView
+                && boundTransmittanceSampler == transmittanceSampler
+                && boundScatterViewA == scatterViewA && boundScatterViewB == scatterViewB
+                && boundIntegratedView == integratedView) {
             return;
         }
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkDescriptorImageInfo.Buffer images = VkDescriptorImageInfo.calloc(7, stack);
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(7, stack);
+            int writeCount = 2 * VOLUMETRIC_INJECT_BINDING_COUNT + 2 * VOLUMETRIC_INTEGRATE_BINDING_COUNT
+                    + VOLUMETRIC_COMPOSITE_BINDING_COUNT;
+            VkDescriptorImageInfo.Buffer images = VkDescriptorImageInfo.calloc(writeCount, stack);
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(writeCount, stack);
             int i = 0;
 
-            images.get(i).imageView(scatterView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            writes.get(i).sType$Default().dstSet(scatterDescriptorSet)
-                    .dstBinding(VOLUMETRIC_SCATTER_OUTPUT).descriptorCount(1)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-                    .pImageInfo(VkDescriptorImageInfo.create(images.address(i), 1));
-            i++;
-            images.get(i).imageView(sourceView).sampler(linearSampler)
-                    .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            writes.get(i).sType$Default().dstSet(scatterDescriptorSet)
-                    .dstBinding(VOLUMETRIC_SCATTER_SOURCE).descriptorCount(1)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                    .pImageInfo(VkDescriptorImageInfo.create(images.address(i), 1));
-            i++;
-            images.get(i).imageView(depthView).sampler(nearestSampler)
-                    .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            writes.get(i).sType$Default().dstSet(scatterDescriptorSet)
-                    .dstBinding(VOLUMETRIC_SCATTER_DEPTH).descriptorCount(1)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                    .pImageInfo(VkDescriptorImageInfo.create(images.address(i), 1));
-            i++;
-            images.get(i).imageView(transmittanceView).sampler(transmittanceSampler)
-                    .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            writes.get(i).sType$Default().dstSet(scatterDescriptorSet)
-                    .dstBinding(VOLUMETRIC_SCATTER_TRANSMITTANCE).descriptorCount(1)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                    .pImageInfo(VkDescriptorImageInfo.create(images.address(i), 1));
-            i++;
+            long[] scatterViews = {scatterViewA, scatterViewB};
+            for (int parity = 0; parity < 2; parity++) {
+                long writeView = scatterViews[parity];
+                long historyView = scatterViews[1 - parity];
+                i = write(images, writes, i, injectDescriptorSets[parity], VOLUMETRIC_INJECT_OUTPUT,
+                        VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, writeView, VK10.VK_NULL_HANDLE);
+                i = write(images, writes, i, injectDescriptorSets[parity], VOLUMETRIC_INJECT_HISTORY,
+                        VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, historyView, linearSampler);
+                i = write(images, writes, i, injectDescriptorSets[parity], VOLUMETRIC_INJECT_TRANSMITTANCE,
+                        VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, transmittanceView, transmittanceSampler);
 
-            images.get(i).imageView(outputView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            writes.get(i).sType$Default().dstSet(compositeDescriptorSet)
-                    .dstBinding(VOLUMETRIC_COMPOSITE_OUTPUT).descriptorCount(1)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-                    .pImageInfo(VkDescriptorImageInfo.create(images.address(i), 1));
-            i++;
-            images.get(i).imageView(sourceView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            writes.get(i).sType$Default().dstSet(compositeDescriptorSet)
-                    .dstBinding(VOLUMETRIC_COMPOSITE_SOURCE).descriptorCount(1)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-                    .pImageInfo(VkDescriptorImageInfo.create(images.address(i), 1));
-            i++;
-            images.get(i).imageView(scatterView).sampler(linearSampler)
-                    .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-            writes.get(i).sType$Default().dstSet(compositeDescriptorSet)
-                    .dstBinding(VOLUMETRIC_COMPOSITE_SCATTER).descriptorCount(1)
-                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                    .pImageInfo(VkDescriptorImageInfo.create(images.address(i), 1));
+                i = write(images, writes, i, integrateDescriptorSets[parity], VOLUMETRIC_INTEGRATE_OUTPUT,
+                        VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, integratedView, VK10.VK_NULL_HANDLE);
+                i = write(images, writes, i, integrateDescriptorSets[parity], VOLUMETRIC_INTEGRATE_SCATTER,
+                        VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, writeView, VK10.VK_NULL_HANDLE);
+            }
+
+            i = write(images, writes, i, compositeDescriptorSet, VOLUMETRIC_COMPOSITE_OUTPUT,
+                    VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, outputView, VK10.VK_NULL_HANDLE);
+            i = write(images, writes, i, compositeDescriptorSet, VOLUMETRIC_COMPOSITE_SOURCE,
+                    VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, sourceView, VK10.VK_NULL_HANDLE);
+            i = write(images, writes, i, compositeDescriptorSet, VOLUMETRIC_COMPOSITE_VOLUME,
+                    VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, integratedView, linearSampler);
+            // Both depth fetches are POINT sampled, and the composite's especially must stay that way.
+            // Reversed-Z is hyperbolic, so interpolating across a silhouette does not blend the two
+            // distances: a block three blocks away and a background sixty blocks away average to about
+            // six, snapping the edge texel to the foreground. That put a rim of far-too-short fog around
+            // every silhouette, and sub-pixel camera motion made the rim flicker.
+            write(images, writes, i, compositeDescriptorSet, VOLUMETRIC_COMPOSITE_DEPTH,
+                    VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, depthView, nearestSampler);
 
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }
         boundOutputView = outputView;
-        boundScatterView = scatterView;
         boundSourceView = sourceView;
         boundDepthView = depthView;
         boundTransmittanceView = transmittanceView;
         boundTransmittanceSampler = transmittanceSampler;
+        boundScatterViewA = scatterViewA;
+        boundScatterViewB = scatterViewB;
+        boundIntegratedView = integratedView;
     }
 
+    /**
+     * Record injection, integration, and the display-resolution composite.
+     *
+     * @param scatter      the froxel volume this frame writes; its extent is the grid's dimensions
+     * @param parity       which ping-pong orientation {@code scatter} is (0 = A, 1 = B)
+     * @param tlas         this frame's world acceleration structure, traced for occlusion
+     * @param graphicsUse  the frame's graphics-timeline slot, which retires the TLAS descriptor ring entry
+     */
     public void dispatch(VkCommandBuffer cmd, RtImage scatter, RtImage output,
-                         long worldPushAddress, int samples, float intensity, float density, float decay) {
+                         VolumetricLightPushData pushData, int parity,
+                         long tlas, RtGpuExecutor.GraphicsUse graphicsUse) {
+        int slot = parity & 1;
+        long accelSet = injectAccelSet.bind(ctx, tlas, graphicsUse);
         try (MemoryStack stack = MemoryStack.stackPush();
              RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "volumetric light scattering")) {
-            VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, scatterPipeline);
-            VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
-                    scatterPipelineLayout, 0, stack.longs(scatterDescriptorSet), null);
             ByteBuffer push = stack.malloc(VolumetricLightPushData.BYTE_SIZE);
-            new VolumetricLightPushData(worldPushAddress, samples, intensity, density, decay).write(push);
-            VK10.vkCmdPushConstants(cmd, scatterPipelineLayout,
-                    VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
+            pushData.write(push);
+
+            VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, injectPipeline);
+            VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
+                    injectPipelineLayout, 0, stack.longs(injectDescriptorSets[slot], accelSet), null);
+            VK10.vkCmdPushConstants(cmd, injectPipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
+            VK10.vkCmdDispatch(cmd, (scatter.width + 7) / 8, (scatter.height + 7) / 8, scatter.depth);
+            com.mojang.blaze3d.vulkan.VulkanCommandEncoder.memoryBarrier(cmd, stack);
+
+            // One thread per screen tile walks the whole depth column, so this dispatch is 2D.
+            VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, integratePipeline);
+            VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
+                    integratePipelineLayout, 0, stack.longs(integrateDescriptorSets[slot]), null);
+            VK10.vkCmdPushConstants(cmd, integratePipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (scatter.width + 7) / 8, (scatter.height + 7) / 8, 1);
             com.mojang.blaze3d.vulkan.VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, compositePipeline);
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
                     compositePipelineLayout, 0, stack.longs(compositeDescriptorSet), null);
-            VK10.vkCmdDispatch(cmd, (output.width + 15) / 16, (output.height + 15) / 16, 1);
+            VK10.vkCmdPushConstants(cmd, compositePipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
+            VK10.vkCmdDispatch(cmd, (output.width + 7) / 8, (output.height + 7) / 8, 1);
         }
     }
 
@@ -280,17 +312,53 @@ public final class RtVolumetricLightPipeline {
             return;
         }
         VkDevice vk = ctx.vk();
-        VK10.vkDestroyPipeline(vk, scatterPipeline, null);
-        VK10.vkDestroyPipelineLayout(vk, scatterPipelineLayout, null);
-        VK10.vkDestroyDescriptorPool(vk, scatterDescriptorPool, null);
-        VK10.vkDestroyDescriptorSetLayout(vk, scatterDescriptorSetLayout, null);
+        VK10.vkDestroyPipeline(vk, injectPipeline, null);
+        VK10.vkDestroyPipelineLayout(vk, injectPipelineLayout, null);
+        VK10.vkDestroyPipeline(vk, integratePipeline, null);
+        VK10.vkDestroyPipelineLayout(vk, integratePipelineLayout, null);
         VK10.vkDestroyPipeline(vk, compositePipeline, null);
         VK10.vkDestroyPipelineLayout(vk, compositePipelineLayout, null);
-        VK10.vkDestroyDescriptorPool(vk, compositeDescriptorPool, null);
+        VK10.vkDestroyDescriptorPool(vk, descriptorPool, null);
+        VK10.vkDestroyDescriptorSetLayout(vk, injectDescriptorSetLayout, null);
+        injectAccelSet.destroy(vk);
+        VK10.vkDestroyDescriptorSetLayout(vk, integrateDescriptorSetLayout, null);
         VK10.vkDestroyDescriptorSetLayout(vk, compositeDescriptorSetLayout, null);
         VK10.vkDestroySampler(vk, linearSampler, null);
         VK10.vkDestroySampler(vk, nearestSampler, null);
         destroyed = true;
+    }
+
+    private static void storageImage(VkDescriptorSetLayoutBinding.Buffer bindings, int binding) {
+        bindings.get(binding).binding(binding)
+                .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1)
+                .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+    }
+
+    private static void sampledImage(VkDescriptorSetLayoutBinding.Buffer bindings, int binding) {
+        bindings.get(binding).binding(binding)
+                .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
+                .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+    }
+
+    private static long createSetLayout(RtContext ctx, MemoryStack stack,
+                                        VkDescriptorSetLayoutBinding.Buffer bindings, String label) {
+        VkDescriptorSetLayoutCreateInfo info = VkDescriptorSetLayoutCreateInfo.calloc(stack)
+                .sType$Default().pBindings(bindings);
+        LongBuffer handle = stack.mallocLong(1);
+        check(VK10.vkCreateDescriptorSetLayout(ctx.vk(), info, null, handle),
+                "vkCreateDescriptorSetLayout(rt " + label + ")");
+        RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, handle.get(0),
+                label + " descriptor set layout");
+        return handle.get(0);
+    }
+
+    private static int write(VkDescriptorImageInfo.Buffer images, VkWriteDescriptorSet.Buffer writes,
+                             int index, long set, int binding, int type, long view, long sampler) {
+        images.get(index).imageView(view).sampler(sampler).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+        writes.get(index).sType$Default().dstSet(set).dstBinding(binding).descriptorCount(1)
+                .descriptorType(type)
+                .pImageInfo(VkDescriptorImageInfo.create(images.address(index), 1));
+        return index + 1;
     }
 
     private static long allocateSet(VkDevice vk, MemoryStack stack, long pool, long layout,
@@ -303,10 +371,10 @@ public final class RtVolumetricLightPipeline {
         return set.get(0);
     }
 
-    private static long createPipelineLayout(VkDevice vk, MemoryStack stack, long descriptorSetLayout,
+    private static long createPipelineLayout(VkDevice vk, MemoryStack stack, LongBuffer descriptorSetLayouts,
                                              VkPushConstantRange.Buffer pushRange, String operation) {
         VkPipelineLayoutCreateInfo info = VkPipelineLayoutCreateInfo.calloc(stack)
-                .sType$Default().pSetLayouts(stack.longs(descriptorSetLayout));
+                .sType$Default().pSetLayouts(descriptorSetLayouts);
         if (pushRange != null) {
             info.pPushConstantRanges(pushRange);
         }

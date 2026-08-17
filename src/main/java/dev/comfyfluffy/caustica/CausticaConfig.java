@@ -59,7 +59,7 @@ public final class CausticaConfig {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.VolumetricLight.ENABLED, Rt.FrameStats.ENABLED,
-            Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
+            Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Rt.Parallax.ENABLED, Ngx.PATH,
         };
     }
 
@@ -98,8 +98,14 @@ public final class CausticaConfig {
         FILE.setComment("tonemap",
                 " Controls the final image. gamma: 1 is neutral; lower values brighten midtones.");
         FILE.setComment("volumetric-light",
-                " Screen-space volumetric light scattering (crepuscular rays).\n"
-                        + " intensity controls ray brightness; sample count trades performance for smoothness.");
+                " Froxel volumetric light scattering (crepuscular rays, fog, and underwater shafts).\n"
+                        + " strength scales ray brightness; fog-density sets how much air scatters;\n"
+                        + " quality (0-4) trades performance for the resolution of the volumetric grid.");
+        FILE.setComment("parallax",
+                " Parallax occlusion mapping from a resource pack's LabPBR height channel.\n"
+                        + " depth is how far the surface pushes in, in blocks; steps trades performance for\n"
+                        + " accuracy at grazing angles; distance is where it fades back to a flat surface.\n"
+                        + " smoothing rounds the height field between texels, for packs above 16x; 0 is off.");
         FILE.setComment("exposure",
                 " Controls automatic exposure. manual-ev sets exposure in manual mode and adjusts it in auto mode.\n"
                         + " adapt-darken and adapt-brighten control adjustment speed in seconds.\n"
@@ -822,28 +828,127 @@ public final class CausticaConfig {
         }
 
         /**
-         * Screen-space volumetric light scattering from the dominant sun or moon. The radial sampler runs
-         * after DLSS Ray Reconstruction so its synthetic shafts never enter temporal reconstruction, then
-         * the additive composite rejoins the scene before exposure, bloom, and the SDR/HDR display transforms.
+         * Froxel volumetric lighting from the dominant sun or moon. The frustum is voxelised, each cell
+         * traces the world for the light's visibility and for its own sky access, and the accumulated
+         * volume is applied to the reconstructed scene. It runs after DLSS Ray Reconstruction — the volume
+         * carries its own temporal filter, so its shafts never enter RR's history — and rejoins the scene
+         * before exposure, bloom, and the SDR/HDR display transforms.
          */
         public static final class VolumetricLight {
             public static final BooleanSetting ENABLED =
                     bool("caustica.rt.volumetricLight", "volumetric-light.enabled", true);
-            public static final FloatSetting INTENSITY =
-                    clampedFloat("caustica.rt.volumetricLight.intensity",
-                            "volumetric-light.intensity", 0.20f, 0.0f, 2.0f);
-            public static final List<Integer> SAMPLE_STEPS = List.of(16, 24, 32, 48, 64);
-            public static final IntSetting SAMPLES =
-                    intChoice("caustica.rt.volumetricLight.samples",
-                            "volumetric-light.samples", 32, SAMPLE_STEPS);
+            /** Artistic multiplier on in-scattered radiance. Transmittance stays physical at any value. */
+            public static final FloatSetting STRENGTH =
+                    clampedFloat("caustica.rt.volumetricLight.strength",
+                            "volumetric-light.strength", 1.0f, 0.0f, 3.0f);
+            public static final List<Integer> QUALITY_STEPS = List.of(0, 1, 2, 3, 4);
+            public static final IntSetting QUALITY =
+                    intChoice("caustica.rt.volumetricLight.quality",
+                            "volumetric-light.quality", 1, QUALITY_STEPS);
+            /**
+             * Scattering coefficient of air at sea level, 1/block. This is what makes shafts visible at
+             * all, and also what hazes distant terrain: the default costs roughly a third of the light
+             * over the grid's full reach, which reads as aerial perspective rather than as fog.
+             */
             public static final FloatSetting DENSITY =
                     clampedFloat("caustica.rt.volumetricLight.density",
-                            "volumetric-light.density", 0.92f, 0.1f, 1.5f);
-            public static final FloatSetting DECAY =
-                    clampedFloat("caustica.rt.volumetricLight.decay",
-                            "volumetric-light.decay", 0.96f, 0.5f, 1.0f);
+                            "volumetric-light.fog-density", 0.0035f, 0.0f, 0.05f);
+            /**
+             * Henyey-Greenstein g. Higher values concentrate the glow around the light's own direction,
+             * so shafts flare when looking toward the sun and fade when looking away from it. The default
+             * keeps that contrast about sixteen-fold, which reads as haze rather than as a spotlight.
+             */
+            public static final FloatSetting ANISOTROPY =
+                    clampedFloat("caustica.rt.volumetricLight.anisotropy",
+                            "volumetric-light.anisotropy", 0.60f, 0.0f, 0.95f);
+            /** Far boundary of the froxel grid, blocks. Beyond it the scene receives no fog at all. */
+            public static final FloatSetting DISTANCE =
+                    clampedFloat("caustica.rt.volumetricLight.distance",
+                            "volumetric-light.distance", 160.0f, 32.0f, 512.0f);
+            /** Height above sea level at which air density has fallen to 1/e, blocks. */
+            public static final FloatSetting HEIGHT_FALLOFF =
+                    clampedFloat("caustica.rt.volumetricLight.heightFalloff",
+                            "volumetric-light.height-falloff", 60.0f, 4.0f, 512.0f);
+            /**
+             * Unshadowed fraction of the celestial illuminance, standing in for sky light and multiple
+             * scattering. Zero makes shadowed air perfectly clear; large values flatten shafts into haze.
+             */
+            public static final FloatSetting AMBIENT =
+                    clampedFloat("caustica.rt.volumetricLight.ambient",
+                            "volumetric-light.ambient", 0.035f, 0.0f, 0.5f);
+            /**
+             * Scattering coefficient used while the camera eye is submerged, 1/block. Water scatters
+             * orders of magnitude more than air, which is why submerged shafts are visible at all; the
+             * biome tint's absorption is not added here because the path tracer already applied it.
+             */
+            public static final FloatSetting UNDERWATER_DENSITY =
+                    clampedFloat("caustica.rt.volumetricLight.underwaterDensity",
+                            "volumetric-light.underwater-density", 0.05f, 0.0f, 0.5f);
+
+            /**
+             * Grid shape for a quality step: {@code tile} screen pixels per froxel column, {@code slices}
+             * depth cells, and {@code skyProbes} fixed directions tested for sky access.
+             *
+             * <p>Cell count is the frame divided by the tile size, times the slices; each cell traces one
+             * ray for the light plus {@code skyProbes} for the ambient term, so cost scales with the
+             * product of all three. Tile size decides how sharply a shadow edge can be drawn inside a
+             * shaft, slice count decides whether shafts read as smooth volumes or as stacked layers, and
+             * the probe count decides how finely partial sky cover — a canopy, a ledge — is quantised,
+             * since those directions are a fixed set rather than a random sample.
+             */
+            public record Grid(int tile, int slices, int skyProbes) {}
+
+            private static final List<Grid> GRIDS = List.of(
+                    new Grid(20, 48, 1),
+                    new Grid(12, 64, 2),
+                    new Grid(10, 96, 3),
+                    new Grid(8, 128, 4),
+                    new Grid(6, 160, 4));
+
+            public static Grid grid() {
+                return GRIDS.get(Math.clamp(QUALITY.value(), 0, GRIDS.size() - 1));
+            }
 
             private VolumetricLight() {
+            }
+        }
+
+        /**
+         * Parallax occlusion mapping of a resource pack's LabPBR height channel (the {@code _n} texture's
+         * alpha), marched in the closest-hit material path.
+         *
+         * <p>Applied to the camera's own hit only. Shadow and bounce rays keep the flat surface, which
+         * costs some self-shadowing accuracy and buys stability: the geometry, the depth guide, and the
+         * motion vectors all keep describing one undisplaced surface, so reconstruction has nothing to
+         * disagree with.
+         */
+        public static final class Parallax {
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.parallax", "parallax.enabled", true);
+            /** How far the surface pushes in, in blocks. A block face is one texture tile across. */
+            public static final FloatSetting DEPTH =
+                    clampedFloat("caustica.rt.parallax.depth", "parallax.depth", 0.06f, 0.0f, 0.25f);
+            /** Distance in blocks at which the effect has faded back to a flat surface. */
+            public static final FloatSetting DISTANCE =
+                    clampedFloat("caustica.rt.parallax.distance", "parallax.distance", 24.0f, 4.0f, 128.0f);
+            public static final List<Integer> STEP_CHOICES = List.of(8, 16, 32, 64, 128);
+            /**
+             * Ceiling on march steps. The shader spends the full count only at grazing angles, where the
+             * search sweeps across many texels; head-on there is almost nothing to march.
+             */
+            public static final IntSetting STEPS =
+                    intChoice("caustica.rt.parallax.steps", "parallax.steps", 32, STEP_CHOICES);
+            /**
+             * Strength of the height field's smoothing filter. Material pages are point-sampled to keep
+             * Minecraft's texels crisp, so the marched height is a grid of flat plateaus: at 16x those
+             * plateaus are the art, while a high-resolution pack authors continuous relief that the same
+             * sampling turns into terracing. Off by default — it costs four height taps per march step
+             * where one would do, and it rounds off detail a default-resolution pack wants kept square.
+             */
+            public static final FloatSetting SMOOTHING =
+                    clampedFloat("caustica.rt.parallax.smoothing", "parallax.smoothing", 0.0f, 0.0f, 1.0f);
+
+            private Parallax() {
             }
         }
 

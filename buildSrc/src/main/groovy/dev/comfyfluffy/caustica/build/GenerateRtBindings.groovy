@@ -47,11 +47,15 @@ abstract class GenerateRtBindings extends DefaultTask {
                     HIST_BINS: "histBins", IMAGE: "exposureImage", STATE: "stateBuf"]],
             [prefix: "BLOOM", source: "pipelines/bloom/main.comp.slang", resources: [
                     OUTPUT: "dstImage", SOURCE: "srcImage", EXPOSURE: "exposureImage"]],
-            [prefix: "VOLUMETRIC_SCATTER", source: "pipelines/volumetric_light/scatter.comp.slang", resources: [
-                    OUTPUT: "scatterImage", SOURCE: "sourceImage", DEPTH: "depthImage",
-                    TRANSMITTANCE: "transmittanceLut"]],
+            [prefix: "VOLUMETRIC_INJECT", source: "pipelines/volumetric_light/inject.comp.slang", resources: [
+                    OUTPUT: "scatterImage", HISTORY: "historyImage", TRANSMITTANCE: "transmittanceLut"],
+             // The TLAS is rebuilt every frame, so it is bound from its own ring of single-binding sets
+             // rather than from the image set, which is written once per resize.
+             accelResources: [TLAS: "worldTlas"]],
+            [prefix: "VOLUMETRIC_INTEGRATE", source: "pipelines/volumetric_light/integrate.comp.slang", resources: [
+                    OUTPUT: "integratedImage", SCATTER: "scatterImage"]],
             [prefix: "VOLUMETRIC_COMPOSITE", source: "pipelines/volumetric_light/composite.comp.slang", resources: [
-                    OUTPUT: "outputImage", SOURCE: "sourceImage", SCATTER: "scatterImage"]],
+                    OUTPUT: "outputImage", SOURCE: "sourceImage", VOLUME: "volumeImage", DEPTH: "depthImage"]],
             [prefix: "SKY_LUT", source: "pipelines/sky_lut/view.comp.slang", resources: [
                     TRANSMITTANCE_IMAGE: "transmittanceImage", MULTISCATTER_IMAGE: "multiScatterImage",
                     SKY_VIEW_IMAGE: "skyViewImage", TRANSMITTANCE_SAMPLER: "transmittanceLut",
@@ -90,16 +94,19 @@ abstract class GenerateRtBindings extends DefaultTask {
             def reflection = reflect(new File(shaderRoot.get().asFile, spec.source as String), scratchDir)
             def reflected = reflection.parameters.findAll { it.binding?.kind == "descriptorTableSlot" }
                     .collectEntries { [(it.name): it.binding] }
-            def missing = spec.resources.values().findAll { !reflected.containsKey(it) }
-            def unexpected = reflected.keySet().findAll { !spec.resources.containsValue(it) }
+            def accelResources = (spec.accelResources ?: [:]) as Map
+            def declared = (spec.resources as Map) + accelResources
+            def missing = declared.values().findAll { !reflected.containsKey(it) }
+            def unexpected = reflected.keySet().findAll { !declared.containsValue(it) }
             if (!missing.isEmpty() || !unexpected.isEmpty()) {
                 throw new GradleException("${spec.source} descriptor mismatch; missing=${missing}, unexpected=${unexpected}")
             }
 
-            def locations = spec.resources.collectEntries { suffix, resource ->
+            def locations = declared.collectEntries { suffix, resource ->
                 [(suffix): [index: reflected[resource].index as int, set: (reflected[resource].space ?: 0) as int]]
             }
-            if (spec.prefix != "WORLD" && (locations.values()*.set as Set).size() != 1) {
+            if (spec.prefix != "WORLD" && accelResources.isEmpty()
+                    && (locations.values()*.set as Set).size() != 1) {
                 throw new GradleException("${spec.source} resources span unexpected descriptor sets: ${locations}")
             }
             locations.values().groupBy { it.set }.each { set, bindings ->
@@ -134,6 +141,18 @@ abstract class GenerateRtBindings extends DefaultTask {
                 constants.WORLD_BINDLESS_SET = bindless.values().first().set
                 bindless.each { suffix, location -> constants["WORLD_${suffix}"] = location.index }
                 constants.WORLD_BINDLESS_COUNT = bindless.size()
+            } else if (!accelResources.isEmpty()) {
+                def images = locations.findAll { suffix, ignored -> (spec.resources as Map).containsKey(suffix) }
+                def accels = locations.findAll { suffix, ignored -> accelResources.containsKey(suffix) }
+                if ((images.values()*.set as Set).size() != 1 || (accels.values()*.set as Set).size() != 1
+                        || images.values().first().set == accels.values().first().set) {
+                    throw new GradleException("${spec.source} must keep its acceleration structure in its own descriptor set: ${locations}")
+                }
+                constants["${spec.prefix}_SET"] = images.values().first().set
+                images.each { suffix, location -> constants["${spec.prefix}_${suffix}"] = location.index }
+                constants["${spec.prefix}_BINDING_COUNT"] = images.values()*.index.max() + 1
+                constants["${spec.prefix}_ACCEL_SET"] = accels.values().first().set
+                accels.each { suffix, location -> constants["${spec.prefix}_${suffix}"] = location.index }
             } else {
                 constants["${spec.prefix}_SET"] = locations.values().first().set
                 locations.each { suffix, location -> constants["${spec.prefix}_${suffix}"] = location.index }

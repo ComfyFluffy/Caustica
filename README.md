@@ -22,9 +22,9 @@ changes while the renderer is being built.
 - DLSS Ray Reconstruction support
 - DLSS Frame Generation support (experimental)
 - HDR output
-- Configurable volumetric light scattering and crepuscular rays
+- Froxel volumetric lighting: light shafts, height fog, and underwater rays, ray-traced against world geometry so both the light and its occluders may be off-screen
 - Dynamic entity rendering in the ray-traced scene
-- LabPBR-style material support
+- LabPBR-style material support, including parallax occlusion mapping of a pack's height channel
 - OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations
 
 ## Requirements
@@ -81,7 +81,7 @@ license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## TODO List
 
-- [ ] Nether/End sky, weather, volumetric fog/clouds
+- [ ] Nether/End sky, weather, volumetric clouds
 - [ ] NRD + FSR for non-NVIDIA GPUs
 - [ ] LOD
 - [ ] ReSTIR

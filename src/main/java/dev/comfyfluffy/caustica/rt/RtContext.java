@@ -20,6 +20,7 @@ import org.lwjgl.vulkan.VkBufferDeviceAddressInfo;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkCommandBufferAllocateInfo;
 import org.lwjgl.vulkan.VkCommandBufferBeginInfo;
+import org.lwjgl.vulkan.VkClearColorValue;
 import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkFenceCreateInfo;
@@ -27,6 +28,7 @@ import org.lwjgl.vulkan.VkFormatProperties;
 import org.lwjgl.vulkan.VkImageCreateInfo;
 import org.lwjgl.vulkan.VkImageFormatProperties;
 import org.lwjgl.vulkan.VkImageMemoryBarrier;
+import org.lwjgl.vulkan.VkImageSubresourceRange;
 import org.lwjgl.vulkan.VkImageViewCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructurePropertiesKHR;
@@ -393,7 +395,91 @@ public final class RtContext {
         return new RtImage(vma, vk, image, allocation, view, width, height);
     }
 
+    /**
+     * A 3D storage image (STORAGE + SAMPLED), transitioned to GENERAL and cleared to zero.
+     *
+     * <p>Used for the volumetric-light froxel grid, whose passes both write it as a storage image and
+     * sample it trilinearly. The clear is load-bearing rather than tidiness: the froxel injection blends
+     * against the previous frame's grid, so an uninitialised allocation would feed denormals or NaNs into
+     * the temporal history and keep them there.
+     */
+    public RtImage createStorageImage3D(int width, int height, int depth, int format, String label) {
+        int usage = VK10.VK_IMAGE_USAGE_STORAGE_BIT | VK10.VK_IMAGE_USAGE_SAMPLED_BIT
+                | VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        requireStorageImageSupport(VK10.VK_IMAGE_TYPE_3D, width, height, depth, format, usage, label);
+        long image;
+        long allocation;
+        long view;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
+                    .imageType(VK10.VK_IMAGE_TYPE_3D).format(format)
+                    .mipLevels(1).arrayLayers(1).samples(VK10.VK_SAMPLE_COUNT_1_BIT)
+                    .tiling(VK10.VK_IMAGE_TILING_OPTIMAL).usage(usage)
+                    .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE)
+                    .initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);
+            ici.extent().set(width, height, depth);
+            VmaAllocationCreateInfo iaci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
+            LongBuffer pImage = stack.mallocLong(1);
+            PointerBuffer pAlloc = stack.mallocPointer(1);
+            check(Vma.vmaCreateImage(vma, ici, iaci, pImage, pAlloc, null), "vmaCreateImage(" + label + ")");
+            image = pImage.get(0);
+            allocation = pAlloc.get(0);
+            RtDebugLabels.nameImage(this, image, label);
+
+            VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default()
+                    .image(image).viewType(VK10.VK_IMAGE_VIEW_TYPE_3D).format(format);
+            vci.subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
+            LongBuffer pView = stack.mallocLong(1);
+            check(VK10.vkCreateImageView(vk, vci, null, pView), "vkCreateImageView(" + label + ")");
+            view = pView.get(0);
+            RtDebugLabels.nameImageView(this, view, label + " view");
+        }
+        long imageFinal = image;
+        submitSync(cmd -> {
+            try (MemoryStack stack = MemoryStack.stackPush();
+                 RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "init " + label)) {
+                VkImageMemoryBarrier.Buffer toTransfer = VkImageMemoryBarrier.calloc(1, stack);
+                toTransfer.get(0).sType$Default()
+                        .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED)
+                        .newLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).image(imageFinal);
+                toTransfer.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .levelCount(1).layerCount(1);
+                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, null, null, toTransfer);
+
+                VkClearColorValue clear = VkClearColorValue.calloc(stack);
+                clear.float32(stack.floats(0f, 0f, 0f, 0f));
+                VkImageSubresourceRange.Buffer ranges = VkImageSubresourceRange.calloc(1, stack);
+                ranges.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
+                VK10.vkCmdClearColorImage(cmd, imageFinal, VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        clear, ranges);
+
+                VkImageMemoryBarrier.Buffer toGeneral = VkImageMemoryBarrier.calloc(1, stack);
+                toGeneral.get(0).sType$Default()
+                        .oldLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                        .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).image(imageFinal);
+                toGeneral.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .levelCount(1).layerCount(1);
+                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, null, null, toGeneral);
+            }
+        });
+        return new RtImage(vma, vk, image, allocation, view, width, height, depth);
+    }
+
     private void requireStorageImageSupport(int width, int height, int format, int usage, String label) {
+        requireStorageImageSupport(VK10.VK_IMAGE_TYPE_2D, width, height, 1, format, usage, label);
+    }
+
+    private void requireStorageImageSupport(int imageType, int width, int height, int depth, int format,
+                                            int usage, String label) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkFormatProperties formatProperties = VkFormatProperties.calloc(stack);
             VK10.vkGetPhysicalDeviceFormatProperties(vk.getPhysicalDevice(), format, formatProperties);
@@ -415,16 +501,17 @@ public final class RtContext {
 
             VkImageFormatProperties imageProperties = VkImageFormatProperties.calloc(stack);
             int result = VK10.vkGetPhysicalDeviceImageFormatProperties(vk.getPhysicalDevice(), format,
-                    VK10.VK_IMAGE_TYPE_2D, VK10.VK_IMAGE_TILING_OPTIMAL, usage, 0, imageProperties);
+                    imageType, VK10.VK_IMAGE_TILING_OPTIMAL, usage, 0, imageProperties);
             if (result == VK10.VK_ERROR_FORMAT_NOT_SUPPORTED) {
                 throw new UnsupportedOperationException(label + " format " + format
                         + " does not support image usage 0x" + Integer.toHexString(usage));
             }
             check(result, "vkGetPhysicalDeviceImageFormatProperties");
-            if (width > imageProperties.maxExtent().width() || height > imageProperties.maxExtent().height()) {
-                throw new UnsupportedOperationException(label + " extent " + width + "x" + height
+            if (width > imageProperties.maxExtent().width() || height > imageProperties.maxExtent().height()
+                    || depth > imageProperties.maxExtent().depth()) {
+                throw new UnsupportedOperationException(label + " extent " + width + "x" + height + "x" + depth
                         + " exceeds format maximum " + imageProperties.maxExtent().width() + "x"
-                        + imageProperties.maxExtent().height());
+                        + imageProperties.maxExtent().height() + "x" + imageProperties.maxExtent().depth());
             }
         }
     }

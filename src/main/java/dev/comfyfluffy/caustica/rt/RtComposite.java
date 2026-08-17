@@ -11,6 +11,7 @@ import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.client.CausticaJitter;
 import dev.comfyfluffy.caustica.mixin.CommandEncoderAccessor;
+import dev.comfyfluffy.caustica.rt.gen.VolumetricLightPushData;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushConstantsData;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.BreakEntry;
@@ -124,10 +125,22 @@ public final class RtComposite {
 
     private static boolean volumetricLightEnabled() {
         return CausticaConfig.Rt.VolumetricLight.ENABLED.value()
-                && CausticaConfig.Rt.VolumetricLight.INTENSITY.value() > 0.0f;
+                && CausticaConfig.Rt.VolumetricLight.STRENGTH.value() > 0.0f;
     }
 
     private static final int WATER_ANCHOR_MASK = 4095;
+    // Froxel constants that describe the algorithm rather than a taste: the near boundary is where the
+    // grid starts (closer than this the eye is inside the first cell anyway), and the thickness bound is
+    // how deep behind a depth-guide surface a shadow test may still claim occlusion before the guide
+    // stops being evidence. The temporal weight is the per-frame share of a new sample: the visibility
+    // tests it averages are binary, so this doubles as how much of their residual variance survives into
+    // the image, and it is set low enough that a shaft edge crossing a slice boundary cannot shimmer.
+    private static final float FROXEL_NEAR_DISTANCE = 0.3f;   // blocks
+    private static final float FROXEL_TEMPORAL_BLEND = 0.09f; // weight of this frame's sample
+    // Ceiling on froxels per volume, enforced by coarsening the tile size. Three volumes of eight bytes a
+    // cell means this is the difference between a couple of hundred megabytes and a gigabyte of video
+    // memory, and the finest quality steps at 4K would sail past that without ever being playable.
+    private static final long FROXEL_BUDGET = 8_000_000L;
     // The versioned look package owns every photometric anchor and the sky geometry. Its sun illuminance is the
     // photometric solar constant at the top of the atmosphere; the shader's transmittance LUT brings that
     // to ~117,000 lux under a zenith sun and reddens/dims it through sunset, and because world.rmiss tints
@@ -254,11 +267,22 @@ public final class RtComposite {
     // Display-res reconstructed RT image: DLSS-RR writes it (render -> display denoise+upscale), or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
-    // Volumetric light scattering runs after RR: radial additive sampling writes a half-resolution soft
-    // shaft signal, then a full-resolution composite adds it to rrOutput. Even while the option is off,
-    // postProcessOutput receives a 1:1 copy so every downstream descriptor stays fixed and live toggles
-    // never update a descriptor set that an earlier frame may still be using.
-    private RtImage volumetricLightImage;
+    // Volumetric light runs after RR over a froxel grid: a 3D voxelisation of the view frustum whose
+    // cells hold scattering and extinction, integrated into froxelIntegrated and composited onto rrOutput.
+    // The two scattering volumes ping-pong so each frame can blend against the previous grid; parity is
+    // the frame serial's low bit. Even while the option is off, postProcessOutput receives a 1:1 copy so
+    // every downstream descriptor stays fixed and live toggles never update a descriptor set that an
+    // earlier frame may still be using.
+    private final RtImage[] froxelScatter = new RtImage[2];
+    private RtImage froxelIntegrated;
+    // Grid shape the froxel volumes were allocated for, so a live quality change is noticed at a fixed
+    // window size, and the pre-exposure the previous frame's volume was stored with.
+    private CausticaConfig.Rt.VolumetricLight.Grid froxelGrid;
+    // False whenever the volumes hold nothing this frame may blend against: freshly allocated (cleared to
+    // zero), or left behind while the effect was switched off. The first frame after that takes its own
+    // sample whole instead of fading up out of an empty or stale grid.
+    private boolean froxelHistoryValid;
+    private float previousPreExposure = 1.0f;
     private RtImage postProcessOutput;
     private final RtExposure exposure = new RtExposure();
 
@@ -671,8 +695,9 @@ public final class RtComposite {
             debugPresentPipeline.setImages(displayImage.view, gNormal.view, gAlbedo.view, gDepth.view,
                     gMotion.view, gSpecAlbedo.view, gSpecMotion.view, postProcessOutput.view, exposure.image().view,
                     exposure.stateBuffer());
-            volumetricLightPipeline.setImages(postProcessOutput.view, volumetricLightImage.view,
-                    rrOutput.view, gDepth.view, skyLut.transmittanceView(), skyLut.sampler());
+            volumetricLightPipeline.setImages(postProcessOutput.view, rrOutput.view, gDepth.view,
+                    skyLut.transmittanceView(), skyLut.sampler(),
+                    froxelScatter[0].view, froxelScatter[1].view, froxelIntegrated.view);
             // Cheap idempotent check every frame (not just on resize): if the exposure mode is switched
             // manual -> auto at runtime (video settings), the auto-mode histogram/state/pipeline must be
             // allocated before recordFrame's exposure.record() below needs them, or it throws.
@@ -906,10 +931,7 @@ public final class RtComposite {
             rrOutput.destroy();
             rrOutput = null;
         }
-        if (volumetricLightImage != null) {
-            volumetricLightImage.destroy();
-            volumetricLightImage = null;
-        }
+        destroyFroxelVolumes();
         if (postProcessOutput != null) {
             postProcessOutput.destroy();
             postProcessOutput = null;
@@ -922,12 +944,14 @@ public final class RtComposite {
         // the RR path whose render-resolution guide inputs the debug pass visualizes.
         boolean rrEnabled = RtDlssRr.enabled();
         int rrQuality = rrEnabled ? RtDlssRr.quality() : Integer.MIN_VALUE;
+        CausticaConfig.Rt.VolumetricLight.Grid wantedGrid = CausticaConfig.Rt.VolumetricLight.grid();
         if (output != null && continuationQueue != null
                 && displayImage != null && hdrDisplayImage != null && rrOutput != null
-                && volumetricLightImage != null && postProcessOutput != null
+                && froxelIntegrated != null && postProcessOutput != null
                 && bloomLevels.length > 0 && exposure.ready()
                 && displayW == width && displayH == height
-                && renderSizeRrEnabled == rrEnabled && renderSizeRrQuality == rrQuality) {
+                && renderSizeRrEnabled == rrEnabled && renderSizeRrQuality == rrQuality
+                && wantedGrid.equals(froxelGrid)) {
             return;
         }
         ctx.waitIdle(); // resize is rare; no in-flight frame may use the old image/descriptor
@@ -995,16 +1019,12 @@ public final class RtComposite {
         gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide motion " + renderW + "x" + renderH);
         gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderW + "x" + renderH);
         gSpecMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderW + "x" + renderH);
-        // Display-res reconstructed scene plus the post-process pair. Additive radial sampling is
-        // half-resolution because its output is deliberately soft; the composite remains full resolution
-        // so every downstream stage has one canonical post-process scene image.
+        // Display-res reconstructed scene plus the post-process pair. The volumetric composite reads
+        // rrOutput and writes postProcessOutput, which stays the one canonical post-process scene image
+        // every downstream stage reads.
         rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                 "DLSS-RR output " + width + "x" + height);
-        int volumetricWidth = Math.max(1, (width + 1) / 2);
-        int volumetricHeight = Math.max(1, (height + 1) / 2);
-        volumetricLightImage = ctx.createStorageImage(volumetricWidth, volumetricHeight,
-                VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                "volumetric light " + volumetricWidth + "x" + volumetricHeight);
+        createFroxelVolumes(ctx, wantedGrid);
         postProcessOutput = ctx.createStorageImage(width, height,
                 VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                 "post-process scene " + width + "x" + height);
@@ -1024,8 +1044,89 @@ public final class RtComposite {
         debugPresentPipeline.setImages(displayImage.view, gNormal.view, gAlbedo.view, gDepth.view,
                 gMotion.view, gSpecAlbedo.view, gSpecMotion.view, postProcessOutput.view, exposure.image().view,
                 exposure.stateBuffer());
-        volumetricLightPipeline.setImages(postProcessOutput.view, volumetricLightImage.view,
-                rrOutput.view, gDepth.view, skyLut.transmittanceView(), skyLut.sampler());
+        volumetricLightPipeline.setImages(postProcessOutput.view, rrOutput.view, gDepth.view,
+                skyLut.transmittanceView(), skyLut.sampler(),
+                froxelScatter[0].view, froxelScatter[1].view, froxelIntegrated.view);
+    }
+
+    /**
+     * Allocate the froxel grid for the current display size and quality step.
+     *
+     * <p>The grid is sized in screen tiles, so its aspect ratio always matches the frustum it voxelises,
+     * and its slices are laid out exponentially by the shaders (see {@code froxel.slang}). Both scattering
+     * volumes and the integrated volume share one shape; the pair is what lets a frame read the previous
+     * grid while writing this one.
+     */
+    private void createFroxelVolumes(RtContext ctx, CausticaConfig.Rt.VolumetricLight.Grid grid) {
+        int gridD = Math.max(1, grid.slices());
+        int tile = Math.max(1, grid.tile());
+        int gridW = Math.max(1, (displayW + tile - 1) / tile);
+        int gridH = Math.max(1, (displayH + tile - 1) / tile);
+        // A quality step names a tile size, not a cell count, so the same step costs four times as much at
+        // 4K as at 1080p. Coarsen the tiles until the volume fits the budget rather than letting the
+        // allocation grow without bound.
+        while ((long) gridW * gridH * gridD > FROXEL_BUDGET && tile < displayW) {
+            tile++;
+            gridW = Math.max(1, (displayW + tile - 1) / tile);
+            gridH = Math.max(1, (displayH + tile - 1) / tile);
+        }
+        String extent = gridW + "x" + gridH + "x" + gridD;
+        for (int i = 0; i < froxelScatter.length; i++) {
+            froxelScatter[i] = ctx.createStorageImage3D(gridW, gridH, gridD,
+                    VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "froxel scattering " + i + " " + extent);
+        }
+        froxelIntegrated = ctx.createStorageImage3D(gridW, gridH, gridD,
+                VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "froxel integrated " + extent);
+        froxelGrid = grid;
+        froxelHistoryValid = false;
+    }
+
+    private void destroyFroxelVolumes() {
+        for (int i = 0; i < froxelScatter.length; i++) {
+            if (froxelScatter[i] != null) {
+                froxelScatter[i].destroy();
+                froxelScatter[i] = null;
+            }
+        }
+        if (froxelIntegrated != null) {
+            froxelIntegrated.destroy();
+            froxelIntegrated = null;
+        }
+        froxelGrid = null;
+        froxelHistoryValid = false;
+    }
+
+    /**
+     * Per-frame froxel state.
+     *
+     * <p>The camera altitude is measured against sea level so the density model is pinned to the world
+     * rather than to the viewer: climb a mountain and the air actually thins, descend into a cave and it
+     * does not keep thickening. {@code historyScale} rebases the previous frame's stored radiance onto
+     * this frame's pre-exposure, which the froxel textures are scaled by.
+     */
+    private VolumetricLightPushData volumetricPush(long worldPushAddress) {
+        float preExposure = exposure.preExposure();
+        float historyScale = previousPreExposure > 0.0f ? preExposure / previousPreExposure : 1.0f;
+        previousPreExposure = preExposure;
+        float temporalBlend = froxelHistoryValid ? FROXEL_TEMPORAL_BLEND : 1.0f;
+        froxelHistoryValid = true;
+        var level = Minecraft.getInstance().level;
+        float seaLevel = level != null ? level.getSeaLevel() : 0f;
+        return new VolumetricLightPushData(
+                worldPushAddress,
+                froxelGrid.skyProbes(),
+                (int) frameCounter,
+                CausticaConfig.Rt.VolumetricLight.STRENGTH.value(),
+                CausticaConfig.Rt.VolumetricLight.DENSITY.value(),
+                CausticaConfig.Rt.VolumetricLight.ANISOTROPY.value(),
+                FROXEL_NEAR_DISTANCE,
+                CausticaConfig.Rt.VolumetricLight.DISTANCE.value(),
+                CausticaConfig.Rt.VolumetricLight.HEIGHT_FALLOFF.value(),
+                (float) (camY - seaLevel),
+                CausticaConfig.Rt.VolumetricLight.AMBIENT.value(),
+                temporalBlend,
+                CausticaConfig.Rt.VolumetricLight.UNDERWATER_DENSITY.value(),
+                historyScale);
     }
 
     private void destroyBloomLevels() {
@@ -1227,12 +1328,19 @@ public final class RtComposite {
             // WorldPush at all, and the RIS light buffers are read from world.rgen's hot inner loop, so
             // none of them should cost an extra BDA dereference to find.
             ByteBuffer pushConstants = stack.malloc(WorldPushConstantsData.BYTE_SIZE);
+            // Depth of zero is what the hit shader reads as "do not march", so the toggle needs no bit of
+            // its own: a disabled effect and a zero-depth one are the same surface.
+            boolean parallax = CausticaConfig.Rt.Parallax.ENABLED.value();
             new WorldPushConstantsData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
                     RtMaterialRegistry.INSTANCE.tableAddress(),
                     terrain.lightBufferAddress(), terrain.lightAliasBufferAddress(),
                     terrain.lightLocalAliasBufferAddress(), terrain.lightGridCellBufferAddress(),
                     terrain.lightGridSpanBufferAddress(), continuationQueue.deviceAddress,
-                    (int) frameCounter).write(pushConstants);
+                    (int) frameCounter,
+                    parallax ? CausticaConfig.Rt.Parallax.DEPTH.value() : 0f,
+                    CausticaConfig.Rt.Parallax.DISTANCE.value(),
+                    CausticaConfig.Rt.Parallax.STEPS.value(),
+                    CausticaConfig.Rt.Parallax.SMOOTHING.value()).write(pushConstants);
             // Sky LUTs, from the same WorldPush slot the trace is about to read: the sky the LUT holds and
             // the sky the frame shades are built from one set of angles, not two. Recorded here (after the
             // push flush, before the trace) so the miss shader's very first fetch sees this frame's dome.
@@ -1275,21 +1383,24 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to post-processing
 
-            // Crepuscular rays are a screen-space effect with no valid world motion, so they stay after
-            // temporal reconstruction. The enabled path performs half-res radial additive sampling and a
-            // full-res add; the disabled path is a 1:1 copy into the same canonical output, keeping every
-            // downstream descriptor stable while avoiding the expensive sample walk.
-            if (volumetricLightEnabled()) {
+            // The froxel volume carries its own temporal filter and has no valid per-pixel motion, so it
+            // stays after reconstruction. The enabled path injects, integrates, and composites the grid;
+            // the disabled path is a 1:1 copy into the same canonical output, keeping every downstream
+            // descriptor stable while avoiding the grid's cost entirely.
+            // Injection traces this frame's TLAS, the same one the path tracer just used, so the pass runs
+            // only once that structure exists; without it there is nothing to resolve occlusion against.
+            long volumetricTlas = currentTlasHandle;
+            if (volumetricLightEnabled() && volumetricTlas != 0L) {
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "volumetric light");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.volumetricLight")) {
-                    volumetricLightPipeline.dispatch(cmd, volumetricLightImage, postProcessOutput,
-                            pushBuf.deviceAddress,
-                            CausticaConfig.Rt.VolumetricLight.SAMPLES.value(),
-                            CausticaConfig.Rt.VolumetricLight.INTENSITY.value(),
-                            CausticaConfig.Rt.VolumetricLight.DENSITY.value(),
-                            CausticaConfig.Rt.VolumetricLight.DECAY.value());
+                    int parity = (int) (frameCounter & 1L);
+                    volumetricLightPipeline.dispatch(cmd, froxelScatter[parity], postProcessOutput,
+                            volumetricPush(pushBuf.deviceAddress), parity, volumetricTlas, graphicsUse);
                 }
             } else {
+                // Nothing wrote the grid this frame, so whatever it still holds belongs to an older
+                // camera and must not be blended into the next frame that turns the effect back on.
+                froxelHistoryValid = false;
                 VK10.vkCmdCopyImage(cmd, rrOutput.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                         postProcessOutput.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                         copyRegion(stack, displayW, displayH));

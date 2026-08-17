@@ -28,6 +28,17 @@ public struct WorldPushConstants {
     public uint64_t lightGridSpanAddr;   // packed weighted section spans referenced by cell headers
     public uint64_t pathQueueAddr;       // packed primary -> indirect continuation records
     public uint frameIndex;
+    // Parallax occlusion mapping of the LabPBR height channel, read by the closest-hit material path.
+    // Inline rather than behind worldPushAddr because the hit shader would otherwise dereference the
+    // whole per-frame block to decide whether to march at all. Depth is in blocks and zero disables the
+    // effect outright; distance is where it has finished fading back to a flat surface.
+    public float parallaxDepth;
+    public float parallaxDistance;
+    public uint  parallaxSteps;
+    // Strength of the height field's smoothing filter, 0 disabling it and its cost outright. The material
+    // pages are point-sampled to keep Minecraft's crisp texels, so the march otherwise descends a
+    // staircase of texel plateaus; that reads as relief at 16x and as terracing on a high-resolution pack.
+    public float parallaxSmoothing;
 };
 
 // Minimal push block for the compute passes that only need to dereference the frame's WorldPush: the sky
@@ -179,6 +190,10 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 // Set by world.rchit on a terrain hit whose prim carries TERRAIN_PRIM_IN_LIGHT_BUFFER: this emitter is
 // RIS-sampled, so raygen gates its direct-hit emission on diffuse continuation rays (no double count).
 public static const uint PAYLOAD_EMITTER_IN_LIST = 128u;
+// Set on a trace whose hit is the one the camera sees directly, so the closest hit knows it may pay for
+// parallax. Deliberately an input-only bit above every output bit the hit shader packs back: the hit
+// overwrites the whole flags word with its material result, so nothing downstream can see it.
+public static const uint PAYLOAD_PARALLAX = 256u;
 // Set by world.rchit on any dielectric hit (water or glass/ice): true when the incoming ray travels
 // against the prim's outward face normal (entering the volume), false when it exits. Derived from face
 // orientation rather than toggled, so a stray or missing face cannot corrupt the medium for the rest of
@@ -352,3 +367,9 @@ public float3 srgbToLinear(float3 color) {
     float3 hi = pow((color + 0.055) / 1.055, float3(2.4));
     return lerp(lo, hi, step(float3(0.04045), color));
 }
+
+// Water is a smooth dielectric; its absorption model lives in medium.slang, but the index of refraction
+// is needed outside the ray-tracing pipeline too — the volumetric passes refract the celestial light
+// through the surface above a submerged camera and must bend it by exactly the same amount the water
+// interface does.
+public static const float WATER_IOR = 1.333;
