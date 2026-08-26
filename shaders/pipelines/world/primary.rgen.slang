@@ -43,8 +43,12 @@ public PathSegment tracePrimary(PathSegment seg,
         PathSegment terminal = makePathSegment(ro, rd, throughput, medium,
                                                rayConeWidth, rayConeSpread, seed, bounce,
                                                showCelestial);
+        if (bounce == 0) {
+            gv_primaryParticle = false;
+            gv_transmittedSky = false;
+        }
         traceRadiance(CULL_PRIMARY, ro, 0.0, rd, 10000.0,
-                      showCelestial, rayConeWidth, rayConeSpread);
+                      showCelestial, bounce == 0, rayConeWidth, rayConeSpread);
 
         if (payload.hitT < 0.0) {
             if (bounce == 0) {
@@ -52,6 +56,8 @@ public PathSegment tracePrimary(PathSegment seg,
                 gv_albedo = SKY_DIFF_ALBEDO;
                 gv_emissive = false;
                 gv_rough = 1.0;
+                gv_primarySky = true;
+                gv_transmittedSky = false;
                 gv_hitCamRel = rd * 1.0e6;
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = float3(0.0, 0.0, 0.0);
@@ -76,6 +82,9 @@ public PathSegment tracePrimary(PathSegment seg,
             if (bounce == 0) {
                 gv_normal = n;
                 gv_hitCamRel = hitPos - worldPush.camOffset;
+                gv_primarySky = false;
+                gv_primaryParticle = material == MATERIAL_PARTICLE;
+                gv_transmittedSky = false;
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = payload.motionPrev;
                 gv_emissive = payloadEmission() > 0.0;
@@ -140,6 +149,8 @@ public PathSegment tracePrimary(PathSegment seg,
             gv_rough = 0.0;
             gv_albedo = float3(0.0, 0.0, 0.0);
             gv_emissive = false;
+            gv_primarySky = false;
+            gv_transmittedSky = false;
             gv_hitCamRel = hitPos - worldPush.camOffset;
             gv_motionUseRefracted = false;
             gv_motionObjDisp = isWater ? float3(0.0, 0.0, 0.0) : payload.motionPrev;

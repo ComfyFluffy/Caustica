@@ -1,17 +1,26 @@
 package dev.comfyfluffy.caustica.mixin;
 
 import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 
+import dev.comfyfluffy.caustica.client.CaptureSession;
+import dev.comfyfluffy.caustica.client.UltraScreenshot;
 import dev.comfyfluffy.caustica.rt.RtReflex;
 import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
+
+import java.io.File;
 
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * The Reflex per-frame sleep call must run at the very start of the frame, before input
@@ -30,7 +39,55 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class MinecraftMixin {
 	@Inject(method = "close", at = @At("HEAD"))
 	private void caustica$destroyUiOverlayBeforeRendererShutdown(CallbackInfo ci) {
+		UltraScreenshot.INSTANCE.shutdown();
 		RtUiOverlay.destroy();
+	}
+
+	@Inject(method = "handleGlobalKeyPress", at = @At("HEAD"), cancellable = true)
+	private void caustica$handleCaptureKeys(InputConstants.Key key, boolean controlDown,
+			CallbackInfoReturnable<Boolean> cir) {
+		Minecraft minecraft = (Minecraft) (Object) this;
+		if (!minecraft.options.keyDebugModifier.isDown() && UltraScreenshot.KEY.matches(key)) {
+			UltraScreenshot.INSTANCE.toggle(minecraft);
+			cir.setReturnValue(true);
+		}
+	}
+
+	/** Rejects panorama capture before vanilla mutates the camera, window, or render target. */
+	@WrapMethod(method = "grabPanoramixScreenshot(Ljava/io/File;)Lnet/minecraft/network/chat/Component;")
+	private Component caustica$guardPanorama(File directory, Operation<Component> original) {
+		if (CaptureSession.active()) {
+			return Component.translatable("caustica.status.ultraScreenshot.busy");
+		}
+		return original.call(directory);
+	}
+
+	@Inject(method = "startAttack", at = @At("HEAD"), cancellable = true)
+	private void caustica$suppressCaptureAttack(CallbackInfoReturnable<Boolean> cir) {
+		if (CaptureSession.active()) {
+			cir.setReturnValue(false);
+		}
+	}
+
+	@Inject(method = "continueAttack", at = @At("HEAD"), cancellable = true)
+	private void caustica$suppressCaptureAttackHold(boolean leftClick, CallbackInfo ci) {
+		if (CaptureSession.active()) {
+			ci.cancel();
+		}
+	}
+
+	@Inject(method = "startUseItem", at = @At("HEAD"), cancellable = true)
+	private void caustica$suppressCaptureUse(CallbackInfo ci) {
+		if (CaptureSession.active()) {
+			ci.cancel();
+		}
+	}
+
+	@Inject(method = "pickBlockOrEntity", at = @At("HEAD"), cancellable = true)
+	private void caustica$suppressCapturePick(CallbackInfo ci) {
+		if (CaptureSession.active()) {
+			ci.cancel();
+		}
 	}
 
 	@Inject(method = "runTick", at = @At("HEAD"))

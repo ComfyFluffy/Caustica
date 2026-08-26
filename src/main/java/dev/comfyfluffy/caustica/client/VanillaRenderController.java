@@ -31,7 +31,7 @@ public final class VanillaRenderController {
 		this.worldSkipped = false;
 		this.baseReady = false;
 		this.inactiveReason = null;
-		this.rtActive = RtComposite.enabled();
+		this.rtActive = rtRuntimeWorkRequested();
 
 		if (!Boolean.valueOf(this.rtActive).equals(this.lastLoggedRtActive)) {
 			this.lastLoggedRtActive = this.rtActive;
@@ -105,7 +105,7 @@ public final class VanillaRenderController {
 
 	/** Runtime work switch for per-frame RT work; mirrors {@link RtComposite#enabled()}. */
 	public static boolean rtRuntimeWorkRequested() {
-		return RtComposite.enabled();
+		return !CausticaClient.rtRestartRequired() && RtComposite.enabled();
 	}
 
 	public void markRtCompositeResult(boolean success) {

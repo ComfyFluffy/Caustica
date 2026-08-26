@@ -5,6 +5,7 @@ import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
+import dev.comfyfluffy.caustica.client.UltraScreenshot;
 import dev.comfyfluffy.caustica.client.VanillaRenderController;
 import dev.comfyfluffy.caustica.client.WorldRenderScaler;
 import dev.comfyfluffy.caustica.rt.RtComposite;
@@ -12,6 +13,7 @@ import dev.comfyfluffy.caustica.rt.RtReflex;
 import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 import dev.comfyfluffy.caustica.rt.overlay.RtWorldOverlay;
 import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.SubmitNodeStorage;
 import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
@@ -62,6 +64,7 @@ public abstract class GameRendererMixin {
 	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V", at = @At("TAIL"))
 	private void caustica$endRtFrameStats(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
 		RtComposite.INSTANCE.endFrame();
+		UltraScreenshot.INSTANCE.frameRendered(Minecraft.getInstance());
 	}
 
 	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V",
@@ -138,9 +141,9 @@ public abstract class GameRendererMixin {
 			return projection;
 		}
 
-		var cameraState = this.gameRenderState().levelRenderState.cameraRenderState;
-		RtComposite.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix,
-				cameraState.pos.x, cameraState.pos.y, cameraState.pos.z);
+        var cameraState = this.gameRenderState().levelRenderState.cameraRenderState;
+        RtComposite.INSTANCE.captureFrame(projection, cameraState.viewRotationMatrix,
+                cameraState.pos.x, cameraState.pos.y, cameraState.pos.z, cameraState.fogData);
 		VanillaRenderController.INSTANCE.markProjectionCaptured();
 		return projection;
 	}

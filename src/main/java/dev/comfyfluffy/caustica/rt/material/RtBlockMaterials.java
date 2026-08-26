@@ -296,9 +296,18 @@ public final class RtBlockMaterials {
     }
 
     public void bindPages(RtPipeline pipeline, long sampler) {
+        bindPages(sampler, pipeline);
+    }
+
+    /** Bind the same resource-epoch material pages into every world-compatible pipeline. */
+    public void bindPages(long sampler, RtPipeline... pipelines) {
         for (Page page : pages) {
-            pipeline.setMaterialPage(page.index(), page.surface0().view(), page.normalAo().view(),
-                    page.surface1().view(), sampler);
+            for (RtPipeline pipeline : pipelines) {
+                if (pipeline != null) {
+                    pipeline.setMaterialPage(page.index(), page.surface0().view(), page.normalAo().view(),
+                            page.surface1().view(), sampler);
+                }
+            }
         }
     }
 

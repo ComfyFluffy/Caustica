@@ -27,7 +27,9 @@ abstract class GenerateShaderRecords extends DefaultTask {
     abstract RegularFileProperty getProbeSource()
 
     @Input abstract Property<String> getSlangc()
+    @Input abstract Property<String> getSlangcContentHash()
     @Input abstract Property<String> getSpirvVal()
+    @Input abstract Property<String> getSpirvValContentHash()
     @OutputDirectory abstract DirectoryProperty getOutDir()
 
     @Inject abstract ExecOperations getExecOps()
@@ -297,6 +299,17 @@ abstract class GenerateShaderRecords extends DefaultTask {
         Map exposureStateType = exposureStateProbeArray.type.elementType as Map
         int exposureStateByteSize = exposureStateProbeArray.type.uniformStride as int
 
+        def structuredProbe = { String probeName, String structName ->
+            def probeParameter = reflection.parameters.find { it.name == probeName }
+            def array = probeParameter?.type?.resultType?.fields?.find { it.name == "values" }
+            if (array?.type?.kind != "array" || array.type.elementType?.name != structName) {
+                throw new GradleException("unexpected ${structName} reflection probe shape")
+            }
+            [type: array.type.elementType as Map, byteSize: array.type.uniformStride as int]
+        }
+        def sharcPush = structuredProbe("sharcPushLayoutProbe", "SharcPushConstants")
+        def sharcFrame = structuredProbe("sharcFrameLayoutProbe", "SharcFrame")
+
         def generatedRoot = outDir.get().asFile
         if (generatedRoot.exists() && !generatedRoot.deleteDir()) {
             throw new GradleException("failed to clear generated shader record sources under ${generatedRoot}")
@@ -309,6 +322,11 @@ abstract class GenerateShaderRecords extends DefaultTask {
                 generateJava(materialHeaderType, materialHeaderByteSize, "MaterialHeaderData"), "UTF-8")
         new File(packageDir, "ExposureStateData.java").setText(
                 generateJava(exposureStateType, exposureStateByteSize, "ExposureStateData", true), "UTF-8")
+
+        new File(packageDir, "SharcPushConstantsData.java").setText(
+                generateJava(sharcPush.type, sharcPush.byteSize, "SharcPushConstantsData"), "UTF-8")
+        new File(packageDir, "SharcFrameData.java").setText(
+                generateJava(sharcFrame.type, sharcFrame.byteSize, "SharcFrameData"), "UTF-8")
 
         PUSH_CONSTANT_PROBES.each { probeName, structName, className ->
             Map type = extractPushConstantType(reflection, probeName, structName)

@@ -10,6 +10,11 @@ module world_common;
 public typealias ConstPtr<T> = Ptr<T, Access.Read, AddressSpace.Device, Std430DataLayout>;
 public typealias DevicePtr<T> = Ptr<T, Access.ReadWrite, AddressSpace.Device, Std430DataLayout>;
 
+public static const uint SKYBOX_NONE = 0u;
+public static const uint SKYBOX_OVERWORLD = 1u;
+public static const uint SKYBOX_END = 2u;
+public static const uint SKY_FLAG_END_FLASH = 1u;
+
 // Push constant block. The hot inline lanes avoid dereferencing WorldPush for values that are read in
 // hit shaders or used for raygen control flow — every 64-bit device address lives here for exactly that
 // reason, rather than behind the worldPushAddr indirection. tableAddr/entityTableAddr/materialTableAddr
@@ -83,11 +88,28 @@ public struct WorldPush {
     public int4     lightGridDims;       // xyz dense grid dimensions, w reserved
     public uint     lightCount;       // packed Light records in pc.lightBufAddr
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
+    // NVIDIA DLSS mip-map bias: log2(render resolution / display resolution) - 1 while DLSS is active.
+    // Native rendering keeps this at zero; closest-hit consumes it in explicit SampleLevel LOD.
+    public float     mipMapBias;
     // Pre-exposure scalar applied to radiance at the outImage write
     // ONLY, so all light transport above stays in absolute scene units. Keeps stored fp16 values
     // near mid-grey at any scene brightness; the display pass divides it back out, so the two cancel
     // exactly and this cannot change the image. 1.0 disables it.
     public float    preExposure;
+    // Canonical sample progression. pathSampleBase advances once per per-pixel continuation sample;
+    // the two possible continuation leaves have independent branch roots instead of skipping Sobol indices.
+    // pathSampleEpoch changes whenever temporal history and the sequence cursor reset. Every valid RT
+    // dispatch has a nonzero pathSampleAddr -- initialization failure falls back outside RT.
+    public uint      pathSampleBase;
+    public uint      pathSampleEpoch;
+    public uint64_t  pathSampleAddr;
+    // Dimension-specific native sky state. Appended so the existing transport ABI stays stable for
+    // every field above; generated WorldPushData owns the padding and offsets.
+    public uint       skybox;          // SKYBOX_NONE, SKYBOX_OVERWORLD, or SKYBOX_END
+    public uint       skyFlags;        // SKY_FLAG_END_FLASH when the vanilla End flash is active
+    public float4     skyColor;        // captured vanilla sky/clear color, converted to linear BT.709
+    public float4     skyParams;       // reserved, flash intensity, flash X angle, flash Y angle
+    public float4     endFlashUv;      // celestials-atlas UV rect for end_flash
 };
 
 // 32-byte hot area-light record. Linear ACEScg radiance uses packed R11G11B10; the
@@ -176,6 +198,10 @@ public struct Payload {
 };
 
 public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
+// Marks the visible camera ray so the native End sky can be composited after DLSS-RR history.
+public static const uint PAYLOAD_PRIMARY_SKY = 256u;
+// Dynamic/entity and particle hits are view/animation dependent and must never own persistent SHaRC voxels.
+public static const uint PAYLOAD_SHARC_DYNAMIC = 512u;
 // Set by world.rchit on a terrain hit whose prim carries TERRAIN_PRIM_IN_LIGHT_BUFFER: this emitter is
 // RIS-sampled, so raygen gates its direct-hit emission on diffuse continuation rays (no double count).
 public static const uint PAYLOAD_EMITTER_IN_LIST = 128u;

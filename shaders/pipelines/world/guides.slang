@@ -20,6 +20,9 @@ public static float3 gv_albedo = float3(0.0, 0.0, 0.0);
 // without another material-ID image.
 public static bool gv_emissive = false;
 public static float gv_rough = 0.0;
+public static bool gv_primarySky = false;
+public static bool gv_primaryParticle = false;
+public static bool gv_transmittedSky = false;
 public static float3 gv_hitCamRel = float3(0.0, 0.0, 0.0);       // primary-surface hit position relative to the current camera
 public static bool gv_motionUseRefracted = false; // true when the MV tracks the refracted hit (its own reprojection delta)
 // World-space displacement of the motion-guide surface since the previous frame (0 for static
@@ -67,6 +70,15 @@ public SpecSurface makeSpecSurface(float3 camRel, float3 normal, float3 motionPr
 public float2 projectPrevNdc(float3 worldPos, out bool valid) {
     float4 clip = mul(worldPush.prevViewProj, float4(worldPos - worldPush.camOffset + worldPush.camDelta, 1.0));
     valid = clip.w > 0.0;
+    return valid ? clip.xy / clip.w : float2(0.0, 0.0);
+}
+
+// Project an infinite sky direction into the previous camera. W=0 intentionally removes camera
+// translation: an infinitely distant sky does not move when the camera walks, but it does move when
+// the camera rotates.
+public float2 projectPrevSkyNdc(float3 direction, out bool valid) {
+    float4 clip = mul(worldPush.prevViewProj, float4(direction, 0.0));
+    valid = clip.w > 0.0 && clip.w == clip.w && abs(clip.w) <= 1.0e20;
     return valid ? clip.xy / clip.w : float2(0.0, 0.0);
 }
 
@@ -146,7 +158,9 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
 }
 
 public void setTransmissionGuide(float3 hitCamRel, float3 motionPrev, float3 normal,
-                          float roughness, float3 diffuseAlbedo, bool emissive) {
+                          float roughness, float3 diffuseAlbedo, bool emissive, bool particle) {
+    gv_transmittedSky = false;
+    gv_primaryParticle = particle;
     gv_hitCamRel = hitCamRel;
     gv_motionObjDisp = motionPrev;
     gv_motionUseRefracted = true;
@@ -174,7 +188,8 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
         if (payload.hitT <= 0.0) {
             setTransmissionGuide((ro + direction * 1.0e6) - worldPush.camOffset,
                     float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0), 1.0,
-                    guideFilter * SKY_DIFF_ALBEDO, false);
+                    guideFilter * SKY_DIFF_ALBEDO, false, false);
+            gv_transmittedSky = true;
             return;
         }
 
@@ -189,7 +204,7 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
                     : hitAlbedo * (1.0 - clamp(payloadMetalness(), 0.0, 1.0));
             setTransmissionGuide(interfacePos - worldPush.camOffset, payload.motionPrev,
                     payloadNormal(), endpointRoughness, guideFilter * endpointAlbedo,
-                    payloadEmission() > 0.0);
+                    payloadEmission() > 0.0, material == MATERIAL_PARTICLE);
             return;
         }
         if (material != MATERIAL_WATER && material != MATERIAL_DIELECTRIC) return;
@@ -215,7 +230,7 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
             // Never let a TIR reflection become ordinary diffuse/depth.
             setTransmissionGuide(interfacePos - worldPush.camOffset,
                     isWater ? float3(0.0, 0.0, 0.0) : float3(payload.motionPrev),
-                    interfaceNormal, 0.0, float3(0.0, 0.0, 0.0), false);
+                    interfaceNormal, 0.0, float3(0.0, 0.0, 0.0), false, false);
             return;
         }
         if (!isWater && entering) {
@@ -242,36 +257,44 @@ public void writeGuides(int2 pix, float3 primaryDir, float2 jndc, float2 size, f
 
     // Hardware (non-linear, reversed-Z) depth for DLSS-RR + Frame Generation: project the camera-relative
     // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
-    // would write. Reversed-Z (near=1, far=0), so DLSS gets the DepthInverted flag; sky's far hit -> ~0.
+    // would write. Reversed-Z (near=1, far=0), so DLSS gets the DepthInverted flag. A primary sky miss
+    // is a far-plane guide, not a finite hit point: publish exact reversed-Z far depth.
     // Clear transmission uses destination depth so the entire ordinary tuple describes one layer.
-    float4 curClip = mul(worldPush.curViewProj, float4(gv_hitCamRel, 1.0));
-    float depth = curClip.w > 0.0 ? curClip.z / curClip.w : 0.0;
-
-    // Motion vector: reproject this guide point through the previous frame's view-projection.
-    // The primary ray was cast through the JITTERED ndc (jndc), so this hit's current screen position is
-    // jndc, NOT the pixel centre. Subtract jndc so the MV is jitter-free (= 0 when static), which is
-    // what DLSS expects with MVJittered unset. Scaled from NDC into render-pixel space.
-    // For a dynamic surface, previous-frame position is the current point minus its world-space
-    // displacement; subtracting gv_motionObjDisp de-cameras the MV.
-    float4 prevClip = mul(worldPush.prevViewProj,
-            float4(gv_hitCamRel + worldPush.camDelta - gv_motionObjDisp, 1.0));
-    float2 curNdc = jndc; // primary hit's current screen position is exactly the jittered ray ndc
-    // Transmitted content is its own feature: compare its previous and current projections rather than
-    // subtracting the primary interface's jittered NDC.
-    float4 curClipMotion = gv_motionUseRefracted
-            ? mul(worldPush.curViewProj, float4(gv_hitCamRel, 1.0))
-            : float4(0.0, 0.0, 0.0, 1.0); // unused; keeps the guard below uniform
-    // Guard both perspective divides the way the depth above does. A guide point can land behind either
-    // camera — most easily a transmitted destination seen at a grazing angle, or one that leaves the
-    // frustum as the camera turns — and w at or below zero turns the divide into an arbitrarily large
-    // vector that DLSS-RR reprojects with. No valid previous position exists in that case, so report no
-    // motion and let RR fall back instead of handing it garbage.
     float2 motion;
-    if (prevClip.w > 0.0 && (!gv_motionUseRefracted || curClipMotion.w > 0.0)) {
-        if (gv_motionUseRefracted) curNdc = curClipMotion.xy / curClipMotion.w;
-        motion = (prevClip.xy / prevClip.w - curNdc) * 0.5 * size;
-    } else {
+    float depth;
+    if (gv_transmittedSky) {
+        // A transmitted sky has no stable destination correspondence behind its foreground interface.
+        // Keep its ordinary motion invalid so RR cannot smear glass-to-sky pixels into splotches.
+        depth = 0.0;
         motion = float2(0.0, 0.0);
+    } else if (gv_primarySky) {
+        depth = 0.0;
+        bool previousSkyValid;
+        float2 previousSkyNdc = projectPrevSkyNdc(primaryDir, previousSkyValid);
+        motion = previousSkyValid
+                ? (previousSkyNdc - jndc) * 0.5 * size
+                : float2(0.0, 0.0);
+    } else {
+        float4 curClip = mul(worldPush.curViewProj, float4(gv_hitCamRel, 1.0));
+        bool clipWFinite = curClip.w > 0.0 && curClip.w == curClip.w && abs(curClip.w) <= 1.0e20;
+        float projectedDepth = clipWFinite ? curClip.z / curClip.w : 0.0;
+        bool depthValid = clipWFinite
+                && projectedDepth == projectedDepth && abs(projectedDepth) <= 1.0e20;
+        depth = depthValid ? clamp(projectedDepth, 0.0, 1.0) : 0.0;
+
+        // The primary ray was cast through the jittered NDC (jndc). Subtracting it keeps the
+        // motion guide jitter-free, which is required because MVJittered is not enabled.
+        float4 prevClip = mul(worldPush.prevViewProj,
+                float4(gv_hitCamRel + worldPush.camDelta - gv_motionObjDisp, 1.0));
+        float2 curNdc = jndc;
+        if (gv_motionUseRefracted) {
+            curNdc = depthValid ? curClip.xy / curClip.w : float2(0.0, 0.0);
+        }
+        if (prevClip.w > 0.0 && (!gv_motionUseRefracted || depthValid)) {
+            motion = (prevClip.xy / prevClip.w - curNdc) * 0.5 * size;
+        } else {
+            motion = float2(0.0, 0.0);
+        }
     }
 
     // Guide buffers: first-hit or coherently replaced attributes consumed by the denoiser/DLSS-RR.
@@ -281,4 +304,14 @@ public void writeGuides(int2 pix, float3 primaryDir, float2 jndc, float2 size, f
     gMotion[pix] = motion;
     gSpecAlbedo[pix] = float4(specAlbedo, 1.0);
     gSpecMotion[pix] = specMotion;
+    // Primary and transmitted sky have no stable surface correspondence; responsivity tells DLSSD not
+    // to reuse their history. Transmission replaces the ordinary guide tuple, so both sky branches must
+    // classify identically with the depth/motion invalidation above. Display needs a separate primary-sky
+    // classification because transmitted sky remains a visible foreground surface there.
+    // Particle classification prevents dynamic particle pixels from being accumulated as opaque terrain.
+    // Only a visible primary miss is eligible for native End-sky replacement. A transmitted sky stays
+    // a surface feature so the display pass cannot overwrite the foreground glass/water layer.
+    gResponsivity[pix] = (gv_primarySky || gv_transmittedSky) ? 1.0 : 0.0;
+    gSkyClassification[pix] = gv_primarySky ? 1.0 : 0.0;
+    gParticleMask[pix] = gv_primaryParticle ? 1u : 0u;
 }

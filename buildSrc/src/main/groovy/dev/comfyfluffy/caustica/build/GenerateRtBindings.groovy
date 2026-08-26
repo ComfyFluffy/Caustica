@@ -22,6 +22,7 @@ abstract class GenerateRtBindings extends DefaultTask {
     abstract DirectoryProperty getShaderRoot()
 
     @Input abstract Property<String> getSlangc()
+    @Input abstract Property<String> getSlangcContentHash()
     @OutputDirectory abstract DirectoryProperty getOutDir()
 
     @Inject abstract ExecOperations getExecOps()
@@ -31,12 +32,16 @@ abstract class GenerateRtBindings extends DefaultTask {
                     TLAS: "topLevelAS", OUTPUT: "outImage", BLOCK_ALBEDO: "blockAlbedoAtlas",
                     G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth", G_MOTION: "gMotion",
                     G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",
+                    G_RESPONSIVITY: "gResponsivity", G_PARTICLE_MASK: "gParticleMask",
+                    G_SKY_CLASSIFICATION: "gSkyClassification",
                     CELESTIALS: "celestialsAtlas", SKY_VIEW: "skyViewLut", TRANSMITTANCE: "transmittanceLut",
+                    END_SKY: "endSkyTexture",
                     ENTITY_ALBEDO: "entityAlbedoTex", MATERIAL_SURFACE0: "materialSurface0Tex",
                     MATERIAL_NORMAL_AO: "materialNormalAoTex", MATERIAL_SURFACE1: "materialSurface1Tex"]],
             [prefix: "DISPLAY", source: "pipelines/display/main.comp.slang", resources: [
                     OUTPUT: "outputImage", RT_IMAGE: "rtImage", EXPOSURE: "exposureImage", HDR_OUTPUT: "hdrImage",
-                    SDR_TONE_LUT: "toneLut", HDR_TONE_LUT: "hdrToneLut", LOOK_LUT: "lookLut", BLOOM: "bloomImage"]],
+                    SDR_TONE_LUT: "toneLut", HDR_TONE_LUT: "hdrToneLut", LOOK_LUT: "lookLut", BLOOM: "bloomImage",
+                    SKY_CLASSIFICATION: "skyClassificationImage", END_SKY: "endSkyTexture", CELESTIALS: "celestialsAtlas"]],
             [prefix: "DEBUG_PRESENT", source: "pipelines/debug_present/main.comp.slang", resources: [
                     OUTPUT: "outputImage", G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth",
                     G_MOTION: "gMotion", G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",

@@ -322,8 +322,8 @@ public abstract class VulkanGpuSurfaceMixin {
 	 */
 	@Inject(method = "blitFromTexture", at = @At("HEAD"), cancellable = true)
 	private void caustica$presentHdr(CommandEncoderBackend commandEncoder, GpuTextureView textureView, CallbackInfo ci) {
-		// The mastering peak is a live option and selects a different baked ACES output LUT without forcing
-		// swapchain recreation. Refresh the metadata once when that selected LUT changes.
+		// The mastering peak is a live option. ACES selects the nearest packaged LUT while analytical modes
+		// use the exact configured peak; neither requires swapchain recreation. Refresh metadata on change.
 		caustica$applyHdrMetadataIfNeeded();
 		if (this.currentImageIndex < 0) {
 			return;
@@ -357,7 +357,7 @@ public abstract class VulkanGpuSurfaceMixin {
 				|| !RtHdr.metadataExtensionEnabled() || this.swapchain == 0L) {
 			return;
 		}
-		int peakNits = CausticaConfig.Rt.Hdr.PEAK_NITS.value();
+		int peakNits = CausticaConfig.Rt.Hdr.effectivePeakNits();
 		if (this.caustica$metadataSwapchain == this.swapchain
 				&& this.caustica$metadataPeakNits == peakNits) {
 			return;

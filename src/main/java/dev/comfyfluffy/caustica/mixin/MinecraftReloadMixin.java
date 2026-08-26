@@ -1,6 +1,8 @@
 package dev.comfyfluffy.caustica.mixin;
 
 import dev.comfyfluffy.caustica.rt.RtComposite;
+import dev.comfyfluffy.caustica.client.UltraScreenshot;
+import net.minecraft.network.chat.Component;
 import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -24,6 +26,7 @@ import java.util.concurrent.CompletableFuture;
 public class MinecraftReloadMixin {
     @Inject(method = "reloadResourcePacks()Ljava/util/concurrent/CompletableFuture;", at = @At("HEAD"))
     private void caustica$rtReloadStart(CallbackInfoReturnable<CompletableFuture<Void>> cir) {
+        UltraScreenshot.INSTANCE.abort(Component.translatable("caustica.status.ultraScreenshot.invalidated"));
         RtComposite.INSTANCE.onResourceReloadStart();
     }
 }

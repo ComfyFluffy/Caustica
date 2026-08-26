@@ -1,12 +1,16 @@
 package dev.comfyfluffy.caustica.mixin;
 
 import dev.comfyfluffy.caustica.CausticaConfig;
+import dev.comfyfluffy.caustica.client.RtSharcOptionsScreen;
 import dev.comfyfluffy.caustica.client.RtVideoOptions;
 import java.util.ArrayList;
 import java.util.List;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Options;
+import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.OptionsList;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.options.VideoSettingsScreen;
 import net.minecraft.network.chat.Component;
 import org.spongepowered.asm.mixin.Mixin;
@@ -69,6 +73,19 @@ public abstract class VideoSettingsScreenMixin {
         }
         list.addHeader(CAUSTICA$RT_HEADER);
         list.addSmall(RtVideoOptions.runtimeOptions());
+        Minecraft minecraft = Minecraft.getInstance();
+        list.addSmall(
+                RtVideoOptions.debugView().createButton(minecraft.options),
+                RtVideoOptions.toneMappingButton(
+                        (Screen) (Object) this,
+                        () -> {
+                            list.applyUnsavedChanges();
+                            CausticaConfig.save();
+                        }));
+        list.addSmall(List.of(Button.builder(
+                Component.translatable("caustica.options.rt.sharcMenu.open"), button ->
+                        minecraft.setScreenAndShow(new RtSharcOptionsScreen((Screen) (Object) this)))
+                .build()));
     }
 
     @Inject(method = "removed", at = @At("TAIL"))

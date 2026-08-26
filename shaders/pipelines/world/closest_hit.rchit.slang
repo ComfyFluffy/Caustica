@@ -46,6 +46,11 @@ float2 texSizePx(Sampler2D t) {
     return float2(w, h);
 }
 
+float causticaMipMapBias() {
+    float bias = ConstPtr<WorldPush>(pc.worldPushAddr)[0].mipMapBias;
+    return bias == bias && abs(bias) <= 16.0 ? bias : 0.0;
+}
+
 float rayConeHitWidth(uint rayCone) {
     float2 cone = unpackHalf2(rayCone);
     return max(cone.x + cone.y * max(RayTCurrent(), 0.0), RAY_CONE_MIN_WIDTH);
@@ -64,12 +69,12 @@ float rayConeTextureLod(uint rayCone, float2 textureSizePx, float3 p0, float3 p1
             max(edgeTexelsPerWorld(p1, p2, uv1, uv2, textureSizePx),
                 edgeTexelsPerWorld(p2, p0, uv2, uv0, textureSizePx)));
     float footprint = max(rayConeHitWidth(rayCone) * texelsPerWorld, RAY_CONE_MIN_TEXEL_FOOTPRINT);
-    return clamp(log2(footprint), 0.0, RAY_CONE_MAX_LOD);
+    return clamp(log2(footprint) + causticaMipMapBias(), 0.0, RAY_CONE_MAX_LOD);
 }
 
 float rayConeUnitUvLod(uint rayCone, float2 textureSizePx) {
     float footprint = max(rayConeHitWidth(rayCone) * max(textureSizePx.x, textureSizePx.y), RAY_CONE_MIN_TEXEL_FOOTPRINT);
-    return clamp(log2(footprint), 0.0, RAY_CONE_MAX_LOD);
+    return clamp(log2(footprint) + causticaMipMapBias(), 0.0, RAY_CONE_MAX_LOD);
 }
 
 // LabPBR _n decode (shared): rotate the tangent-space normal into world space via a TBN built from the
@@ -243,9 +248,9 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         packAlbedo(payload, bt709ToAcesCg(particleAlbedo709));
         packNormal(payload, pn);
         payload.hitT = RayTCurrent();
-        // Per-particle motion vector: interpolate the captured per-vertex displacement (uniform across
-        // the billboard's verts) with the same indices/barycentrics as the UV. dispAddr == 0 falls back
-        // to rigidDisp, which particles write as zero.
+        // Per-particle motion vector: interpolate captured per-vertex displacement with the same
+        // indices/barycentrics as the UV. dispAddr == 0 falls back to rigidDisp, which particles write
+        // as zero.
         if (g.dispAddr != 0) {
             ConstPtr<float4> pd = ConstPtr<float4>(g.dispAddr);
             payload.motionPrev = half3(pbary.x * pd[p0].xyz + pbary.y * pd[p1].xyz + pbary.z * pd[p2].xyz);
@@ -255,6 +260,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         payload.f0 = half3(0.0h, 0.0h, 0.0h);
         payloadSetPacked(payload, MATERIAL_PARTICLE, 1.0, 0.0, 0.0, 0.0,
                 1.0, 0.0, EMISSION_SOURCE_NONE);
+        payload.flags |= PAYLOAD_SHARC_DYNAMIC;
         return;
     }
     // Dynamic entities: instances with this custom-index flag bit carry real captured ModelPart
@@ -323,6 +329,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
                 emission, sss, header.params.z, header.params.w,
                 materialEmissionSource(header, emission));
         payloadSetDielectric(payload, material, entering);
+        payload.flags |= PAYLOAD_SHARC_DYNAMIC;
         return;
     }
 

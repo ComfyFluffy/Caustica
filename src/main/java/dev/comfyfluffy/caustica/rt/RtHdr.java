@@ -19,7 +19,7 @@ import dev.comfyfluffy.caustica.CausticaMod;
  * HDR display support — capability detection/logging plus static mastering metadata for PQ swapchains.
  * Surface enumeration tells the swapchain-ownership code whether HDR10 is available on the current driver,
  * window system, compositor, and monitor; {@code VK_EXT_hdr_metadata}, when supported, describes the
- * Rec.2020/D65 ACES virtual mastering display to that presentation stack.
+ * selected Rec.2020/D65 virtual mastering display to that presentation stack.
  *
  * <p>Extended color spaces are reported only when the instance enables
  * {@code VK_EXT_swapchain_colorspace}. {@code VulkanInstanceMixin} enables it when available; this class
@@ -77,10 +77,10 @@ public final class RtHdr {
     /**
      * Assigns SMPTE ST 2086 / CTA-861.3 static metadata to one PQ swapchain.
      *
-     * <p>The ACES HDR output LUT is a Rec.2020/D65 virtual master capped at one of the baked mastering
-     * peaks, so that peak is both the mastering-display maximum and MaxCLL. MaxFALL cannot be known without
-     * analysing every rendered frame; Vulkan explicitly permits unknown fields to be zero, which is more
-     * truthful than inventing a scene-average value.
+     * <p>The active HDR output transform supplies the Rec.2020/D65 virtual master peak, so metadata matches
+     * the actual displayed transform. ACES 2.0 uses the nearest packaged LUT peak; analytical modes use the
+     * exact configured peak. MaxFALL cannot be known without analysing every rendered frame; Vulkan explicitly
+     * permits unknown fields to be zero, which is more truthful than inventing a scene-average value.
      */
     public static boolean applyMasteringMetadata(VkDevice device, long swapchain, int masteringPeakNits) {
         if (!hdrMetadataExtensionEnabled || swapchain == 0L) {
@@ -136,9 +136,10 @@ public final class RtHdr {
     /** Logs the resolved HDR config once (cheap; safe to call repeatedly — guarded by the surface log). */
     public static void logConfig() {
         CausticaMod.LOGGER.info(
-                "HDR config: enabled={} ui={}nits peak={}nits -> {}",
+                "HDR config: enabled={} ui={}nits requestedPeak={}nits effectivePeak={}nits -> {}",
                 CausticaConfig.Rt.Hdr.enabled(),
                 CausticaConfig.Rt.Hdr.UI_NITS.value(), CausticaConfig.Rt.Hdr.PEAK_NITS.value(),
+                CausticaConfig.Rt.Hdr.effectivePeakNits(),
                 CausticaConfig.Rt.Hdr.enabled() ? "HDR display path active" : "SDR display path");
     }
 

@@ -15,9 +15,11 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.InvalidateRenderStateCallback;
+import net.minecraft.network.chat.Component;
 
 public final class CausticaClient implements ClientModInitializer {
 	private static boolean rtInitDone = false;
+	private static boolean rtRestartRequired = false;
 
 	@Override
 	public void onInitializeClient() {
@@ -32,9 +34,12 @@ public final class CausticaClient implements ClientModInitializer {
 		// The GpuDevice exists well before the first tick, so a one-shot at tick start
 		// runs on the render thread with the device idle between frames.
 		ClientTickEvents.START_CLIENT_TICK.register(client -> {
+			if (rtRestartRequired) {
+				return;
+			}
 			if (!VanillaRenderController.rtRuntimeWorkRequested()) {
 				if (rtInitDone) {
-					shutdownRt();
+					shutdownRt(false);
 				}
 				return;
 			}
@@ -57,7 +62,9 @@ public final class CausticaClient implements ClientModInitializer {
 					// material flags resolve from the first section (PBR on join, no re-extract). No-op
 					// until we're in a world with the block atlas loaded, or once already created.
 					RtComposite.INSTANCE.ensureResourcesReady(ctx);
-					RtTerrain.update(ctx);
+					if (!CaptureSession.active()) {
+						RtTerrain.update(ctx);
+					}
 					// Log DLSS-FG availability once when frame generation is enabled (capability query only;
 					// the present-loop integration that consumes it is built separately).
 					if (dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.enabled()) {
@@ -72,17 +79,26 @@ public final class CausticaClient implements ClientModInitializer {
 		// world. Fixes stale geometry persisting across an End→Overworld switch (coords alone aren't
 		// world-unique). Resource reloads do NOT fire this; that path is handled separately.
 		InvalidateRenderStateCallback.EVENT.register(() -> {
+			UltraScreenshot.INSTANCE.abort(
+					Component.translatable("caustica.status.ultraScreenshot.invalidated"));
 			RtTerrain.requestFullClear();
 			RtComposite.INSTANCE.resetExposureHistory();
 			RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
 		});
 
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
-			shutdownRt();
+			shutdownRt(true);
 		});
 	}
 
-	private static void shutdownRt() {
+	private static void shutdownRt(boolean finalClientStop) {
+		if (finalClientStop) {
+			UltraScreenshot.INSTANCE.shutdown();
+		} else {
+			// A temporary RT teardown must not release a pending vanilla PNG write. Its callback
+			// remains the owner of the shared lease, preventing a second capture after RT restarts.
+			UltraScreenshot.INSTANCE.stopRenderer();
+		}
 		WorldRenderScaler.INSTANCE.destroy();
 		RtUiOverlay.destroy(); // GUI redirect is not gated by rtInitDone; always release its TextureTarget
 		if (!rtInitDone) {
@@ -100,7 +116,7 @@ public final class CausticaClient implements ClientModInitializer {
 		if (ctx != null) {
 			RtEntities.INSTANCE.shutdown();
 		}
-		RtComposite.INSTANCE.destroy();
+		boolean rrReleased = RtComposite.INSTANCE.destroy();
 		RtEntityTextures.INSTANCE.reset();
 		RtBlockMaterials.INSTANCE.destroy();
 		dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.destroy();
@@ -108,11 +124,26 @@ public final class CausticaClient implements ClientModInitializer {
 			dev.comfyfluffy.caustica.rt.RtFramePresenter.INSTANCE.destroy(ctx.device());
 			dev.comfyfluffy.caustica.rt.RtReflex.INSTANCE.destroy(ctx.device().vkDevice());
 		}
-		// Shut NGX down once, after every feature (RR + FG) has been released above.
-		dev.comfyfluffy.caustica.ngx.NgxRuntime.INSTANCE.shutdown();
-		if (ctx != null) {
+		// NGX and the Vulkan device may be destroyed only after every native feature released its owner.
+		boolean ngxReleased = rrReleased
+				&& dev.comfyfluffy.caustica.ngx.NgxRuntime.INSTANCE.shutdown();
+		boolean restartRequired = teardownRequiresRestart(rrReleased, ngxReleased);
+		if (ctx != null && !restartRequired) {
 			ctx.destroy();
 		}
 		rtInitDone = false;
+		if (restartRequired) {
+			rtRestartRequired = true;
+			CausticaMod.LOGGER.error("RT teardown retained native NGX ownership; restart is required");
+		}
+	}
+
+	static boolean teardownRequiresRestart(boolean rrReleased, boolean ngxReleased) {
+		return !rrReleased || !ngxReleased;
+	}
+
+	/** Native teardown ownership failures keep RT off until process restart. */
+	public static boolean rtRestartRequired() {
+		return rtRestartRequired;
 	}
 }

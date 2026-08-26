@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/**"
       - "build.gradle"
+      - "buildSrc/**"
       - "settings.gradle"
       - "gradle.properties"
       - "gradle/**"
@@ -15,10 +16,12 @@ on:
       - "native/**"
       - "shaders/**"
       - "src/**"
+      - "THIRD_PARTY_NOTICES.md"
   pull_request:
     paths:
       - ".github/workflows/**"
       - "build.gradle"
+      - "buildSrc/**"
       - "settings.gradle"
       - "gradle.properties"
       - "gradle/**"
@@ -27,10 +30,13 @@ on:
       - "native/**"
       - "shaders/**"
       - "src/**"
+      - "THIRD_PARTY_NOTICES.md"
 
 env:
-  DLSS_SDK_REF: v310.7.0
+  DLSS_SDK_REF: a291cc7d2cc642a51566f3dfd5376f635cd1b284
   DLSS_SDK_PATH: third_party/DLSS
+  SHARC_SDK_REF: e19ccacd511f42a3df6f850052d508c13c9e9737
+  SHARC_SDK_PATH: third_party/SHARC
   NGX_SHIM_CONFIG: release
   NGX_VENDOR_CONFIG: rel
   VULKAN_SDK_VERSION: 1.4.350.0
@@ -138,6 +144,13 @@ jobs:
           ref: ${{ env.DLSS_SDK_REF }}
           path: ${{ env.DLSS_SDK_PATH }}
 
+      - name: Checkout SHARC SDK
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA-RTX/SHARC
+          ref: ${{ env.SHARC_SDK_REF }}
+          path: ${{ env.SHARC_SDK_PATH }}
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -174,6 +187,8 @@ jobs:
       - name: Build bundled jar
         env:
           DLSS_SDK: ${{ github.workspace }}/${{ env.DLSS_SDK_PATH }}
+          SHARC_SDK: ${{ github.workspace }}/${{ env.SHARC_SDK_PATH }}
+          SHARC_LICENSE_ACCEPTED: "true"
         run: >
           bash ./gradlew build
           -PngxPlatforms=windows-x64,linux-x64

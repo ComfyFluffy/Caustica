@@ -928,14 +928,16 @@ public final class RtAccel {
         private final RtBuffer scratch;
         private final int instanceCount;
         private final String label;
+        private final TlasRing.Slot slot;
 
         private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount,
-                             String label) {
+                             String label, TlasRing.Slot slot) {
             this.accel = accel;
             this.instanceBuffer = instanceBuffer;
             this.scratch = scratch;
             this.instanceCount = instanceCount;
             this.label = label;
+            this.slot = slot;
         }
     }
 
@@ -1009,7 +1011,12 @@ public final class RtAccel {
         }
         slot.graphicsUse.mark(graphicsUse);
         return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
-                "frame TLAS " + count + " instances");
+                "frame TLAS " + count + " instances", slot);
+    }
+
+    /** Extends a retained TLAS slot's lifetime through another graphics submission without rebuilding it. */
+    public static void markTlasUsed(PreparedTlas tlas, GraphicsUse graphicsUse) {
+        tlas.slot.graphicsUse.mark(graphicsUse);
     }
 
     // Wrap the mapped Vulkan array in LWJGL structs so its generated accessors own the native ABI/bitfields.

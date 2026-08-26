@@ -73,10 +73,36 @@ public struct DisplayPush {
     public float hdrPeakNits;   // mastering peak baked into the currently bound HDR ACES LUT
     public int lookEnabled;     // 0 = identity, 1 = apply the scene-referred ACES look LUT
     public float lookLutSize;   // lookLut texels per axis (independent of the output-transform LUT size)
-    // Scene-referred blurred highlight signal added before the LMT. The bloom pyramid's level 0 holds the
-    // SUM of every band, so RtComposite folds the 1/levelCount normalisation into this value: the authored
-    // look-package strength then means the same thing whichever level count the resolution supports.
+    // Scene-referred blurred highlight signal added before display rendering. The bloom pyramid's level 0
+    // holds the SUM of every band, so RtComposite folds the 1/levelCount normalisation into this value: the
+    // authored look-package strength then means the same thing whichever level count the resolution supports.
     public float bloomStrength;
+    public int sdrMode;         // 0 = ACES 2.0 LUT; positive values select local analytical operators
+    public int hdrMode;         // 0 = ACES 2.0 LUT; 2 = PsychoV24; 3 = BT.2390
+    public float paperWhiteNits;
+    public float headroom;
+    public float sdrParam0;
+    public float sdrParam1;
+    public float sdrParam2;
+    public float sdrParam3;
+    public float sdrParam4;
+    public float sdrParam5;
+    public float sdrParam6;
+    public float sdrParam7;
+    public float hdrParam0;
+    public float hdrParam1;
+    public float hdrParam2;
+    public float hdrParam3;
+    public float hdrParam4;
+    public float hdrParam5;
+    public float hdrParam6;
+    public float hdrParam7;
+    public float4 skyColor;          // captured vanilla sky/clear color in linear BT.709
+    public float4x4 invViewProj;     // unjittered camera-relative inverse projection
+    public uint skybox;              // SKYBOX_NONE, SKYBOX_OVERWORLD, or SKYBOX_END
+    public uint skyFlags;            // SKY_FLAG_END_FLASH when the vanilla End flash is active
+    public float4 skyParams;         // reserved, flash intensity, flash X angle, flash Y angle
+    public float4 endFlashUv;        // celestials-atlas UV rect for end_flash
 };
 
 public struct BloomPush {

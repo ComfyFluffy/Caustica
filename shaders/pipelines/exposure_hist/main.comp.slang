@@ -24,7 +24,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint groupIndex : SV_GroupInde
     localBins[512u + groupIndex] = 0u;
     GroupMemoryBarrierWithGroupSync();
 
-    int2 pix = int2(dispatchId.xy * pc.stride);
+    uint stride = max(pc.stride, 1u);
+    int2 pix = int2(dispatchId.xy * stride);
     uint w, h;
     colorImage.GetDimensions(w, h);
     if (pix.x < int(w) && pix.y < int(h)) {

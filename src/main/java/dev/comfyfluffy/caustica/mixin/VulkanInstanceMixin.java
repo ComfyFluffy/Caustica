@@ -3,6 +3,7 @@ package dev.comfyfluffy.caustica.mixin;
 import com.llamalad7.mixinextras.sugar.Local;
 import com.mojang.blaze3d.vulkan.VulkanInstance;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.ngx.NgxRuntime;
 import dev.comfyfluffy.caustica.rt.VulkanDiagnostics;
 import java.util.Set;
 import org.lwjgl.vulkan.VkInstanceCreateInfo;
@@ -15,10 +16,9 @@ import org.spongepowered.asm.mixin.injection.ModifyArg;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Enables {@code VK_EXT_swapchain_colorspace} at instance creation when the platform supports it. The
- * extension exposes extended/HDR color spaces to {@code vkGetPhysicalDeviceSurfaceFormatsKHR}, allowing
- * {@code VulkanGpuSurfaceMixin} to select an HDR10/PQ swapchain pair. The extension only adds color-space
- * enum values; swapchain creation still explicitly chooses the active pair.
+ * Adds Caustica's supported Vulkan instance extensions before instance creation. Swapchain colorspace
+ * exposes HDR color spaces to {@code vkGetPhysicalDeviceSurfaceFormatsKHR}; NGX requirements come from the
+ * selected shim so its instance and device contracts stay in sync.
  *
  * <p>Gated on availability — requesting an unsupported instance extension would fail {@code vkCreateInstance}
  * and crash startup.
@@ -41,6 +41,8 @@ public abstract class VulkanInstanceMixin {
 		} else {
 			CausticaMod.LOGGER.warn("Instance extension {} unavailable; HDR color spaces will not be queryable on this platform", SWAPCHAIN_COLORSPACE);
 		}
+		NgxRuntime.INSTANCE.negotiateRequiredExtensions(false, this.enabledExtensions,
+				availableExtensions::contains);
 	}
 
 	@ModifyArg(

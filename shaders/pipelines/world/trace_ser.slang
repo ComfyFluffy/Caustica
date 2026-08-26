@@ -18,9 +18,10 @@ import trace;
 // across the one point where SER must spill every live value. Rebuilding costs a few constant moves and
 // leaves only these two words spanning the reorder.
 public void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 rd, float tmax,
-                            bool showCelestial, float rayConeWidth, float rayConeSpread,
+                            bool showCelestial, bool primarySky, float rayConeWidth, float rayConeSpread,
                             uint pathPhaseHint) {
-    uint flags = showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u;
+    uint flags = (showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u)
+            | (primarySky ? PAYLOAD_PRIMARY_SKY : 0u);
     uint rayCone = packHalf2(float2(rayConeWidth, rayConeSpread));
     Payload tracePayload = makeRadiancePayload(flags, rayCone);
     HitObject hObj = HitObject::TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask,

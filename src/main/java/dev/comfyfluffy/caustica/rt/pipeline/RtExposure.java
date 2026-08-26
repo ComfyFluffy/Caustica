@@ -41,8 +41,12 @@ public final class RtExposure {
     private ExposureCurve cachedCurve;
     private boolean resetRequested = true;
     private int resetSequence;
+    private Mode previousMode;
     /** This frame's latched pre-exposure; see {@link #beginFrame(RtGpuExecutor.GraphicsUseWaiter)}. */
     private float framePreExposure = 1.0f;
+    /** Immutable pre-exposure used by every frame in one finite screenshot capture. */
+    private float capturePreExposure = 1.0f;
+    private boolean captureFrozen;
 
     private static final long DIAG_LOG_INTERVAL_NANOS = 1_000_000_000L;
     private static final int STATE_READBACK_RING = 6;
@@ -70,6 +74,22 @@ public final class RtExposure {
         return state;
     }
 
+    /** Freeze the current display exposure for a finite multi-frame capture. */
+    public void beginCapture() {
+        capturePreExposure = framePreExposure;
+        captureFrozen = true;
+    }
+
+    /** Release the capture latch after the screenshot readback has been scheduled. */
+    public void endCapture() {
+        captureFrozen = false;
+        capturePreExposure = 1.0f;
+    }
+
+    public boolean captureFrozen() {
+        return captureFrozen;
+    }
+
     /** Immutable exposure values attached to a residual-exposed EXR capture. */
     public record CaptureMetadata(
             float preExposure,
@@ -79,8 +99,7 @@ public final class RtExposure {
             float evScene,
             float evTarget,
             float evApplied
-    ) {
-    }
+    ) {}
 
     /**
      * Snapshot the controller after the capture copy has completed.
@@ -153,6 +172,9 @@ public final class RtExposure {
 
     public void record(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack,
                        RtImage traceColor, RtImage guideDepth, RtImage guideAlbedo) {
+        if (captureFrozen) {
+            return;
+        }
         if (image == null) {
             throw new IllegalStateException("RT exposure image not created");
         }
@@ -201,6 +223,9 @@ public final class RtExposure {
         pendingStateReadback = null;
         completedState = null;
         framePreExposure = 1.0f;
+        capturePreExposure = 1.0f;
+        captureFrozen = false;
+        previousMode = null;
     }
 
     // Manual mode's exposure scale, also used as the auto-history seed (resetAutoHistory) so the very
@@ -232,7 +257,7 @@ public final class RtExposure {
      * consumed until its graphics timeline value completes, so the host never races the live storage buffer.
      */
     public void recordStateReadback(VkCommandBuffer cmd, MemoryStack stack) {
-        if (mode() != Mode.AUTO || pendingStateReadback == null) {
+        if (captureFrozen || mode() != Mode.AUTO || pendingStateReadback == null) {
             return;
         }
         VkBufferMemoryBarrier.Buffer toTransfer = VkBufferMemoryBarrier.calloc(1, stack);
@@ -382,9 +407,13 @@ public final class RtExposure {
                 + ", emissiveCap=" + autoConfig.emissiveWeightCap
                 + ", curve=" + CausticaConfig.Rt.Exposure.curve() + ")"
                 : Float.toString(manualExposureScale());
+        RtToneMapping.Settings toneMapping = RtToneMapping.current();
         CausticaMod.LOGGER.info("RT display exposure: mode={}, exposure={}, "
-                        + "tonemap=aces2.0(lookPackage={},gamma={}), DLSS-RR exposure=NGX auto",
-                mode.configName, exposureText, RtLookPackage.current().id(),
+                        + "tonemap=sdr:{},hdr:{}(lookPackage={},paperWhiteNits={},gamma={}), DLSS-RR exposure=NGX auto",
+                mode.configName, exposureText,
+                RtToneMapping.SdrMode.parse(CausticaConfig.Rt.Sdr.TONE_MAPPER.get()).canonicalName(),
+                RtToneMapping.HdrMode.parse(CausticaConfig.Rt.Hdr.TONE_MAPPER.get()).canonicalName(),
+                RtLookPackage.current().id(), toneMapping.paperWhiteNits(),
                 CausticaConfig.Rt.Tonemap.GAMMA.value());
     }
 
@@ -397,6 +426,9 @@ public final class RtExposure {
     }
 
     private AutoConfig autoConfig() {
+        PercentileWindow percentiles = PercentileWindow.sanitize(
+                CausticaConfig.Rt.Exposure.LOW_PERCENTILE.value(),
+                CausticaConfig.Rt.Exposure.HIGH_PERCENTILE.value());
         return new AutoConfig(
                 CausticaConfig.Rt.Exposure.KEY.value(),
                 CausticaConfig.Rt.Exposure.minEv(),
@@ -404,8 +436,8 @@ public final class RtExposure {
                 CausticaConfig.Rt.Exposure.ADAPT_DARKEN.value(),
                 CausticaConfig.Rt.Exposure.ADAPT_BRIGHTEN.value(),
                 manualEv(),
-                CausticaConfig.Rt.Exposure.LOW_PERCENTILE.value(),
-                CausticaConfig.Rt.Exposure.HIGH_PERCENTILE.value(),
+                percentiles.low(),
+                percentiles.high(),
                 CausticaConfig.Rt.Exposure.STRIDE.value(),
                 CausticaConfig.Rt.Exposure.CENTER_WEIGHT_SIGMA.value(),
                 CausticaConfig.Rt.Exposure.CENTER_WEIGHT_FLOOR.value(),
@@ -426,7 +458,14 @@ public final class RtExposure {
      * ensures both consumers use one prediction; the residual absorbs whatever it failed to predict.
      */
     public void beginFrame(RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter) {
+        if (captureFrozen) {
+            return;
+        }
         Mode currentMode = mode();
+        if (modeTransitionRequiresReset(previousMode, currentMode)) {
+            requestReset();
+        }
+        previousMode = currentMode;
         boolean reset = currentMode == Mode.AUTO && resetRequested;
         if (reset) {
             resetSequence++;
@@ -469,7 +508,7 @@ public final class RtExposure {
      * no fence is needed. 1.0 disables the mechanism.
      */
     public float preExposure() {
-        return framePreExposure;
+        return captureFrozen ? capturePreExposure : framePreExposure;
     }
 
     private float computePreExposure() {
@@ -489,7 +528,7 @@ public final class RtExposure {
         // truncate -- silently de-centring exactly the case pre-exposure exists to handle. The
         // controller's own minEv/maxEv already bound this value; here we only reject garbage.
         float previous = completedState.previous();
-        return Float.isFinite(previous) && previous > 0.0f ? previous : 1.0f;
+        return sanitizePreExposure(previous);
     }
 
     private ByteBuffer stateDataBuffer() {
@@ -512,8 +551,50 @@ public final class RtExposure {
          * unit convention's offset applies.
          */
         float evOffset() {
-            return RtSceneUnits.EV100_OFFSET - (float) (Math.log(Math.max(preExposure, 1.0e-12f)) / Math.log(2.0));
+            return ev100Offset(preExposure);
         }
+    }
+
+    static float ev100Offset(float preExposure) {
+        float safePreExposure = sanitizePreExposure(preExposure);
+        return RtSceneUnits.EV100_OFFSET
+                - (float) (Math.log(safePreExposure) / Math.log(2.0));
+    }
+
+    private static float sanitizePreExposure(float value) {
+        return Float.isFinite(value) && value > 0.0f ? value : 1.0f;
+    }
+
+    record PercentileWindow(float low, float high) {
+        private static final float DEFAULT_LOW = 0.50f;
+        private static final float DEFAULT_HIGH = 0.95f;
+
+        static PercentileWindow sanitize(float low, float high) {
+            low = sanitizeValue(low, DEFAULT_LOW);
+            high = sanitizeValue(high, DEFAULT_HIGH);
+            if (high < low) {
+                float swap = low;
+                low = high;
+                high = swap;
+            }
+            if (!(low < high)) {
+                if (low >= 1.0f) {
+                    low = Math.nextDown(1.0f);
+                    high = 1.0f;
+                } else {
+                    high = Math.nextUp(low);
+                }
+            }
+            return new PercentileWindow(low, high);
+        }
+
+        private static float sanitizeValue(float value, float fallback) {
+            return Float.isFinite(value) ? Math.clamp(value, 0.0f, 1.0f) : fallback;
+        }
+    }
+
+    static boolean modeTransitionRequiresReset(Mode previous, Mode current) {
+        return previous != null && previous != current && current == Mode.AUTO;
     }
 
     private ExposureCurve curveConfig() {
@@ -624,7 +705,7 @@ public final class RtExposure {
         }
     }
 
-    private enum Mode {
+    enum Mode {
         MANUAL("manual"),
         AUTO("auto");
 

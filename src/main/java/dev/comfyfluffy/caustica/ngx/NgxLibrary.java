@@ -18,8 +18,10 @@ import java.nio.file.Path;
  * Vulkan handles (as {@code long} addresses).
  */
 public final class NgxLibrary {
+	private static final int ABI_VERSION = 1;
 	private static final Linker LINKER = Linker.nativeLinker();
 
+	private final MethodHandle abiVersion;
 	private final MethodHandle requiredExtensions;
 	private final MethodHandle init;
 	private final MethodHandle dlssAvailable;
@@ -39,6 +41,8 @@ public final class NgxLibrary {
 	private final MethodHandle lastResult;
 
 	private NgxLibrary(SymbolLookup lookup) {
+		this.abiVersion = handle(lookup, "ngxshim_abi_version",
+				FunctionDescriptor.of(ValueLayout.JAVA_INT));
 		// int ngxshim_required_extensions(int wantDevice, char* outBuf, int bufLen)
 		this.requiredExtensions = handle(lookup, "ngxshim_required_extensions",
 				FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
@@ -79,10 +83,11 @@ public final class NgxLibrary {
 		this.createDlssd = handle(lookup, "ngxshim_create_dlssd",
 				FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
-		// int ngxshim_evaluate_dlssd(cmd, feature, [color/depth/mv/diffAlbedo/specAlbedo/normals/specMotion/specHit/out: view,img,fmt]*9, rw,rh,dw,dh, jx,jy,mvsx,mvsy, reset, frameMs, matrices)
-		this.evaluateDlssd = handle(lookup, "ngxshim_evaluate_dlssd",
+		// int ngxshim_evaluate_dlssd_v2(cmd, feature, [color/depth/mv/diffAlbedo/specAlbedo/normals/specMotion/particle/responsivity/out: view,img,fmt]*10, rw,rh,dw,dh, jx,jy,mvsx,mvsy, reset, frameMs, matrices)
+		this.evaluateDlssd = handle(lookup, "ngxshim_evaluate_dlssd_v2",
 				FunctionDescriptor.of(ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.ADDRESS,
+						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
@@ -124,13 +129,18 @@ public final class NgxLibrary {
 		this.release = handle(lookup, "ngxshim_release",
 				FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
 		this.shutdown = handle(lookup, "ngxshim_shutdown",
-				FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG));
+				FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
 		this.lastResult = handle(lookup, "ngxshim_last_result",
 				FunctionDescriptor.of(ValueLayout.JAVA_INT));
 	}
 
 	public static NgxLibrary load(Path dll) {
-		return new NgxLibrary(SymbolLookup.libraryLookup(dll, Arena.global()));
+		NgxLibrary library = new NgxLibrary(SymbolLookup.libraryLookup(dll, Arena.global()));
+		int actual = library.abiVersion();
+		if (actual != ABI_VERSION) {
+			throw new IllegalStateException("ngxshim ABI mismatch: expected " + ABI_VERSION + ", got " + actual);
+		}
+		return library;
 	}
 
 	private static MethodHandle handle(SymbolLookup lookup, String name, FunctionDescriptor desc) {
@@ -139,11 +149,17 @@ public final class NgxLibrary {
 				desc);
 	}
 
-	// For exports added later than the core ABI (e.g. DLSSG): a stale locally-built ngxshim.dll (the DLL is
-	// not rebuilt by gradle, only copied) must still load so DLSS-RR keeps working — the newer feature just
-	// reports unavailable. Returns null when the symbol is absent.
+	// Optional feature exports may be absent while the core shim ABI remains compatible.
 	private static MethodHandle optionalHandle(SymbolLookup lookup, String name, FunctionDescriptor desc) {
 		return lookup.find(name).map(sym -> LINKER.downcallHandle(sym, desc)).orElse(null);
+	}
+
+	private int abiVersion() {
+		try {
+			return (int) this.abiVersion.invokeExact();
+		} catch (Throwable t) {
+			throw new RuntimeException("ngxshim_abi_version failed", t);
+		}
 	}
 
 	public int requiredExtensions(boolean wantDevice, MemorySegment outBuf, int bufLen) {
@@ -257,7 +273,8 @@ public final class NgxLibrary {
 	                         long specularAlbedoView, long specularAlbedoImage, int specularAlbedoFormat,
 	                         long normalsView, long normalsImage, int normalsFormat,
 	                         long specularMotionView, long specularMotionImage, int specularMotionFormat,
-	                         long specularHitDistanceView, long specularHitDistanceImage, int specularHitDistanceFormat,
+	                         long particleMaskView, long particleMaskImage, int particleMaskFormat,
+	                         long responsivityMaskView, long responsivityMaskImage, int responsivityMaskFormat,
 	                         long outputView, long outputImage, int outputFormat,
 	                         int renderWidth, int renderHeight, int displayWidth, int displayHeight,
 	                         float jitterX, float jitterY, float mvScaleX, float mvScaleY,
@@ -272,13 +289,14 @@ public final class NgxLibrary {
 					specularAlbedoView, specularAlbedoImage, specularAlbedoFormat,
 					normalsView, normalsImage, normalsFormat,
 					specularMotionView, specularMotionImage, specularMotionFormat,
-					specularHitDistanceView, specularHitDistanceImage, specularHitDistanceFormat,
+					particleMaskView, particleMaskImage, particleMaskFormat,
+					responsivityMaskView, responsivityMaskImage, responsivityMaskFormat,
 					outputView, outputImage, outputFormat,
 					renderWidth, renderHeight, displayWidth, displayHeight,
 					jitterX, jitterY, mvScaleX, mvScaleY, reset, frameTimeMs,
 					worldToViewMatrix, viewToClipMatrix);
 		} catch (Throwable t) {
-			throw new RuntimeException("ngxshim_evaluate_dlssd failed", t);
+			throw new RuntimeException("ngxshim_evaluate_dlssd_v2 failed", t);
 		}
 	}
 
@@ -359,9 +377,9 @@ public final class NgxLibrary {
 		}
 	}
 
-	public void shutdown(long vkDevice) {
+	public int shutdown(long vkDevice) {
 		try {
-			this.shutdown.invokeExact(vkDevice);
+			return (int) this.shutdown.invokeExact(vkDevice);
 		} catch (Throwable t) {
 			throw new RuntimeException("ngxshim_shutdown failed", t);
 		}

@@ -9,7 +9,7 @@ final class RtHdrTest {
     private static final float EPSILON = 0.000001f;
 
     @Test
-    void buildsRec2020D65MetadataAtTheSelectedAcesMasteringPeak() {
+    void buildsRec2020D65MetadataAtTheSelectedMasteringPeak() {
         RtHdr.MasteringMetadata metadata = RtHdr.masteringMetadata(1000);
 
         assertChromaticity(metadata.red(), 0.708f, 0.292f);

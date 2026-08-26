@@ -10,6 +10,7 @@ import com.mojang.blaze3d.vulkan.VulkanBackend;
 import com.mojang.blaze3d.vulkan.VulkanPhysicalDevice;
 import com.mojang.blaze3d.vulkan.init.VulkanFeature;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.ngx.NgxRuntime;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtHdr;
 import dev.comfyfluffy.caustica.rt.VulkanDiagnostics;
@@ -55,16 +56,9 @@ public abstract class VulkanBackendMixin {
 			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt16", VkPhysicalDeviceFeatures.SHADERINT16),
 			new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderFloat16", VkPhysicalDeviceVulkan12Features.SHADERFLOAT16));
 
-	private static final List<String> CAUSTICA_WANTED_EXTENSIONS = List.of(
-			// FFX (FSR)
+	private static final List<String> FFX_WANTED_EXTENSIONS = List.of(
 			"VK_KHR_get_memory_requirements2",
-			"VK_KHR_dedicated_allocation",
-			// NGX (DLSS) — NVIDIA-only; skipped on other vendors. (The NGX instance
-			// extension VK_KHR_get_physical_device_properties2 needs an instance hook;
-			// DLSS relies on it being core/enabled at instance level.)
-			"VK_NVX_binary_import",
-			"VK_NVX_image_view_handle",
-			"VK_KHR_push_descriptor");
+			"VK_KHR_dedicated_allocation");
 
 	private static final Set<String> loggedMissingSdkFeatures = new HashSet<>();
 
@@ -90,7 +84,7 @@ public abstract class VulkanBackendMixin {
 
 		Collection<String> requested = args.get(0);
 		var augmented = new ArrayList<>(requested);
-		for (String extension : CAUSTICA_WANTED_EXTENSIONS) {
+		for (String extension : FFX_WANTED_EXTENSIONS) {
 			if (augmented.contains(extension)) {
 				continue;
 			}
@@ -101,6 +95,10 @@ public abstract class VulkanBackendMixin {
 				CausticaMod.LOGGER.warn("Device extension {} not supported by {} — upscaling will be unavailable",
 						extension, physicalDevice.deviceName());
 			}
+		}
+		if ("NVIDIA".equals(physicalDevice.vendorName())) {
+			NgxRuntime.INSTANCE.negotiateRequiredExtensions(true, augmented,
+					physicalDevice::hasDeviceExtension);
 		}
 		VulkanDiagnostics.addDeviceFaultExtension(augmented, physicalDevice);
 		RtHdr.addDeviceExtension(augmented, physicalDevice);

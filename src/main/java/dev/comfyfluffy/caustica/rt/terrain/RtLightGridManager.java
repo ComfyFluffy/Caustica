@@ -179,9 +179,9 @@ final class RtLightGridManager {
             cursor = upload.mapped + layout.globalAliasOffset;
             writeAliases(cursor, data.globalAliases());
             RtLightGrid.Data grid = layout.hasGrid ? data.grid() : null;
+            cursor = upload.mapped + layout.localAliasOffset;
+            writeAliases(cursor, data.localAliases());
             if (grid != null) {
-                cursor = upload.mapped + layout.localAliasOffset;
-                writeAliases(cursor, data.localAliases());
                 cursor = upload.mapped + layout.cellOffset;
                 for (int i = 0; i < grid.cellOffsets().length; i++) {
                     MemoryUtil.memPutInt(cursor, grid.cellOffsets()[i]);
@@ -198,6 +198,9 @@ final class RtLightGridManager {
                     MemoryUtil.memPutFloat(cursor + 12, grid.spanAccept()[i]);
                     cursor += 16;
                 }
+            } else {
+                // RIS reads the discarded local chain unconditionally; a zero span keeps that load in-bounds.
+                MemoryUtil.memSet(upload.mapped + layout.spanOffset, 0, 16);
             }
             upload.flush();
 
@@ -379,9 +382,9 @@ final class RtLightGridManager {
 
         long lightAddress() { return address(layout.lightOffset); }
         long globalAliasAddress() { return address(layout.globalAliasOffset); }
-        long localAliasAddress() { return layout.hasGrid ? address(layout.localAliasOffset) : 0L; }
+        long localAliasAddress() { return lightCount > 0 ? address(layout.localAliasOffset) : 0L; }
         long cellAddress() { return layout.hasGrid ? address(layout.cellOffset) : 0L; }
-        long spanAddress() { return layout.hasGrid ? address(layout.spanOffset) : 0L; }
+        long spanAddress() { return lightCount > 0 ? address(layout.spanOffset) : 0L; }
 
         private long address(long offset) {
             return arena != null ? arena.deviceAddress + offset : 0L;
@@ -408,14 +411,17 @@ final class RtLightGridManager {
             cursor = align16(Math.addExact(cursor, data.lightBytes()));
             long globalAliases = cursor;
             cursor = align16(Math.addExact(cursor, data.globalAliases().bytes()));
-            long localAliases = 0L, cells = 0L, spans = 0L;
+            long localAliases = cursor;
+            cursor = align16(Math.addExact(cursor, data.localAliases().bytes()));
+            long cells = 0L, spans;
             if (includeGrid) {
-                localAliases = cursor;
-                cursor = align16(Math.addExact(cursor, data.localAliases().bytes()));
                 cells = cursor;
                 cursor = align16(Math.addExact(cursor, data.grid().cellBytes()));
                 spans = cursor;
                 cursor = align16(Math.addExact(cursor, data.grid().spanBytes()));
+            } else {
+                spans = cursor;
+                cursor = align16(Math.addExact(cursor, 16L));
             }
             return new Layout(lights, globalAliases, localAliases, cells, spans, cursor, includeGrid);
         }

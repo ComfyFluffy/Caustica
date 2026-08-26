@@ -96,6 +96,17 @@ void main() {
     }
     float population = surfacePopulation + skyPopulation * skyScale
             + emissivePopulation * emissiveScale;
+    if (population <= 0.0 || !isfinite(population)) {
+        float previous = (stateBuf[0].initialized != 0u && isfinite(stateBuf[0].previous)
+                && stateBuf[0].previous > 0.0) ? stateBuf[0].previous : 1.0;
+        stateBuf[0].resetSeq = pc.resetSeq;
+        stateBuf[0].previous = previous;
+        stateBuf[0].initialized = 1u;
+        float preExposure = (isfinite(pc.preExposure) && pc.preExposure > 0.0)
+                ? pc.preExposure : 1.0;
+        exposureImage[int2(0, 0)] = previous / preExposure;
+        return;
+    }
     float total = max(population, 1.0);
     float lowPercentile = clamp(min(pc.lowPercentile, pc.highPercentile), 0.0, 1.0);
     float highPercentile = clamp(max(pc.lowPercentile, pc.highPercentile), 0.0, 1.0);

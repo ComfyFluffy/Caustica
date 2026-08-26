@@ -1,15 +1,13 @@
 package dev.comfyfluffy.caustica.ngx;
 
-import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
-import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
-
 import net.fabricmc.loader.api.FabricLoader;
 
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.VK;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkInstance;
 
@@ -25,7 +23,11 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 /**
@@ -43,18 +45,27 @@ public final class NgxRuntime {
     private NgxLibrary lib;
     private boolean initialized;
     private boolean failed;
+    private long initializedDevice;
+    private boolean instanceExtensionsNegotiated;
+    private boolean deviceExtensionsNegotiated;
+    private boolean extensionNegotiationFailed;
 
     private NgxRuntime() {
     }
 
     /**
      * Ensure NGX is loaded and initialized for {@code device}, returning the shared {@link NgxLibrary}, or
-     * {@code null} if it is unavailable. Idempotent; latches failure so it isn't retried every frame
-     * (cleared by {@link #shutdown()} so a fresh device can re-init).
+     * {@code null} if it is unavailable. Idempotent; latches initialization failure so it is not retried
+     * every frame. Extension negotiation remains fail-closed for the current Vulkan instance.
      */
     public synchronized NgxLibrary acquire(VulkanDevice device) {
         if (initialized) {
-            return lib;
+            if (initializedDevice == device.vkDevice().address()) {
+                return lib;
+            }
+            if (!shutdown()) {
+                return null;
+            }
         }
         if (failed) {
             return null;
@@ -62,9 +73,11 @@ public final class NgxRuntime {
         try {
             init(device);
             initialized = true;
+            initializedDevice = device.vkDevice().address();
             return lib;
         } catch (Throwable t) {
             failed = true;
+            initializedDevice = 0L;
             lib = null;
             CausticaMod.LOGGER.error("NGX init failed; DLSS features disabled", t);
             return null;
@@ -75,27 +88,85 @@ public final class NgxRuntime {
         return initialized;
     }
 
-    /** The shared library once {@link #acquire} has succeeded, else {@code null}. */
-    public NgxLibrary library() {
-        return lib;
+    /** Allow an explicit render-state recovery action to retry a failed shared NGX initialization. */
+    public synchronized void resetFailureLatch() {
+        if (!initialized && !extensionNegotiationFailed) {
+            failed = false;
+        }
+    }
+
+    /** Query the shim before Vulkan creation and add every NGX-required extension only as one valid set. */
+    public synchronized void negotiateRequiredExtensions(boolean deviceExtensions,
+                                                          Collection<String> requested,
+                                                          Predicate<String> supported) {
+        if (!deviceExtensions && !initialized) {
+            instanceExtensionsNegotiated = false;
+            deviceExtensionsNegotiated = false;
+            extensionNegotiationFailed = false;
+            failed = false;
+        }
+        if (extensionNegotiationFailed) {
+            return;
+        }
+        String scope = deviceExtensions ? "device" : "instance";
+        try {
+            if (!PLATFORM_NATIVES.supported()) {
+                throw new IllegalStateException("NGX natives are not bundled for "
+                        + PLATFORM_NATIVES.platformDir());
+            }
+            Path shim = locateShim();
+            if (shim == null) {
+                throw new IllegalStateException(PLATFORM_NATIVES.shimName() + " is unavailable");
+            }
+            if (lib == null) {
+                lib = NgxLibrary.load(shim);
+            }
+            List<String> required = queryRequiredExtensions(lib, deviceExtensions);
+            List<String> missing = required.stream().filter(extension -> !supported.test(extension)).toList();
+            if (!missing.isEmpty()) {
+                throw new IllegalStateException("required " + scope + " extensions are unavailable: " + missing);
+            }
+            for (String extension : required) {
+                if (requested.add(extension)) {
+                    CausticaMod.LOGGER.info("Enabling {} extension {} required by NGX", scope, extension);
+                }
+            }
+            if (deviceExtensions) {
+                deviceExtensionsNegotiated = true;
+            } else {
+                instanceExtensionsNegotiated = true;
+            }
+        } catch (Throwable t) {
+            extensionNegotiationFailed = true;
+            failed = true;
+            lib = null;
+            CausticaMod.LOGGER.warn("NGX {} extension negotiation failed; DLSS features disabled", scope, t);
+        }
     }
 
     /**
-     * Shut down NGX. Call only at device teardown, after every feature has been released. Resolves the
-     * device from the current render backend; no-op if NGX was never initialized.
+     * Shut down NGX. Call only at device teardown, after every feature has been released. Uses the
+     * device captured at initialization; no-op if NGX was never initialized. Returns false while NGX
+     * retains native device ownership and the Vulkan device must stay alive.
      */
-    public synchronized void shutdown() {
-        if (lib != null && initialized
-                && ((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
+    public synchronized boolean shutdown() {
+        if (lib != null && initialized && initializedDevice != 0L) {
             try {
-                lib.shutdown(device.vkDevice().address());
+                int result = lib.shutdown(initializedDevice);
+                if (ngxFailed(result)) {
+                    throw new IllegalStateException("ngxshim_shutdown returned 0x"
+                            + Integer.toHexString(result));
+                }
             } catch (Throwable t) {
-                CausticaMod.LOGGER.warn("NGX shutdown failed", t);
+                CausticaMod.LOGGER.warn("NGX shutdown failed; native ownership is retained until restart", t);
+                return false;
             }
         }
         initialized = false;
-        failed = false;
+        failed = extensionNegotiationFailed;
+        initializedDevice = 0L;
         lib = null;
+        return true;
     }
 
     /** NVSDK_NGX_Result: failure when the top 12 bits == 0xBAD. Shared by all NGX feature wrappers. */
@@ -104,6 +175,9 @@ public final class NgxRuntime {
     }
 
     private void init(VulkanDevice device) {
+        if (extensionNegotiationFailed || !instanceExtensionsNegotiated || !deviceExtensionsNegotiated) {
+            throw new IllegalStateException("NGX Vulkan extensions were not negotiated before device creation");
+        }
         if (!PLATFORM_NATIVES.supported()) {
             throw new IllegalStateException("NGX natives are not bundled for " + PLATFORM_NATIVES.platformDir());
         }
@@ -132,19 +206,46 @@ public final class NgxRuntime {
 
         VkInstance instance = device.vkDevice().getPhysicalDevice().getInstance();
         try (Arena arena = Arena.ofConfined()) {
+            long gipa = VK.getFunctionProvider().getFunctionAddress("vkGetInstanceProcAddr");
+            if (gipa == 0L) {
+                throw new IllegalStateException("vkGetInstanceProcAddr is unavailable");
+            }
             long gdpa;
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 gdpa = VK10.vkGetInstanceProcAddr(instance, stack.ASCII("vkGetDeviceProcAddr"));
             }
             int rc = lib.init(0L, wideString(arena, dataPath.toString()),
                     instance.address(), device.vkDevice().getPhysicalDevice().address(), device.vkDevice().address(),
-                    0L, gdpa, wideString(arena, nativesDir == null ? "" : nativesDir.toString()));
+                    gipa, gdpa, wideString(arena, nativesDir == null ? "" : nativesDir.toString()));
             if (ngxFailed(rc)) {
                 throw new IllegalStateException("ngxshim_init failed: 0x" + Integer.toHexString(rc)
                         + " last=0x" + Integer.toHexString(lib.lastResult()));
             }
         }
         CausticaMod.LOGGER.info("NGX initialized (shim {})", shim);
+    }
+
+    private static List<String> queryRequiredExtensions(NgxLibrary library, boolean deviceExtensions) {
+        final int capacity = 8192;
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment buffer = arena.allocate(capacity, 1);
+            int count = library.requiredExtensions(deviceExtensions, buffer, capacity);
+            if (count < 0) {
+                throw new IllegalStateException("ngxshim_required_extensions returned " + count);
+            }
+            byte[] bytes = buffer.toArray(ValueLayout.JAVA_BYTE);
+            int length = 0;
+            while (length < bytes.length && bytes[length] != 0) {
+                length++;
+            }
+            List<String> extensions = new String(bytes, 0, length, StandardCharsets.UTF_8).lines()
+                    .map(String::strip).filter(name -> !name.isEmpty()).toList();
+            if (extensions.size() != count) {
+                throw new IllegalStateException("NGX extension list was truncated or malformed: expected "
+                        + count + " names, got " + extensions.size());
+            }
+            return extensions;
+        }
     }
 
     private static Path locateShim() {
@@ -189,11 +290,26 @@ public final class NgxRuntime {
     }
 
     private static void extractBundledFeatureLibraries(Path dir) throws IOException {
+        Set<String> current = new HashSet<>();
         for (String name : PLATFORM_NATIVES.exactFeatureNames()) {
-            extractBundledNative(name, dir.resolve(name));
+            if (extractBundledNative(name, dir.resolve(name))) {
+                current.add(name);
+            }
         }
         for (String name : bundledFeatureLibraryNames()) {
-            extractBundledNative(name, dir.resolve(name));
+            if (extractBundledNative(name, dir.resolve(name))) {
+                current.add(name);
+            }
+        }
+        List<Path> stale;
+        try (Stream<Path> files = Files.list(dir)) {
+            stale = files.filter(Files::isRegularFile)
+                    .filter(path -> PLATFORM_NATIVES.isFeatureLibrary(path.getFileName().toString()))
+                    .filter(path -> !current.contains(path.getFileName().toString()))
+                    .toList();
+        }
+        for (Path path : stale) {
+            Files.deleteIfExists(path);
         }
     }
 

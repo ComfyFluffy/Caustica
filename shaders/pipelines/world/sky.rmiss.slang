@@ -99,11 +99,85 @@ float3 skyDome(float3 dir, SkyState state) {
     return skyViewLut.SampleLevel(sunUv, 0.0).rgb + skyViewLut.SampleLevel(moonUv, 0.0).rgb;
 }
 
+// SkyRenderer.buildEndSky() draws six 200x200 quads around the camera. This is the ray equivalent of
+// those faces, including the per-face UV orientation and the 0..16 repeat range of end_sky.png.
+float2 endSkyUv(float3 dir) {
+    float3 a = abs(dir);
+    float t = 100.0 / max(max(a.x, a.y), a.z);
+    float3 p = dir * t;
+    if (a.x >= a.y && a.x >= a.z) {
+        if (dir.x > 0.0) return (float2(p.y, p.z) + 100.0) * (16.0 / 200.0);
+        return (float2(-p.y, p.z) + 100.0) * (16.0 / 200.0);
+    }
+    if (a.y >= a.z) {
+        if (dir.y > 0.0) return (float2(p.x, -p.z) + 100.0) * (16.0 / 200.0);
+        return (float2(p.x, p.z) + 100.0) * (16.0 / 200.0);
+    }
+    if (dir.z > 0.0) return (float2(p.x, p.y) + 100.0) * (16.0 / 200.0);
+    return (float2(p.x, -p.y) + 100.0) * (16.0 / 200.0);
+}
+
+float3 endFlashRadiance(float3 dir, WorldPush worldPush) {
+    if ((worldPush.skyFlags & SKY_FLAG_END_FLASH) == 0u) {
+        return float3(0.0);
+    }
+    // Matches SkyRenderer.renderEndFlash's Y(180-y) * X(-90-x) pose, translation (0,100,0),
+    // and 60x60 quad scale.
+    static const float PI = 3.14159265359;
+    float y = PI - worldPush.skyParams.w;
+    float x = -0.5 * PI - worldPush.skyParams.z;
+    float cy = cos(y), sy = sin(y), cx = cos(x), sx = sin(x);
+    float3 right = float3(cy, 0.0, -sy);
+    float3 up = float3(sy * sx, cx, cy * sx);
+    float3 forward = float3(sy * cx, -sx, cy * cx);
+    float3 center = up * 100.0;
+    float denom = dot(dir, up);
+    if (abs(denom) < 1.0e-5) return float3(0.0);
+    float hitDistance = dot(center, up) / denom;
+    if (hitDistance <= 0.0) return float3(0.0);
+    float3 q = dir * hitDistance - center;
+    float2 local = float2(dot(q, right), dot(q, forward)) / 60.0;
+    if (max(abs(local.x), abs(local.y)) > 1.0) return float3(0.0);
+    float2 uv = lerp(worldPush.endFlashUv.xy, worldPush.endFlashUv.zw, local * 0.5 + 0.5);
+    float4 texel = celestialsAtlas.SampleLevel(uv, 0.0);
+    float intensity = worldPush.skyParams.y;
+    return srgbToLinear(texel.rgb) * texel.a * intensity * intensity;
+}
+
 [shader("miss")]
 void main(inout Payload payload) {
     WorldPush worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
     SkyState state = skyState(worldPush);
     float3 dir = normalize(WorldRayDirection());
+
+    if (worldPush.skybox == SKYBOX_NONE) {
+        packSky(payload, bt709ToAcesCg(max(worldPush.skyColor.rgb, float3(0.0))));
+        payload.hitT = -1.0;
+        payload.flags = 0u;
+        payload.roughMetal = packHalf2(float2(1.0, 0.0));
+        payload.emissionSss = packHalf2(float2(0.0, 0.0));
+        payload.iorTransmission = packHalf2(float2(1.0, 0.0));
+        payload.rayCone = 0u;
+        return;
+    }
+
+    if (worldPush.skybox == SKYBOX_END) {
+        float4 texel = endSkyTexture.SampleLevel(endSkyUv(dir), 0.0);
+        float3 endSkyColor = srgbToLinear(texel.rgb) * (40.0 / 255.0);
+        float3 color = lerp(worldPush.skyColor.rgb, endSkyColor, clamp(texel.a, 0.0, 1.0));
+        if ((payload.flags & PAYLOAD_PRIMARY_SKY) != 0u) {
+            color += endFlashRadiance(dir, worldPush);
+        }
+        packSky(payload, bt709ToAcesCg(max(color, float3(0.0))));
+        payload.hitT = -1.0;
+        payload.flags = 0u;
+        payload.roughMetal = packHalf2(float2(1.0, 0.0));
+        payload.emissionSss = packHalf2(float2(0.0, 0.0));
+        payload.iorTransmission = packHalf2(float2(1.0, 0.0));
+        payload.rayCone = 0u;
+        return;
+    }
+
     bool showCelestial = (payload.flags & PAYLOAD_SHOW_CELESTIAL) != 0u;
 
     float3 color = skyDome(dir, state);

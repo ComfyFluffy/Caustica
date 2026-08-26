@@ -177,13 +177,36 @@ public final class RtEntityTextures {
 
     /** Write any newly-registered entity textures into the pipeline's bindless set (before the trace). */
     public void uploadPending(RtPipeline pipeline, long sampler) {
+        uploadPending(sampler, pipeline);
+    }
+
+    /** Write newly registered textures into every pipeline that shares this texture epoch. */
+    public void uploadPending(long sampler, RtPipeline... pipelines) {
         if (pending.isEmpty()) {
             return;
         }
         for (Pending p : pending) {
-            pipeline.setEntityAlbedoTexture(p.slot(), p.view(), sampler);
+            for (RtPipeline pipeline : pipelines) {
+                if (pipeline != null) {
+                    pipeline.setEntityAlbedoTexture(p.slot(), p.view(), sampler);
+                }
+            }
         }
         pending.clear();
+    }
+
+    /** Populate all slots into a newly created pipeline before the pending queue is cleared. */
+    public void uploadAll(long sampler, RtPipeline... pipelines) {
+        for (Map.Entry<Long, Integer> entry : viewSlotCache.entrySet()) {
+            long view = entry.getKey();
+            int slot = entry.getValue();
+            for (RtPipeline pipeline : pipelines) {
+                if (pipeline != null) {
+                    pipeline.setEntityAlbedoTexture(slot, view, sampler);
+                }
+            }
+        }
+        uploadPending(sampler, pipelines);
     }
 
     /** Drop the registry (call when the world pipeline / bindless set is recreated, or textures reload). */

@@ -17,6 +17,7 @@ import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
 import org.lwjgl.vulkan.VkPushConstantRange;
 import org.lwjgl.vulkan.VkShaderModuleCreateInfo;
 import org.lwjgl.vulkan.VkWriteDescriptorSet;
+import org.joml.Matrix4fc;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -54,6 +55,11 @@ public final class RtDisplayPipeline {
     private long boundLookLutSampler;
     private long boundBloomView;
     private long boundBloomSampler;
+    private long boundSkyClassificationView;
+    private long boundEndSkyView;
+    private long boundEndSkySampler;
+    private long boundCelestialsView;
+    private long boundCelestialsSampler;
     private boolean destroyed;
 
     private RtDisplayPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline) {
@@ -66,6 +72,10 @@ public final class RtDisplayPipeline {
     }
 
     public static RtDisplayPipeline create(RtContext ctx) {
+        if (ctx.maxPushConstantsSize() < PUSH_BYTES) {
+            throw new IllegalStateException("Caustica display pipeline requires at least " + PUSH_BYTES
+                    + " push-constant bytes; device reports " + ctx.maxPushConstantsSize());
+        }
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(DISPLAY_BINDING_COUNT, stack);
@@ -86,6 +96,12 @@ public final class RtDisplayPipeline {
                     .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
             binds.get(DISPLAY_BLOOM).binding(DISPLAY_BLOOM).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            binds.get(DISPLAY_SKY_CLASSIFICATION).binding(DISPLAY_SKY_CLASSIFICATION).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                    .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            binds.get(DISPLAY_END_SKY).binding(DISPLAY_END_SKY).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            binds.get(DISPLAY_CELESTIALS).binding(DISPLAY_CELESTIALS).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
 
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
             LongBuffer p = stack.mallocLong(1);
@@ -94,8 +110,8 @@ public final class RtDisplayPipeline {
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, "display descriptor set layout");
 
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(2, stack);
-            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(4);
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(4);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(5);
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(6);
             VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool(rt display)");
             long pool = p.get(0);
@@ -134,13 +150,18 @@ public final class RtDisplayPipeline {
 
     public void setImages(long outputImageView, long rtImageView, long exposureImageView, long hdrImageView,
                            long lutView, long lutSampler, long hdrLutView, long hdrLutSampler,
-                           long lookLutView, long lookLutSampler, long bloomView, long bloomSampler) {
+                           long lookLutView, long lookLutSampler, long bloomView, long bloomSampler,
+                           long skyClassificationView, long endSkyView, long endSkySampler,
+                           long celestialsView, long celestialsSampler) {
         if (boundOutputView == outputImageView && boundRtView == rtImageView
                 && boundExposureView == exposureImageView && boundHdrView == hdrImageView
                 && boundLutView == lutView && boundLutSampler == lutSampler
                 && boundHdrLutView == hdrLutView && boundHdrLutSampler == hdrLutSampler
                 && boundLookLutView == lookLutView && boundLookLutSampler == lookLutSampler
-                && boundBloomView == bloomView && boundBloomSampler == bloomSampler) {
+                && boundBloomView == bloomView && boundBloomSampler == bloomSampler
+                && boundSkyClassificationView == skyClassificationView && boundEndSkyView == endSkyView
+                && boundEndSkySampler == endSkySampler && boundCelestialsView == celestialsView
+                && boundCelestialsSampler == celestialsSampler) {
             return;
         }
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -161,6 +182,14 @@ public final class RtDisplayPipeline {
             VkDescriptorImageInfo.Buffer bloomInfo = VkDescriptorImageInfo.calloc(1, stack);
             bloomInfo.get(0).imageView(bloomView).sampler(bloomSampler)
                     .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            VkDescriptorImageInfo.Buffer skyClassificationInfo = VkDescriptorImageInfo.calloc(1, stack);
+            skyClassificationInfo.get(0).imageView(skyClassificationView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            VkDescriptorImageInfo.Buffer endSkyInfo = VkDescriptorImageInfo.calloc(1, stack);
+            endSkyInfo.get(0).imageView(endSkyView).sampler(endSkySampler)
+                    .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            VkDescriptorImageInfo.Buffer celestialsInfo = VkDescriptorImageInfo.calloc(1, stack);
+            celestialsInfo.get(0).imageView(celestialsView).sampler(celestialsSampler)
+                    .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
 
             VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(DISPLAY_BINDING_COUNT, stack);
             writes.get(DISPLAY_OUTPUT).sType$Default().dstSet(descriptorSet).dstBinding(DISPLAY_OUTPUT)
@@ -180,6 +209,14 @@ public final class RtDisplayPipeline {
             writes.get(DISPLAY_BLOOM).sType$Default().dstSet(descriptorSet).dstBinding(DISPLAY_BLOOM)
                     .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .pImageInfo(bloomInfo);
+            writes.get(DISPLAY_SKY_CLASSIFICATION).sType$Default().dstSet(descriptorSet).dstBinding(DISPLAY_SKY_CLASSIFICATION)
+                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(skyClassificationInfo);
+            writes.get(DISPLAY_END_SKY).sType$Default().dstSet(descriptorSet).dstBinding(DISPLAY_END_SKY)
+                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .pImageInfo(endSkyInfo);
+            writes.get(DISPLAY_CELESTIALS).sType$Default().dstSet(descriptorSet).dstBinding(DISPLAY_CELESTIALS)
+                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .pImageInfo(celestialsInfo);
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }
         boundOutputView = outputImageView;
@@ -194,23 +231,52 @@ public final class RtDisplayPipeline {
         boundLookLutSampler = lookLutSampler;
         boundBloomView = bloomView;
         boundBloomSampler = bloomSampler;
+        boundSkyClassificationView = skyClassificationView;
+        boundEndSkyView = endSkyView;
+        boundEndSkySampler = endSkySampler;
+        boundCelestialsView = celestialsView;
+        boundCelestialsSampler = celestialsSampler;
     }
 
     /**
-     * Run the display mapping through the baked ACES 2.0 LUTs: SDR
-     * (binding 0) always writes; the PQ-encoded HDR image (binding 3) also writes when
-     * {@code hdrEnabled}. The HDR LUT is baked for a fixed mastering-nits peak (see
-     * {@code CausticaConfig.Rt.Hdr.PEAK_NITS_STEPS}), selected host-side by which LUT resource is bound.
+     * Run the selected display transforms. SDR always writes; the PQ-encoded HDR image also writes
+     * when {@code hdrEnabled}. ACES 2.0 uses the bound display LUTs, while analytical modes execute
+     * directly in the display shader.
      */
-    public void dispatch(VkCommandBuffer cmd, int width, int height, boolean hdrEnabled, int lutSize,
-                         float gamma, float hdrPeakNits, boolean lookEnabled, int lookLutSize,
-                         float bloomStrength) {
+    public void dispatch(VkCommandBuffer cmd, int width, int height, RtToneMapping.Settings toneMapping,
+                         int lutSize, float gamma, float hdrPeakNits, boolean lookEnabled, int lookLutSize,
+                         float bloomStrength, Matrix4fc invViewProj, int skybox, int skyFlags,
+                         float skyR, float skyG, float skyB, float skyA,
+                         float endFlashIntensity, float endFlashX, float endFlashY,
+                         float flashU0, float flashV0, float flashU1, float flashV1) {
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "display compute")) {
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(descriptorSet), null);
             ByteBuffer push = stack.malloc(DisplayPushData.BYTE_SIZE);
-            new DisplayPushData(hdrEnabled ? 1 : 0, (float) lutSize, gamma, hdrPeakNits,
-                    lookEnabled ? 1 : 0, (float) lookLutSize, bloomStrength).write(push);
+            RtToneMapping.Parameters sdr = toneMapping.sdrParameters();
+            RtToneMapping.Parameters hdr = toneMapping.hdrParameters();
+            new DisplayPushData(
+                    toneMapping.hdrEnabled() ? 1 : 0,
+                    (float) lutSize,
+                    gamma,
+                    hdrPeakNits,
+                    lookEnabled ? 1 : 0,
+                    (float) lookLutSize,
+                    bloomStrength,
+                    toneMapping.sdrMode(),
+                    toneMapping.hdrMode(),
+                    toneMapping.paperWhiteNits(),
+                    toneMapping.headroom(),
+                    sdr.param0(), sdr.param1(), sdr.param2(), sdr.param3(),
+                    sdr.param4(), sdr.param5(), sdr.param6(), sdr.param7(),
+                    hdr.param0(), hdr.param1(), hdr.param2(), hdr.param3(),
+                    hdr.param4(), hdr.param5(), hdr.param6(), hdr.param7(),
+                    new DisplayPushData.Float4(skyR, skyG, skyB, skyA),
+                    invViewProj,
+                    skybox,
+                    skyFlags,
+                    new DisplayPushData.Float4(0.0f, endFlashIntensity, endFlashX, endFlashY),
+                    new DisplayPushData.Float4(flashU0, flashV0, flashU1, flashV1)).write(push);
             VK10.vkCmdPushConstants(cmd, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
         }

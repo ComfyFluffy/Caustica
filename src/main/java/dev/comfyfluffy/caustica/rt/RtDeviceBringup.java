@@ -24,6 +24,7 @@ import org.lwjgl.vulkan.VkPhysicalDeviceRayQueryFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
+import org.lwjgl.vulkan.VkPhysicalDeviceVulkan11Features;
 import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapPropertiesEXT;
 import org.lwjgl.vulkan.VkPhysicalDevicePresentIdFeaturesKHR;
@@ -146,6 +147,9 @@ public final class RtDeviceBringup {
     private static final VulkanPNextStruct PRESENT_ID_FEATURES_STRUCT = new VulkanPNextStruct(
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
             VkPhysicalDevicePresentIdFeaturesKHR.SIZEOF);
+    private static final VulkanPNextStruct VULKAN_11_FEATURES_STRUCT = new VulkanPNextStruct(
+            VK12.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+            VkPhysicalDeviceVulkan11Features.SIZEOF);
 
     private static final VulkanFeature BUFFER_DEVICE_ADDRESS_FEATURE = new VulkanFeature(
             VulkanBackend.VK12_FEATURES_STRUCT, "bufferDeviceAddress",
@@ -162,6 +166,11 @@ public final class RtDeviceBringup {
     private static final VulkanFeature SAMPLED_IMAGE_UPDATE_AFTER_BIND_FEATURE = new VulkanFeature(
             VulkanBackend.VK12_FEATURES_STRUCT, "descriptorBindingSampledImageUpdateAfterBind",
             VkPhysicalDeviceVulkan12Features.DESCRIPTORBINDINGSAMPLEDIMAGEUPDATEAFTERBIND);
+    private static final VulkanFeature SHADER_INT16_FEATURE = new VulkanFeature(
+            VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt16", VkPhysicalDeviceFeatures.SHADERINT16);
+    private static final VulkanFeature SHADER_FLOAT16_FEATURE = new VulkanFeature(
+            VulkanBackend.VK12_FEATURES_STRUCT, "shaderFloat16",
+            VkPhysicalDeviceVulkan12Features.SHADERFLOAT16);
     private static final VulkanFeature SHADER_INT64_FEATURE = new VulkanFeature(
             VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt64", VkPhysicalDeviceFeatures.SHADERINT64);
     private static final VulkanFeature ACCELERATION_STRUCTURE_FEATURE = new VulkanFeature(
@@ -184,6 +193,12 @@ public final class RtDeviceBringup {
             PRESENT_ID_FEATURES_STRUCT, "presentId", VkPhysicalDevicePresentIdFeaturesKHR.PRESENTID);
     private static final VulkanFeature WIDE_LINES_FEATURE = new VulkanFeature(
             VulkanBackend.VK10_FEATURES_STRUCT, "wideLines", VkPhysicalDeviceFeatures.WIDELINES);
+    private static final VulkanFeature SHARC_BUFFER_INT64_ATOMICS_FEATURE = new VulkanFeature(
+            VulkanBackend.VK12_FEATURES_STRUCT, "shaderBufferInt64Atomics",
+            VkPhysicalDeviceVulkan12Features.SHADERBUFFERINT64ATOMICS);
+    private static final VulkanFeature SHARC_STORAGE_BUFFER_16_FEATURE = new VulkanFeature(
+            VULKAN_11_FEATURES_STRUCT, "storageBuffer16BitAccess",
+            VkPhysicalDeviceVulkan11Features.STORAGEBUFFER16BITACCESS);
 
     private static final List<VulkanFeature> REQUIRED_RT_FEATURES = List.of(
             BUFFER_DEVICE_ADDRESS_FEATURE,
@@ -191,6 +206,8 @@ public final class RtDeviceBringup {
             SAMPLED_IMAGE_NON_UNIFORM_FEATURE,
             DESCRIPTOR_PARTIALLY_BOUND_FEATURE,
             SAMPLED_IMAGE_UPDATE_AFTER_BIND_FEATURE,
+            SHADER_INT16_FEATURE,
+            SHADER_FLOAT16_FEATURE,
             SHADER_INT64_FEATURE,
             ACCELERATION_STRUCTURE_FEATURE,
             RAY_TRACING_PIPELINE_FEATURE,
@@ -217,7 +234,8 @@ public final class RtDeviceBringup {
     }
 
     private record FeatureSupport(List<String> missingRequired, SerBackend serBackend,
-                                  boolean omm, boolean presentId, boolean wideLines) {
+                                  boolean omm, boolean presentId, boolean wideLines,
+                                  boolean sharcInt64Atomics, boolean sharcStorageBuffer16) {
         boolean supportsRt() {
             return missingRequired.isEmpty();
         }
@@ -458,6 +476,12 @@ public final class RtDeviceBringup {
             }
             WIDE_LINES_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
 
+            boolean querySharc = RtSharcSupport.packaged();
+            if (querySharc) {
+                SHARC_BUFFER_INT64_ATOMICS_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
+                SHARC_STORAGE_BUFFER_16_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
+            }
+
             VK12.vkGetPhysicalDeviceFeatures2(physicalDevice.vkPhysicalDevice(), available);
 
             List<String> missing = new ArrayList<>();
@@ -471,7 +495,9 @@ public final class RtDeviceBringup {
             return new FeatureSupport(missing, supportedSer,
                     queryOmm && OMM_FEATURE.get(available),
                     queryPresentId && PRESENT_ID_FEATURE.get(available),
-                    WIDE_LINES_FEATURE.get(available));
+                    WIDE_LINES_FEATURE.get(available),
+                    querySharc && SHARC_BUFFER_INT64_ATOMICS_FEATURE.get(available),
+                    querySharc && SHARC_STORAGE_BUFFER_16_FEATURE.get(available));
         }
     }
 
@@ -521,6 +547,8 @@ public final class RtDeviceBringup {
         reflexEnabled = false;
         presentIdEnabled = false;
         wideLinesEnabled = false;
+        RtSharcSupport.setDeviceFeaturesEnabled(false, false, false);
+        RtSharcSupport.clearFailure();
         maxLineWidth = 1.0f;
         String missingExtension = firstUnsupportedExtension(physicalDevice);
         if (missingExtension != null) {
@@ -546,6 +574,14 @@ public final class RtDeviceBringup {
         // Core features merge into vanilla's VK10/VK12 structs; extension features create their matching
         // pNext structs. Every boolean here was verified by queryFeatureSupport above.
         features.addAll(REQUIRED_RT_FEATURES);
+        boolean sharcPackaged = RtSharcSupport.packaged();
+        boolean sharcFeatures = sharcPackaged && support.sharcInt64Atomics
+                && support.sharcStorageBuffer16;
+        // SHaRC's optional feature set is atomic: a partial set follows the ordinary RT path.
+        if (sharcFeatures) {
+            features.add(SHARC_BUFFER_INT64_ATOMICS_FEATURE);
+            features.add(SHARC_STORAGE_BUFFER_16_FEATURE);
+        }
         // Bindless entity textures: a runtime-sized sampler2D[] indexed non-uniformly in the hit shader,
         // with partially-bound + update-after-bind slots (a growing per-RenderType registry). Core on the
         // VK 1.4 device; just needs enabling alongside bufferDeviceAddress on the same struct.
@@ -595,6 +631,11 @@ public final class RtDeviceBringup {
 
         rtRequested = true;
         serBackend = support.serBackend;
+        RtSharcSupport.setDeviceFeaturesEnabled(sharcFeatures, sharcFeatures, sharcFeatures);
+        if (sharcPackaged && !sharcFeatures) {
+            CausticaMod.LOGGER.info("Optional SHaRC unavailable; keeping the ordinary RT path: {}",
+                    RtSharcSupport.status());
+        }
         List<String> optionalExtensions = supportedOptionalExtensions(physicalDevice, support);
         CausticaMod.LOGGER.info(
                 "Ray tracing: enabling {}{}{} + features [bufferDeviceAddress, accelerationStructure, rayTracingPipeline, rayQuery, SER={}"

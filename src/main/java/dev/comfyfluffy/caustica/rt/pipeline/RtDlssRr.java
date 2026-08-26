@@ -4,6 +4,7 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.client.CaptureSession;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
@@ -19,7 +20,8 @@ import java.lang.foreign.ValueLayout;
 /**
  * DLSS Ray Reconstruction backend for the RT renderer. Runs the DLSSD (Ray Reconstruction) feature
  * over path-traced color + guide buffers (normals/roughness, diffuse/specular albedo, depth, motion
- * vectors, reflection motion vectors), denoising and upscaling (render res → display res) in one pass.
+ * vectors, reflection motion vectors, sky responsivity, and particle classification), denoising and
+ * upscaling (render res → display res) in one pass.
  */
 public final class RtDlssRr {
     public static final RtDlssRr INSTANCE = new RtDlssRr();
@@ -45,13 +47,65 @@ public final class RtDlssRr {
     }
 
     public static int quality() {
-        return CausticaConfig.Rt.DlssRr.QUALITY.value();
+        return CaptureSession.effectiveDlssQuality(CausticaConfig.Rt.DlssRr.QUALITY.value());
+    }
+
+    public boolean hasFailed() {
+        return failed;
+    }
+
+    /** NVIDIA's recommended texture LOD offset for the active DLSS render/display resolution pair. */
+    public static float recommendedMipMapBias(int renderWidth, int displayWidth) {
+        if (renderWidth <= 0 || displayWidth <= 0) {
+            return 0.0f;
+        }
+        double bias = Math.log((double) renderWidth / (double) displayWidth) / Math.log(2.0) - 1.0;
+        return Double.isFinite(bias) ? (float) bias : 0.0f;
+    }
+
+    public void resetFailureLatch() {
+        boolean canRetry = true;
+        if (!isNull(feature)) {
+            try {
+                VulkanDevice device = featureDevice != null ? featureDevice : currentDeviceOrNull();
+                if (device == null) {
+                    canRetry = false;
+                } else {
+                    releaseFeature(device);
+                }
+            } catch (Throwable t) {
+                canRetry = false;
+                CausticaMod.LOGGER.warn("DLSS-RR feature reset could not release the old native handle", t);
+            }
+        }
+        if (!canRetry) {
+            failed = true;
+            featureInvalid = true;
+            return;
+        }
+        failed = false;
+        featureInvalid = false;
+        requestHistoryReset();
+        NgxRuntime.INSTANCE.resetFailureLatch();
+    }
+
+    /**
+     * Request a reset on the next successful DLSSD evaluation. Callers must reserve this for a hard
+     * temporal discontinuity, such as a dimension/skybox transition, output or feature recreation, an
+     * explicit render-state invalidation, or recovery from a failed feature. Ordinary lighting and setting
+     * transitions keep history so DLSSD can smooth them without a visible reconstruction flash.
+     */
+    public void requestHistoryReset() {
+        resetHistory = true;
+        lastFrameNanos = 0L;
     }
 
     private NgxLibrary lib;
     private MemorySegment feature = MemorySegment.NULL;
+    private VulkanDevice featureDevice;
     private boolean initialized;
     private boolean failed;
+    private boolean featureInvalid;
     private boolean loggedAvailable;
 
     private int featureRenderWidth = -1;
@@ -79,7 +133,8 @@ public final class RtDlssRr {
      */
     public boolean evaluate(long cmd, RtImage color, RtImage depth, RtImage motion,
                             RtImage diffuseAlbedo, RtImage specularAlbedo, RtImage normals,
-                            RtImage specularMotion, RtImage out,
+                            RtImage specularMotion, RtImage particleMask, RtImage responsivityMask,
+                            RtImage out,
                             int renderWidth, int renderHeight, int displayWidth, int displayHeight,
                             float jitterX, float jitterY, Matrix4fc worldToView, Matrix4fc viewToClip) {
         if (!isReady()) {
@@ -105,18 +160,19 @@ public final class RtDlssRr {
                         specularAlbedo.view, specularAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         normals.view, normals.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         specularMotion.view, specularMotion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
-                        0L, 0L, 0,
+                        particleMask.view, particleMask.image, VK10.VK_FORMAT_R8_UINT,
+                        responsivityMask.view, responsivityMask.image, VK10.VK_FORMAT_R16_SFLOAT,
                         out.view, out.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         renderWidth, renderHeight, displayWidth, displayHeight,
                         // jitter in render pixels; MVs are already in render-pixel units, so MV scale = 1.
                         jitterX, jitterY, 1.0f, 1.0f, resetHistory ? 1 : 0, frameMs,
                         worldToViewMatrix, viewToClipMatrix);
             }
-            resetHistory = false;
             if (NgxRuntime.ngxFailed(rc)) {
                 throw new IllegalStateException("ngxshim_evaluate_dlssd failed: 0x" + Integer.toHexString(rc)
                         + " last=0x" + Integer.toHexString(lib.lastResult()));
             }
+            resetHistory = false;
             return true;
         } catch (Throwable t) {
             failed = true;
@@ -129,36 +185,76 @@ public final class RtDlssRr {
      * Asks NGX what render resolution the current quality mode expects for the given display size.
      * Returns {@code null} only when RR is off (or already disabled from an earlier failure elsewhere)
      * — in that state there is no feature to query and the caller should trace at full resolution.
-     * Once RR is active, a failed query (stale shim, old driver, bad NGX result) throws instead of
-     * silently falling back, so a broken render/display sync is never masked.
+     * A failed query (stale shim, old driver, or bad NGX result) disables only RR; the compositor
+     * traces at display resolution and uses its normal non-RR blit path.
      */
     public int[] queryOptimalRenderSize(int displayWidth, int displayHeight) {
         if (!enabled() || failed) {
             return null;
         }
-        if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
+        try {
+            if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
+                disableForQuery("Vulkan device backend is unavailable", null);
+                return null;
+            }
+            ensureInitialized(device);
+            if (!lib.hasQueryOptimalDlssd()) {
+                disableForQuery("ngxshim is missing ngxshim_query_optimal_dlssd (stale native shim)", null);
+                return null;
+            }
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment outWidth = arena.allocate(ValueLayout.JAVA_INT);
+                MemorySegment outHeight = arena.allocate(ValueLayout.JAVA_INT);
+                MemorySegment outSharpness = arena.allocate(ValueLayout.JAVA_FLOAT);
+                int rc = lib.queryOptimalDlssd(displayWidth, displayHeight, quality(), outWidth, outHeight, outSharpness);
+                if (NgxRuntime.ngxFailed(rc)) {
+                    disableForQuery("ngxshim_query_optimal_dlssd failed: 0x" + Integer.toHexString(rc), null);
+                    return null;
+                }
+                int renderWidth = outWidth.get(ValueLayout.JAVA_INT, 0);
+                int renderHeight = outHeight.get(ValueLayout.JAVA_INT, 0);
+                if (!validRenderSize(renderWidth, renderHeight, displayWidth, displayHeight)) {
+                    disableForQuery("ngxshim_query_optimal_dlssd returned invalid render size "
+                            + renderWidth + "x" + renderHeight, null);
+                    return null;
+                }
+                return new int[] { renderWidth, renderHeight };
+            }
+        } catch (Throwable t) {
+            disableForQuery("ngxshim_query_optimal_dlssd threw", t);
             return null;
         }
-        ensureInitialized(device);
-        if (!lib.hasQueryOptimalDlssd()) {
-            throw new IllegalStateException("ngxshim is missing ngxshim_query_optimal_dlssd (stale native shim)");
-        }
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment outWidth = arena.allocate(ValueLayout.JAVA_INT);
-            MemorySegment outHeight = arena.allocate(ValueLayout.JAVA_INT);
-            MemorySegment outSharpness = arena.allocate(ValueLayout.JAVA_FLOAT);
-            int rc = lib.queryOptimalDlssd(displayWidth, displayHeight, quality(), outWidth, outHeight, outSharpness);
-            if (NgxRuntime.ngxFailed(rc)) {
-                throw new IllegalStateException("ngxshim_query_optimal_dlssd failed: 0x" + Integer.toHexString(rc));
+    }
+
+    private void disableForQuery(String reason, Throwable cause) {
+        failed = true;
+        featureInvalid = !isNull(feature);
+        if (featureInvalid) {
+            try {
+                VulkanDevice device = featureDevice != null ? featureDevice : currentDeviceOrNull();
+                if (device != null) {
+                    releaseFeature(device);
+                    featureInvalid = false;
+                }
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("DLSS-RR query failure could not release the live native feature", t);
             }
-            int renderWidth = outWidth.get(ValueLayout.JAVA_INT, 0);
-            int renderHeight = outHeight.get(ValueLayout.JAVA_INT, 0);
-            if (renderWidth <= 0 || renderHeight <= 0) {
-                throw new IllegalStateException(
-                        "ngxshim_query_optimal_dlssd returned invalid render size " + renderWidth + "x" + renderHeight);
-            }
-            return new int[] { renderWidth, renderHeight };
         }
+        requestHistoryReset();
+        if (cause == null) {
+            CausticaMod.LOGGER.warn("DLSS-RR disabled; using full-resolution RT fallback: {}", reason);
+        } else {
+            CausticaMod.LOGGER.warn("DLSS-RR disabled; using full-resolution RT fallback: " + reason, cause);
+        }
+    }
+
+    private static boolean validRenderSize(int renderWidth, int renderHeight, int displayWidth, int displayHeight) {
+        if (displayWidth <= 0 || displayHeight <= 0 || renderWidth <= 0 || renderHeight <= 0
+                || renderWidth > displayWidth || renderHeight > displayHeight) {
+            return false;
+        }
+        long aspectDelta = Math.abs((long) renderWidth * displayHeight - (long) displayWidth * renderHeight);
+        return aspectDelta <= Math.max(displayWidth, displayHeight);
     }
 
     /**
@@ -170,16 +266,19 @@ public final class RtDlssRr {
         if (!enabled() || failed) {
             return false;
         }
-        if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
-            return false;
-        }
         try {
+            if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
+                failed = true;
+                requestHistoryReset();
+                CausticaMod.LOGGER.warn("DLSS-RR disabled; Vulkan device backend is unavailable");
+                return false;
+            }
             ensureInitialized(device);
             int quality = quality();
             int preset = renderPreset();
             if (featureRenderWidth != renderWidth || featureRenderHeight != renderHeight
                     || featureDisplayWidth != displayWidth || featureDisplayHeight != displayHeight
-                    || featureQuality != quality || featurePreset != preset
+                    || featureQuality != quality || featurePreset != preset || featureInvalid
                     || isNull(feature)) {
                 releaseFeature(device);
                 feature = lib.createDlssd(cmd, renderWidth, renderHeight, displayWidth, displayHeight,
@@ -194,6 +293,7 @@ public final class RtDlssRr {
                 featureDisplayHeight = displayHeight;
                 featureQuality = quality;
                 featurePreset = preset;
+                featureDevice = device;
                 resetHistory = true; // a fresh feature has no temporal history
                 CausticaMod.LOGGER.info("DLSS-RR feature created: {}x{} -> {}x{} (quality {}, preset {})",
                         renderWidth, renderHeight, displayWidth, displayHeight, quality, preset);
@@ -230,25 +330,67 @@ public final class RtDlssRr {
     /**
      * Release the RR feature. Does NOT shut down NGX — that is the shared {@link NgxRuntime}'s job at device
      * teardown ({@code NgxRuntime.shutdown()} in {@code CausticaClient.shutdownRt}), so FG can keep using NGX.
+     * Returns false while the native feature remains owned and the Vulkan device must stay alive.
      */
-    public void destroy() {
-        if (((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
-            releaseFeature(device);
+    public boolean destroy() {
+        try {
+            if (!isNull(feature)) {
+                VulkanDevice device = featureDevice != null ? featureDevice : currentDeviceOrNull();
+                if (device == null) {
+                    throw new IllegalStateException("DLSS-RR feature owner device is unavailable");
+                }
+                releaseFeature(device);
+            }
+        } catch (Throwable t) {
+            CausticaMod.LOGGER.warn("DLSS-RR teardown failed; native ownership is retained until restart", t);
         }
         initialized = false;
-        lib = null;
+        if (isNull(feature)) {
+            lib = null;
+            featureDevice = null;
+            featureInvalid = false;
+            failed = false;
+            resetHistory = false;
+            lastFrameNanos = 0L;
+            loggedAvailable = false;
+        } else {
+            failed = true;
+            featureInvalid = true;
+        }
+        return isNull(feature);
+    }
+
+    private static VulkanDevice currentDeviceOrNull() {
+        RtContext ctx = RtContext.currentOrNull();
+        if (ctx != null) {
+            return ctx.device();
+        }
+        if (RenderSystem.getDevice() instanceof GpuDeviceAccessor accessor
+                && accessor.caustica$getBackend() instanceof VulkanDevice device) {
+            return device;
+        }
+        return null;
     }
 
     private void releaseFeature(VulkanDevice device) {
         if (!isNull(feature)) {
+            VulkanDevice owner = featureDevice != null ? featureDevice : device;
+            if (owner == null) {
+                throw new IllegalStateException("DLSS-RR feature owner device is unavailable");
+            }
+            if (lib == null) {
+                throw new IllegalStateException("DLSS-RR feature library is unavailable");
+            }
             RtContext ctx = RtContext.currentOrNull();
-            if (ctx != null && ctx.device() == device) {
+            if (ctx != null && ctx.device() == owner) {
                 ctx.waitIdle();
             } else {
-                VK10.vkDeviceWaitIdle(device.vkDevice());
+                RtContext.check(owner, VK10.vkDeviceWaitIdle(owner.vkDevice()),
+                        "vkDeviceWaitIdle before DLSS-RR release");
             }
             lib.release(feature);
             feature = MemorySegment.NULL;
+            featureDevice = null;
         }
         featureRenderWidth = -1;
         featureRenderHeight = -1;

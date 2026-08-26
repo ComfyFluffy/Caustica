@@ -44,6 +44,7 @@ static const char* kProjectId = "b6f1e9c2-7a44-4d1e-9b3a-1f2c3d4e5a6b";
 
 static NVSDK_NGX_Parameter* g_capabilityParams = nullptr;
 static VkDevice g_device = VK_NULL_HANDLE;
+static bool g_initialized = false;
 static int g_lastResult = 0;
 
 // Logging sink wired into NVSDK_NGX_FeatureCommonInfo so the (closed) NGX core/SDK pipes its own
@@ -86,6 +87,11 @@ extern "C" {
 #else
 #define NGX_SHIM_EXPORT __attribute__((visibility("default")))
 #endif
+
+// Increment whenever the flat C ABI changes incompatibly. Java checks this before using any export.
+NGX_SHIM_EXPORT int ngxshim_abi_version() {
+    return 1;
+}
 
 // Last NVSDK_NGX_Result observed, for diagnostics from the Java side.
 NGX_SHIM_EXPORT int ngxshim_last_result() {
@@ -140,6 +146,8 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
             appId, (void*) dataPath, (void*) instance, (void*) physicalDevice, (void*) device,
             getInstanceProcAddr, getDeviceProcAddr, (void*) featureDllPath);
     g_device = device;
+    g_initialized = false;
+    g_capabilityParams = nullptr;
 
     NVSDK_NGX_FeatureCommonInfo info;
     std::memset(&info, 0, sizeof(info));
@@ -166,13 +174,24 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
     NGX_LOG("init: Init_with_ProjectID r=0x%08x", (unsigned) r);
     if (NVSDK_NGX_FAILED(r)) {
         NGX_LOG("init: FAILED init, returning 0x%08x", (unsigned) r);
+        g_device = VK_NULL_HANDLE;
         return (int) r;
     }
+    g_initialized = true;
 
     NGX_LOG("init: calling NVSDK_NGX_VULKAN_GetCapabilityParameters");
     r = NVSDK_NGX_VULKAN_GetCapabilityParameters(&g_capabilityParams);
     g_lastResult = (int) r;
     NGX_LOG("init: GetCapabilityParameters r=0x%08x g_capabilityParams=%p", (unsigned) r, (void*) g_capabilityParams);
+    if (NVSDK_NGX_FAILED(r)) {
+        if (g_capabilityParams) {
+            NVSDK_NGX_VULKAN_DestroyParameters(g_capabilityParams);
+            g_capabilityParams = nullptr;
+        }
+        NVSDK_NGX_VULKAN_Shutdown1(g_device);
+        g_initialized = false;
+        g_device = VK_NULL_HANDLE;
+    }
     return (int) r;
 }
 
@@ -367,15 +386,15 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     }
     NVSDK_NGX_Result r = NVSDK_NGX_Result_Success;
 
-    if (renderPreset != 0) {
-        unsigned int preset = (unsigned int) renderPreset;
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, preset);
-    }
+    // The capability block is shared across feature instances, so write every hint on every create;
+    // zero restores the DLL's default when the caller requests the Default preset.
+    unsigned int preset = (unsigned int) renderPreset;
+    NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, preset);
+    NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, preset);
+    NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, preset);
+    NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, preset);
+    NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, preset);
+    NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, preset);
 
     NVSDK_NGX_DLSSD_Create_Params createParams;
     std::memset(&createParams, 0, sizeof(createParams));
@@ -403,6 +422,13 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     }
 
     DlssFeature* feature = (DlssFeature*) std::malloc(sizeof(DlssFeature));
+    if (!feature) {
+        NGX_LOG("create_dlssd: wrapper allocation failed; releasing handle=%p", (void*) handle);
+        if (handle) {
+            NVSDK_NGX_VULKAN_ReleaseFeature(handle);
+        }
+        return nullptr;
+    }
     feature->handle = handle;
     feature->params = params;
     feature->ownsParams = false; // shared capability block, freed at shutdown
@@ -410,21 +436,22 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     return feature;
 }
 
-// Records a DLSS Ray Reconstruction evaluation. Guide buffers: HDR color, linear depth, motion
+// Records a DLSS Ray Reconstruction evaluation. Guide buffers: HDR color, hardware depth, motion
 // vectors, diffuse albedo, specular albedo, world-space normals (roughness packed in normals.w),
-// and reflection motion vectors. Specular hit distance remains in the ABI/resources for debug and
-// easy A/B, but is disabled by leaving pInSpecularHitDistance null.
+// and reflection motion vectors. Particle classification and responsivity are optional render-resolution
+// guides consumed by DLSSD to avoid reusing history for dynamic pixels.
 // Output is the only read-write (storage) resource. All non-output images use the color aspect;
-// depth is a linear value carried in a color image, not a depth-aspect attachment.
-NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
+// depth is a non-linear, reversed-Z hardware value carried in a color image, not a depth-aspect attachment.
+NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd_v2(VkCommandBuffer cmd, void* feature,
                                            VkImageView colorView, VkImage colorImage, int colorFormat,
                                            VkImageView depthView, VkImage depthImage, int depthFormat,
                                            VkImageView mvView, VkImage mvImage, int mvFormat,
                                            VkImageView diffuseAlbedoView, VkImage diffuseAlbedoImage, int diffuseAlbedoFormat,
                                             VkImageView specularAlbedoView, VkImage specularAlbedoImage, int specularAlbedoFormat,
-                                            VkImageView normalsView, VkImage normalsImage, int normalsFormat,
-                                            VkImageView specularMotionView, VkImage specularMotionImage, int specularMotionFormat,
-                                            VkImageView specularHitDistanceView, VkImage specularHitDistanceImage, int specularHitDistanceFormat,
+                                              VkImageView normalsView, VkImage normalsImage, int normalsFormat,
+                                              VkImageView specularMotionView, VkImage specularMotionImage, int specularMotionFormat,
+                                              VkImageView particleMaskView, VkImage particleMaskImage, int particleMaskFormat,
+                                              VkImageView responsivityMaskView, VkImage responsivityMaskImage, int responsivityMaskFormat,
                                             VkImageView outputView, VkImage outputImage, int outputFormat,
                                            unsigned int renderWidth, unsigned int renderHeight,
                                            unsigned int displayWidth, unsigned int displayHeight,
@@ -439,12 +466,10 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
         NGX_LOG("evaluate_dlssd: null feature, returning -1");
         return -1;
     }
-    NGX_LOG("evaluate_dlssd: handle=%p params=%p color=%p depth=%p mv=%p diffuse=%p specular=%p normals=%p specMotion=%p output=%p",
+    NGX_LOG("evaluate_dlssd: handle=%p params=%p color=%p depth=%p mv=%p diffuse=%p specular=%p normals=%p specMotion=%p particles=%p responsivity=%p output=%p",
             (void*) f->handle, (void*) f->params, (void*) colorView, (void*) depthView, (void*) mvView,
-            (void*) diffuseAlbedoView, (void*) specularAlbedoView, (void*) normalsView, (void*) specularMotionView, (void*) outputView);
-    (void) specularHitDistanceView;
-    (void) specularHitDistanceImage;
-    (void) specularHitDistanceFormat;
+            (void*) diffuseAlbedoView, (void*) specularAlbedoView, (void*) normalsView, (void*) specularMotionView,
+            (void*) particleMaskView, (void*) responsivityMaskView, (void*) outputView);
 
     NVSDK_NGX_Resource_VK color = makeImageResource(colorView, colorImage, colorFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK depth = makeImageResource(depthView, depthImage, depthFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
@@ -453,6 +478,8 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     NVSDK_NGX_Resource_VK specularAlbedo = makeImageResource(specularAlbedoView, specularAlbedoImage, specularAlbedoFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK normals = makeImageResource(normalsView, normalsImage, normalsFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK specularMotion = makeImageResource(specularMotionView, specularMotionImage, specularMotionFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK particleMask = makeImageResource(particleMaskView, particleMaskImage, particleMaskFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    NVSDK_NGX_Resource_VK responsivityMask = makeImageResource(responsivityMaskView, responsivityMaskImage, responsivityMaskFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK output = makeImageResource(outputView, outputImage, outputFormat, displayWidth, displayHeight, VK_IMAGE_ASPECT_COLOR_BIT, true);
 
     NVSDK_NGX_VK_DLSSD_Eval_Params eval;
@@ -465,6 +492,10 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     eval.pInSpecularAlbedo = &specularAlbedo;
     eval.pInNormals = &normals;
     eval.pInMotionVectorsReflections = &specularMotion;
+    eval.pInIsParticleMask = &particleMask;
+    eval.pInResponsivityMask = &responsivityMask;
+    eval.InResponsivityMaskSubrectBase.X = 0;
+    eval.InResponsivityMaskSubrectBase.Y = 0;
     eval.pInSpecularHitDistance = nullptr;
     // HW depth needs the projection so DLSS can linearize it (jitter-free; NGX left-multiply layout).
     eval.pInWorldToViewMatrix = worldToViewMatrix;
@@ -638,15 +669,29 @@ NGX_SHIM_EXPORT void ngxshim_release(void* feature) {
     NGX_LOG("release: exit");
 }
 
-NGX_SHIM_EXPORT void ngxshim_shutdown(VkDevice device) {
+NGX_SHIM_EXPORT int ngxshim_shutdown(VkDevice device) {
     NGX_LOG("shutdown: enter device=%p g_device=%p g_capabilityParams=%p", (void*) device, (void*) g_device, (void*) g_capabilityParams);
     if (g_capabilityParams) {
-        NVSDK_NGX_VULKAN_DestroyParameters(g_capabilityParams);
+        NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_DestroyParameters(g_capabilityParams);
+        g_lastResult = (int) r;
+        if (NVSDK_NGX_FAILED(r)) {
+            NGX_LOG("shutdown: DestroyParameters failed r=0x%08x", (unsigned) r);
+            return (int) r;
+        }
         g_capabilityParams = nullptr;
     }
-    NVSDK_NGX_VULKAN_Shutdown1(device ? device : g_device);
+    if (g_initialized) {
+        NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Shutdown1(device ? device : g_device);
+        g_lastResult = (int) r;
+        if (NVSDK_NGX_FAILED(r)) {
+            NGX_LOG("shutdown: Shutdown1 failed r=0x%08x", (unsigned) r);
+            return (int) r;
+        }
+    }
+    g_initialized = false;
     g_device = VK_NULL_HANDLE;
     NGX_LOG("shutdown: exit");
+    return g_lastResult;
 }
 
 } // extern "C"

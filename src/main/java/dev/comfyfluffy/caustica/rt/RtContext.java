@@ -66,11 +66,13 @@ public final class RtContext {
     private final int shaderGroupHandleAlignment;
     private final int maxShaderGroupStride;
     private final int accelerationStructureScratchAlignment;
+    private final int maxPushConstantsSize;
     private final long updateAfterBindCombinedImageSamplerLimit;
     private long commandPool;
 
     private RtContext(VulkanDevice device, long vma, int handleSize, int baseAlign, int handleAlign,
-                      int maxSbtStride, int scratchAlign, long updateAfterBindCombinedImageSamplerLimit) {
+                      int maxSbtStride, int scratchAlign, int maxPushConstantsSize,
+                      long updateAfterBindCombinedImageSamplerLimit) {
         this.device = device;
         this.vk = device.vkDevice();
         this.vma = vma;
@@ -82,6 +84,7 @@ public final class RtContext {
         this.shaderGroupHandleAlignment = handleAlign;
         this.maxShaderGroupStride = maxSbtStride;
         this.accelerationStructureScratchAlignment = scratchAlign;
+        this.maxPushConstantsSize = maxPushConstantsSize;
         this.updateAfterBindCombinedImageSamplerLimit = updateAfterBindCombinedImageSamplerLimit;
         this.gpuExecutor = new RtGpuExecutor(this);
     }
@@ -157,14 +160,17 @@ public final class RtContext {
 
             CausticaMod.LOGGER.info(
                     "RT portability limits: SBT handleAlignment={}, baseAlignment={}, maxStride={}; "
-                            + "AS scratchAlignment={}; update-after-bind combined-sampler limit={}",
+                            + "AS scratchAlignment={}; maxPushConstantsSize={}; "
+                            + "update-after-bind combined-sampler limit={}",
                     rtProps.shaderGroupHandleAlignment(), rtProps.shaderGroupBaseAlignment(),
                     Integer.toUnsignedLong(rtProps.maxShaderGroupStride()),
-                    asProps.minAccelerationStructureScratchOffsetAlignment(), combinedImageSamplerLimit);
+                    asProps.minAccelerationStructureScratchOffsetAlignment(), limits.maxPushConstantsSize(),
+                    combinedImageSamplerLimit);
 
             return new RtContext(device, pVma.get(0), rtProps.shaderGroupHandleSize(), rtProps.shaderGroupBaseAlignment(),
                     rtProps.shaderGroupHandleAlignment(), rtProps.maxShaderGroupStride(),
-                    asProps.minAccelerationStructureScratchOffsetAlignment(), combinedImageSamplerLimit);
+                    asProps.minAccelerationStructureScratchOffsetAlignment(), limits.maxPushConstantsSize(),
+                    combinedImageSamplerLimit);
         }
     }
 
@@ -214,6 +220,11 @@ public final class RtContext {
 
     public int maxShaderGroupStride() {
         return maxShaderGroupStride;
+    }
+
+    /** Device-reported limit for one Vulkan push-constant range, in bytes. */
+    public int maxPushConstantsSize() {
+        return maxPushConstantsSize;
     }
 
     /** Conservative combined-image-sampler limit for a descriptor set using update-after-bind. */
@@ -552,9 +563,13 @@ public final class RtContext {
     }
 
     public static void check(int rc, String what) {
+        check(instance != null ? instance.device : null, rc, what);
+    }
+
+    public static void check(VulkanDevice owner, int rc, String what) {
         if (rc != VK10.VK_SUCCESS) {
-            if (rc == VK10.VK_ERROR_DEVICE_LOST && instance != null) {
-                VulkanDiagnostics.reportDeviceLost(instance.device, what);
+            if (rc == VK10.VK_ERROR_DEVICE_LOST && owner != null) {
+                VulkanDiagnostics.reportDeviceLost(owner, what);
             }
             throw new IllegalStateException(what + " failed: " + rc);
         }

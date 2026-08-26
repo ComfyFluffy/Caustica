@@ -93,17 +93,180 @@ public float fresnelDielectric(float cosI, float etaI, float etaT) {
     return 0.5 * (rs * rs + rp * rp);
 }
 
-// PCG hash RNG.
+// PCG remains available for non-path-sampling scheduling. Stochastic estimator decisions use PathSampler.
 public uint pcg(inout uint s) {
     s = s * 747796405u + 2891336453u;
     uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
     return (w >> 22u) ^ w;
 }
-public float rndf(inout uint s) {
-    // Convert the high 24 bits, which are exactly representable as float. Converting all 32 bits first
-    // lets the top 128 uint values round to 2^32, incorrectly returning 1.0 and breaking `< probability`
-    // tests (most seriously the F == 1 total-internal-reflection branch).
-    return float(pcg(s) >> 8u) * (1.0 / 16777216.0);
+public float rndf(inout uint seed) {
+    return float(pcg(seed) >> 8u) * (1.0 / 16777216.0);
+}
+
+public static const uint PATH_DIM_INTERFACE = 0u;
+public static const uint PATH_DIM_LOBE = 1u;
+public static const uint PATH_DIM_RR = 2u;
+public static const uint PATH_DIM_GGX_U = 0u;
+public static const uint PATH_DIM_GGX_V = 1u;
+public static const uint PATH_DIM_DIFFUSE_U = 0u;
+public static const uint PATH_DIM_DIFFUSE_V = 1u;
+public static const uint PATH_DIM_RIS_GRID_X = 0u;
+public static const uint PATH_DIM_RIS_GRID_Y = 1u;
+public static const uint PATH_DIM_RIS_GRID_Z = 2u;
+public static const uint PATH_DIM_RIS_SELECT = 0u;
+public static const uint PATH_DIM_RIS_REPLACE = 2u;
+public static const uint PATH_DIM_RIS_LIGHT_U = 0u;
+public static const uint PATH_DIM_RIS_LIGHT_V = 1u;
+public static const uint PATH_DIM_SHARC_UPDATE = 0u;
+public static const uint PATH_DIM_CELESTIAL_U = 0u;
+
+public static const uint PATH_GROUP_TRANSPORT_CORE = 0u;
+public static const uint PATH_GROUP_TRANSPORT_SPECULAR = 1u;
+public static const uint PATH_GROUP_TRANSPORT_DIFFUSE = 2u;
+public static const uint PATH_GROUP_RIS_BASE = 3u;
+public static const uint PATH_GROUP_RIS_CANDIDATE_FIRST = 4u;
+public static const uint PATH_GROUP_SHARC = 68u;
+public static const uint PATH_GROUP_CELESTIAL = 69u;
+public static const uint PATH_GROUP_COUNT = 70u;
+public static const uint PATH_BRANCH_COUNT = 2u;
+public static const uint PATH_BOUNCE_COUNT = 9u;
+public static const uint PATH_SOBOL_DIMENSIONS = 4u;
+public static const uint PATH_SOBOL_FIRST_TABLE_DIMENSION = 1u;
+public static const uint PATH_SOBOL_TABLE_DIMENSION_COUNT =
+        PATH_SOBOL_DIMENSIONS - PATH_SOBOL_FIRST_TABLE_DIMENSION;
+public static const uint PATH_SOBOL_WORDS_PER_DIMENSION = 128u;
+public static const uint PATH_DIRECTION_TABLE_OFFSET = 0u;
+public static const uint PATH_ROOT_TABLE_OFFSET = PATH_DIRECTION_TABLE_OFFSET
+        + PATH_SOBOL_TABLE_DIMENSION_COUNT * PATH_SOBOL_WORDS_PER_DIMENSION;
+public static const uint PATH_ROOTS_PER_GROUP = 9u;
+public static const uint PATH_ROOT_INDEX_SHUFFLE = 0u;
+public static const uint PATH_ROOT_COORDINATE_SCRAMBLE_BASE = 1u;
+public static const uint PATH_ROOT_DIGITAL_SHIFT_BASE = 5u;
+public static const uint PATH_EPOCH_KEY = 0x9e3779b9u;
+public static const uint PATH_STATE_BOUNCE_MASK = 0x1eu;
+public static const uint PATH_STATE_GROUP_MASK = 0xfe0u;
+
+public struct PathSampler {
+    public uint globalSample;
+    public uint pixelEpochKey;
+    public uint shuffledIndex;
+    // branch, bounce, and group occupy bits 0, 1..4, and 5..11 of the resource-bounded state.
+    public uint pathState;
+}
+
+public uint pathHash(uint value) {
+    uint x = value;
+    x ^= x >> 16u;
+    x *= 0x21f0aaadu;
+    x ^= x >> 15u;
+    x *= 0xf35a2d97u;
+    x ^= x >> 15u;
+    return x;
+}
+
+public uint pathReverseBits(uint value) {
+    // The pinned Slang toolchain lowers this intrinsic to SPIR-V OpBitReverse.
+    return reversebits(value);
+}
+
+public uint pathNestedUniformPermutation(uint value, uint seed) {
+    uint x = pathReverseBits(value);
+    x ^= x * 0x3d20adeau;
+    x += seed;
+    x *= (seed >> 16u) | 1u;
+    x ^= x * 0x05526c56u;
+    x ^= x * 0x53a22864u;
+    return pathReverseBits(x);
+}
+
+public uint pathRootBase(in PathSampler sampler) {
+    uint state = sampler.pathState;
+    return PATH_ROOT_TABLE_OFFSET
+            + (((state & 1u) * PATH_BOUNCE_COUNT + ((state >> 1u) & 15u)) * PATH_GROUP_COUNT
+                    + (state >> 5u)) * PATH_ROOTS_PER_GROUP;
+}
+
+public void rekeyPathSampler(inout PathSampler sampler) {
+    ConstPtr<uint> data = ConstPtr<uint>(worldPush.pathSampleAddr);
+    uint rootBase = pathRootBase(sampler);
+    uint indexSeed = pathHash(data[rootBase + PATH_ROOT_INDEX_SHUFFLE]
+            ^ sampler.pixelEpochKey);
+    sampler.shuffledIndex = pathNestedUniformPermutation(sampler.globalSample, indexSeed);
+}
+
+public PathSampler makePathSampler(uint2 pixel, uint localSample, uint pathBranch) {
+    uint pixelCode = pixel.x | (pixel.y << 16u);
+    PathSampler sampler;
+    sampler.globalSample = worldPush.pathSampleBase + localSample;
+    sampler.pixelEpochKey = pixelCode ^ worldPush.pathSampleEpoch * PATH_EPOCH_KEY;
+    sampler.shuffledIndex = sampler.globalSample;
+    sampler.pathState = pathBranch | (PATH_GROUP_TRANSPORT_CORE << 5u);
+    return sampler;
+}
+
+public void beginPathBounce(inout PathSampler sampler, uint bounce) {
+    sampler.pathState = (sampler.pathState & ~PATH_STATE_BOUNCE_MASK) | (bounce << 1u);
+    rekeyPathSampler(sampler);
+}
+
+public PathSampler pathSamplerWithGroup(in PathSampler parent, uint group) {
+    PathSampler sampler = parent;
+    sampler.pathState = (sampler.pathState & ~PATH_STATE_GROUP_MASK) | (group << 5u);
+    rekeyPathSampler(sampler);
+    return sampler;
+}
+
+public uint pathSobolBitsFromGray(ConstPtr<uint> data, uint gray, uint dimension) {
+    if (dimension == 0u) return pathReverseBits(gray);
+    uint tableDimension = dimension - PATH_SOBOL_FIRST_TABLE_DIMENSION;
+    uint base = PATH_DIRECTION_TABLE_OFFSET + tableDimension * PATH_SOBOL_WORDS_PER_DIMENSION;
+    return data[base + ((gray >> 0u) & 15u)]
+            ^ data[base + 16u + ((gray >> 4u) & 15u)]
+            ^ data[base + 32u + ((gray >> 8u) & 15u)]
+            ^ data[base + 48u + ((gray >> 12u) & 15u)]
+            ^ data[base + 64u + ((gray >> 16u) & 15u)]
+            ^ data[base + 80u + ((gray >> 20u) & 15u)]
+            ^ data[base + 96u + ((gray >> 24u) & 15u)]
+            ^ data[base + 112u + ((gray >> 28u) & 15u)];
+}
+
+public float pathSampleValue(ConstPtr<uint> data, in PathSampler sampler, uint rootBase, uint gray,
+                             uint dimension) {
+    uint bits = pathSobolBitsFromGray(data, gray, dimension);
+    uint scrambleSeed = pathHash(
+            data[rootBase + PATH_ROOT_COORDINATE_SCRAMBLE_BASE + dimension]
+                    ^ sampler.pixelEpochKey);
+    bits = pathNestedUniformPermutation(bits, scrambleSeed);
+    uint digitalShift = pathHash(data[rootBase + PATH_ROOT_DIGITAL_SHIFT_BASE + dimension]
+            ^ sampler.pixelEpochKey);
+    bits ^= digitalShift;
+    return float(bits >> 8u) * (1.0 / 16777216.0);
+}
+
+public float pathSample(in PathSampler sampler, uint dimension) {
+    ConstPtr<uint> data = ConstPtr<uint>(worldPush.pathSampleAddr);
+    uint sampleIndex = sampler.shuffledIndex;
+    return pathSampleValue(data, sampler, pathRootBase(sampler),
+            sampleIndex ^ (sampleIndex >> 1u), dimension);
+}
+
+public float2 pathSample2(in PathSampler sampler, uint dimensionBase) {
+    ConstPtr<uint> data = ConstPtr<uint>(worldPush.pathSampleAddr);
+    uint sampleIndex = sampler.shuffledIndex;
+    uint gray = sampleIndex ^ (sampleIndex >> 1u);
+    uint rootBase = pathRootBase(sampler);
+    return float2(pathSampleValue(data, sampler, rootBase, gray, dimensionBase),
+            pathSampleValue(data, sampler, rootBase, gray, dimensionBase + 1u));
+}
+
+public float3 pathSample3(in PathSampler sampler, uint dimensionBase) {
+    ConstPtr<uint> data = ConstPtr<uint>(worldPush.pathSampleAddr);
+    uint sampleIndex = sampler.shuffledIndex;
+    uint gray = sampleIndex ^ (sampleIndex >> 1u);
+    uint rootBase = pathRootBase(sampler);
+    return float3(pathSampleValue(data, sampler, rootBase, gray, dimensionBase),
+            pathSampleValue(data, sampler, rootBase, gray, dimensionBase + 1u),
+            pathSampleValue(data, sampler, rootBase, gray, dimensionBase + 2u));
 }
 
 public float3 primaryRayDir(float2 ndc) {
@@ -124,9 +287,10 @@ public float primaryRayConeSpread(float2 ndc, float2 size, float3 dir) {
 // Cosine-weighted hemisphere sample about n (Malley's method). For a Lambertian BRDF this is the
 // importance-sampling match: BRDF*cos/pdf = (albedo/PI)*cos / (cos/PI) = albedo, so the continuation
 // throughput is just *= albedo with no PI/cos bookkeeping left over.
-public float3 cosineDir(float3 n, inout uint s) {
-    float u1 = rndf(s);
-    float u2 = rndf(s);
+public float3 cosineDir(float3 n, in PathSampler sampler, uint dimensionBase) {
+    float2 samples = pathSample2(sampler, dimensionBase);
+    float u1 = samples.x;
+    float u2 = samples.y;
     float r = sqrt(u1);
     float phi = 6.2831853 * u2;
     float3 t = normalize(abs(n.x) > 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0));
@@ -136,25 +300,21 @@ public float3 cosineDir(float3 n, inout uint s) {
     return normalize(local.x * t + local.y * b + local.z * n);
 }
 
-// Soft shadows: sample a direction within the light's SQUARE angular extent about `axis`. MC's sun/moon
-// are square quads, so the NEE shadow ray samples a square (not a cone) — the same square, in the same
-// horizon-levelled tangent frame (sky.celestialSquareFrame), that world.rmiss draws the visible body in.
-// Averaged over frames by DLSS-RR this yields soft penumbrae that widen with occluder distance
-// (contact-hardening) for free. halfAngle <= 0 ⇒ exact direction (hard).
-public float3 sampleSquare(float3 axis, float halfAngle, inout uint s) {
+public float3 sampleSquare(float3 axis, float halfAngle, in PathSampler sampler, uint dimensionBase) {
     float3 right;
     float3 up;
     celestialSquareFrame(axis, right, up);
     float t = tan(halfAngle);
-    float u = (rndf(s) * 2.0 - 1.0) * t;
-    float v = (rndf(s) * 2.0 - 1.0) * t;
+    float2 samples = pathSample2(sampler, dimensionBase);
+    float u = (samples.x * 2.0 - 1.0) * t;
+    float v = (samples.y * 2.0 - 1.0) * t;
     return normalize(axis + u * right + v * up);
 }
 
 // Sample a GGX visible-normal (VNDF, Heitz 2018) about geometric normal n for view ve, returning the
 // sampled microfacet normal (half-vector) in world space. Paired with the separable Smith term, the
 // importance-sampling weight reduces to F * G1(NdotL) (applied by the caller).
-public float3 sampleGGXVNDF(float3 n, float3 ve, float alpha, inout uint s) {
+public float3 sampleGGXVNDF(float3 n, float3 ve, float alpha, in PathSampler sampler, uint dimensionBase) {
     float3 t = normalize(abs(n.x) > 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0));
     float3 b = normalize(cross(n, t));
     t = cross(b, n);
@@ -164,8 +324,9 @@ public float3 sampleGGXVNDF(float3 n, float3 ve, float alpha, inout uint s) {
     float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
     float3 T1 = lensq > 0.0 ? float3(-Vh.y, Vh.x, 0.0) * rsqrt(lensq) : float3(1.0, 0.0, 0.0);
     float3 T2 = cross(Vh, T1);
-    float u1 = rndf(s);
-    float u2 = rndf(s);
+    float2 samples = pathSample2(sampler, dimensionBase);
+    float u1 = samples.x;
+    float u2 = samples.y;
     float r = sqrt(u1);
     float phi = 6.2831853 * u2;
     float p1 = r * cos(phi);

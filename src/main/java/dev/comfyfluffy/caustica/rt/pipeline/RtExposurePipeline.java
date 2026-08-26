@@ -35,6 +35,8 @@ import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.*;
 /** Compute pipelines for histogram auto-exposure over the RT HDR trace output. */
 final class RtExposurePipeline {
     private static final String SHADER_DIR = "/caustica/shaders/pipelines/";
+    private static final int HISTOGRAM_WORKGROUP_SIZE = 16;
+    private static final long MAX_WEIGHTED_SAMPLES = 0xffff_ffffL / 256L;
 
     private final RtContext ctx;
     private final long histDescriptorSetLayout;
@@ -195,14 +197,62 @@ final class RtExposurePipeline {
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, histPipelineLayout, 0,
                     stack.longs(histDescriptorSet), null);
             ByteBuffer push = stack.malloc(ExposureHistPushData.BYTE_SIZE);
-            new ExposureHistPushData(config.stride(), config.centerWeightSigma(), config.centerWeightFloor())
+            int stride = effectiveStride(width, height, config.stride());
+            new ExposureHistPushData(stride, config.centerWeightSigma(), config.centerWeightFloor())
                     .write(push);
             VK10.vkCmdPushConstants(cmd, histPipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
-            int stride = config.stride();
-            int sampleWidth = (width + stride - 1) / stride;
-            int sampleHeight = (height + stride - 1) / stride;
-            VK10.vkCmdDispatch(cmd, (sampleWidth + 15) / 16, (sampleHeight + 15) / 16, 1);
+            VK10.vkCmdDispatch(cmd, dispatchGroups(width, stride), dispatchGroups(height, stride), 1);
         }
+    }
+
+    static int safeStride(int stride) {
+        return Math.max(stride, 1);
+    }
+
+    static int effectiveStride(int width, int height, int requested) {
+        int stride = safeStride(requested);
+        int maxDimension = Math.max(Math.max(width, height), 1);
+        while (weightedSampleCount(width, height, stride) > MAX_WEIGHTED_SAMPLES
+                && stride < maxDimension) {
+            int next = stride > maxDimension / 2 ? maxDimension : stride * 2;
+            if (next == stride) {
+                break;
+            }
+            stride = next;
+        }
+        int low = safeStride(requested);
+        int high = stride;
+        while (low < high) {
+            int middle = low + (high - low) / 2;
+            if (weightedSampleCount(width, height, middle) <= MAX_WEIGHTED_SAMPLES) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        return low;
+    }
+
+    private static long weightedSampleCount(int width, int height, int stride) {
+        long columns = sampledExtent(width, stride);
+        long rows = sampledExtent(height, stride);
+        if (columns > Long.MAX_VALUE / rows) {
+            return Long.MAX_VALUE;
+        }
+        return columns * rows;
+    }
+
+    static int sampledExtent(int extent, int stride) {
+        long positiveExtent = Math.max((long) extent, 1L);
+        long safeDivisor = safeStride(stride);
+        long samples = (positiveExtent + safeDivisor - 1L) / safeDivisor;
+        return (int) Math.min(Integer.MAX_VALUE, Math.max(samples, 1L));
+    }
+
+    static int dispatchGroups(int extent, int stride) {
+        long samples = sampledExtent(extent, stride);
+        long groups = (samples + HISTOGRAM_WORKGROUP_SIZE - 1L) / HISTOGRAM_WORKGROUP_SIZE;
+        return (int) Math.min(Integer.MAX_VALUE, Math.max(groups, 1L));
     }
 
     void dispatchResolve(org.lwjgl.vulkan.VkCommandBuffer cmd, RtExposure.AutoConfig config, float frameTimeSeconds) {
