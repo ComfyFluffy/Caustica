@@ -31,6 +31,9 @@ import trace_ser;
 import lighting;
 import sky;
 import bindings;
+import fog;
+import clouds;
+import restir;
 
 // Atmospheric transmittance LUT (RtSkyLut), also bound to world.rmiss at the same binding: raygen reads it
 // to colour the NEE sun/moonlight, the miss shader reads it to tint the visible discs and stars.
@@ -61,6 +64,14 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     // (so the first ray already carries the right relative index and absorption); for a segment split off
     // a dielectric it is whatever the parent was travelling through.
     MediumStack medium = seg.medium;
+    FogParams fog = makeFogParams(worldPush);
+    SkyState fogSky = skyState(worldPush);
+    // Cloud shadowing runs on shadow rays, which every bounce casts, so unlike the view march it is
+    // affordable here — a coarse 8-step march of a 2-octave field, and only when a deck exists at all.
+    CloudParams shadowClouds = makeCloudParams(worldPush);
+    float cloudShadowStrength = worldPush.cloud2.x;
+    float cloudShadowFloor = worldPush.cloud2.y;
+    float wetness = worldPush.cloud2.z;
     bool waterWaves = (worldPush.flags & 16u) != 0u; // animated wave-normal perturbation
     // Sky-disc gate (see world.rmiss): the sun/moon disc is shown to the primary ray and to rays spawned
     // by a specular/dielectric bounce (mirror reflections + refractions of the sun/moon), but hidden from
@@ -73,6 +84,20 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     // remains active with its full configured candidate count at every hit. Pass A's primary/interface
     // prefix is outside this SSS quality budget.
     int indirectDepth = 0;
+    // Pass A consumed the camera -> first-dielectric prefix, so Pass B never walks it and would leave the
+    // fog off anything seen through water or glass. Re-integrate that prefix here as a straight segment
+    // from the eye to this record's origin. Refraction bent the real path, but fog is a smooth function
+    // of position over tens of blocks and the bend is sub-block, so the straight-line approximation is
+    // below the noise floor. Both Fresnel branches get it, each weighted by its own throughput, and those
+    // two throughputs sum to one — so the in-scatter is added once, not twice.
+    if (seg.bounce > 0 && fogActive(fog)) {
+        float3 fromEye = ro - worldPush.camOffset;
+        float prefix = length(fromEye);
+        if (prefix > 1.0e-3) {
+            applyFogSegment(fog, fogSky, airMedium(), worldPush, worldPush.camOffset, fromEye / prefix, prefix,
+                            L, throughput);
+        }
+    }
     for (int bounce = seg.bounce; bounce <= maxBounces; bounce++) {
         // Radiance SBT records run any-hit only for true alpha cutout. Translucent/water go straight to
         // closest-hit for dielectric handling. Geometry is double-sided; the chit flips the normal.
@@ -100,6 +125,11 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             // world.rmiss writes sky radiance (gradient + sun/moon disc + stars) into the payload's
             // surface words as a full float3, so this is absolute scene units with nothing to undo. The
             // packed show-celestial flag decides whether this path segment may see the bright disc.
+            // Fog first: the escaping ray still crossed the whole fogged column, so the sky it reveals is
+            // attenuated by that column and the column's own in-scatter is added in front of it. At the
+            // horizon the two converge on the same sky-view texel, which is why a fogged horizon fades
+            // INTO the sky instead of forming a visible band against it.
+            applyFogSegment(fog, fogSky, medium.current, worldPush, ro, rd, FOG_MAX_DISTANCE, L, throughput);
             float3 sky = payloadSky();
             L += throughput * sky; // escaped to sky
             break;
@@ -112,6 +142,9 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         if (any(medium.current.extinction > 0.0)) {
             throughput *= exp(-medium.current.extinction * payload.hitT);
         }
+        // Air only — applyFogSegment gates on the medium itself, so a segment inside water or glass is a
+        // no-op here and its own extinction above remains the complete answer.
+        applyFogSegment(fog, fogSky, medium.current, worldPush, ro, rd, payload.hitT, L, throughput);
 
         float3 n = payloadNormal(); // oriented toward the incoming ray by the closest-hit
         float3 hitPos = ro + rd * payload.hitT;
@@ -212,6 +245,12 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             if (ndl > 0.0) {
                 float3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
                 float3 vis = visibility(shadowOrigin, lightDir, 10000.0).transmittance;
+                // Particles get their own evaluation: this branch returns before the terrain shading
+                // vertex below, so there is no shared value to hoist here. Same bounce cap.
+                if (bounce <= 1) {
+                    vis *= cloudShadowTransmittance(shadowClouds, hitPos, lightDir,
+                                                    cloudShadowStrength, cloudShadowFloor);
+                }
                 if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
                     L += throughput * albedo * INV_PI * celestialLight.illuminance * ndl * vis;
                 }
@@ -253,6 +292,15 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         // reflection sharp instead of accumulating it as a glossy lobe.
         bool exactSpecular = isDeltaAlpha(rough);
         rough = exactSpecular ? 0.0 : rough;
+        // Rain wetness. The upward visibility test is an extra ray per shaded vertex, so it is gated on
+        // there being rain at all: in clear weather this costs one comparison. The ray is short — 320
+        // blocks clears any plausible build without paying for a full-height trace — and only its
+        // luminance is used, so a surface under stained glass is treated as partly exposed, which is
+        // closer to right than a binary test.
+        if (wetness > 0.0 && n.y > 0.0) {
+            float skyExposure = luminance(visibility(p, float3(0.0, 1.0, 0.0), 320.0).transmittance);
+            applyWetness(wetness, skyExposure, n, albedo, rough);
+        }
         float3 diffAlb = albedo * (1.0 - metal);
         float3 F0 = payload.f0;
 
@@ -284,10 +332,25 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         if (lightHalfAngle > 0.0) {
             lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
         }
+        // Cloud shadow, computed ONCE per shading vertex. It was previously evaluated at each of the
+        // three NEE sites below, all of which use the same shading point and the same light direction —
+        // so two thirds of the work was recomputing an identical number. Each evaluation is an 8-step
+        // march of a 2-octave field, so this is the single cheapest large saving available here.
+        //
+        // Also capped by bounce: the deck's shadow on a second-order bounce is a small correction to an
+        // already-dim contribution, and skipping it there costs nothing visible while removing the
+        // march from the majority of rays in a deep path.
+        float cloudShadow = bounce <= 1
+                ? cloudShadowTransmittance(shadowClouds, hitPos, lightDir,
+                                           cloudShadowStrength, cloudShadowFloor)
+                : 1.0;
         float ndl = max(0.0, dot(n, lightDir));
         if (ndl > 0.0) {
             VisibilityResult shadow = visibility(p, lightDir, 10000.0);
-            float3 vis = shadow.transmittance;
+            // The deck attenuates the light before it ever reaches the geometry, so it multiplies the
+            // shadow ray's visibility rather than the illuminance: same term, and it stays correct when
+            // the caustic factor below scales the whole NEE contribution.
+            float3 vis = shadow.transmittance * cloudShadow;
             // Underwater receiver whose shadow ray crossed a water surface: scale the direct light by
             // the wave-refraction caustic at the exit point. Focusing scales the incident irradiance,
             // so it applies to the whole NEE term (diffuse + specular).
@@ -308,15 +371,70 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             }
         }
 
-        // RIS direct lighting from block emitters (single-frame only, no temporal reservoir reuse).
+        // RIS direct lighting from block emitters, with optional ReSTIR temporal reuse at the primary
+        // hit (restir.slang).
         // Front lobe + SSS backlighting are resampled together and share ONE shadow ray — a light can
         // only be in front of n or behind it, never both, so combining them into one target function is
         // exact, not an approximation. The SSS term is gated off past MAX_SSS_INDIRECT_DEPTH by passing
         // sss=0 there (falls back to plain front-only RIS).
         if (risOn) {
             float activeSss = hitDepth <= MAX_SSS_INDIRECT_DEPTH ? sss : 0.0;
+            // ReSTIR temporal reuse, primary hit only. A secondary bounce has no stable screen-space
+            // identity to reproject through, so reusing history there would combine unrelated surfaces.
             Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, false, activeSss,
                                      seed, proposalSeed);
+            // Primary hit only, and only for the camera's own path: bounce > 0 and the queued
+            // dielectric leaves have no stable screen-space identity to reproject through, so reusing
+            // history there would be combining unrelated surfaces into one pixel's reservoir.
+            float restirStrength = worldPush.restir.x;
+            bool restirPixel = restirStrength > 0.0 && bounce == 0 && seg.bounce == 0;
+            if (restirPixel) {
+                uint parity = uint(worldPush.restir.y + 0.5);
+                // Reprojection through the surface motion vector the guides already produce for DLSS,
+                // so history follows a moving surface rather than a fixed screen position.
+                float2 motion = gMotion[int2(pix)];
+                int2 prevPix = int2(floor(float2(pix) + 0.5 - motion));
+                uint reservoirW;
+                uint reservoirH;
+                reservoirA.GetDimensions(reservoirW, reservoirH);
+                // The images are double-width, so the addressable pixel count is half the texel width.
+                int renderWidth = int(reservoirW) / 2;
+                // Clamped rather than skipped: a pixel whose reprojection left the screen still has
+                // usable neighbours, and anchoring the spatial taps at the edge is better than
+                // dropping reuse entirely for everything moving off-frame.
+                prevPix = int2(clamp(prevPix.x, 0, renderWidth - 1),
+                               clamp(prevPix.y, 0, int(reservoirH) - 1));
+                {
+                    PackedReservoir history = loadReservoir(prevPix, parity);
+                    // Geometric rejection: same depth and normal, or the sample belonged to another
+                    // surface that merely happened to land on this pixel last frame.
+                    float currentDepth = payload.hitT;
+                    float historyDepth = gDepth[prevPix];
+                    float3 historyNormal = gNormal[prevPix].xyz;
+                    if (temporalSurfaceMatches(currentDepth, historyDepth, n, historyNormal)) {
+                        r = temporalCombine(r, history, hitPos, n, v, rd, diffAlb, F0, rough,
+                                            false, activeSss, seed);
+                    }
+                }
+                // Spatial reuse. Taps read the same history image, for the reason given in
+                // restir.slang: sampling this frame's output would race the concurrent writes of the
+                // very dispatch doing the sampling.
+                int spatialTaps = min(int(worldPush.restir.z), RESTIR_MAX_SPATIAL_TAPS);
+                float spatialRadius = worldPush.restir.w;
+                for (int tap = 0; tap < spatialTaps; ++tap) {
+                    int2 tapPix = prevPix + spatialTapOffset(spatialRadius, seed);
+                    if (any(tapPix < int2(0, 0)) || tapPix.x >= renderWidth
+                            || tapPix.y >= int(reservoirH)) {
+                        continue;
+                    }
+                    if (!temporalSurfaceMatches(payload.hitT, gDepth[tapPix], n, gNormal[tapPix].xyz)) {
+                        continue;
+                    }
+                    r = temporalCombine(r, loadReservoir(tapPix, parity), hitPos, n, v, rd,
+                                        diffAlb, F0, rough, false, activeSss, seed);
+                }
+                storeReservoir(int2(pix), parity, toPacked(r));
+            }
             L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, false,
                                              activeSss);
         }
@@ -337,6 +455,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                     visB *= waterCaustic(hitPos + lightDir * shadowBack.waterHitT,
                                          lightDir, shadowBack.waterHitT);
                 }
+                visB *= cloudShadow;
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);
                     L += throughput * diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * backNdl * celestialLight.illuminance * visB;

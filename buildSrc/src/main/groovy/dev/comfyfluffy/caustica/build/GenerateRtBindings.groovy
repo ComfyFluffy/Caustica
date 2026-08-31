@@ -31,6 +31,8 @@ abstract class GenerateRtBindings extends DefaultTask {
                     TLAS: "topLevelAS", OUTPUT: "outImage", BLOCK_ALBEDO: "blockAlbedoAtlas",
                     G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth", G_MOTION: "gMotion",
                     G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",
+                    RESERVOIR_A: "reservoirA", RESERVOIR_B: "reservoirB",
+                    CLOUD_NOISE: "cloudNoiseTex",
                     CELESTIALS: "celestialsAtlas", SKY_VIEW: "skyViewLut", TRANSMITTANCE: "transmittanceLut",
                     ENTITY_ALBEDO: "entityAlbedoTex", MATERIAL_SURFACE0: "materialSurface0Tex",
                     MATERIAL_NORMAL_AO: "materialNormalAoTex", MATERIAL_SURFACE1: "materialSurface1Tex"]],
@@ -120,9 +122,15 @@ abstract class GenerateRtBindings extends DefaultTask {
                 constants.WORLD_SET = ordinary.values().first().set
                 ordinary.each { suffix, location -> constants["WORLD_${suffix}"] = location.index }
                 def guides = ordinary.findAll { suffix, ignored -> (suffix as String).startsWith("G_") }
-                def storageImages = guides + ordinary.findAll { suffix, ignored -> suffix == "OUTPUT" }
+                // RESERVOIR_* are storage images like the guides, but deliberately not counted as guides:
+                // WORLD_GUIDE_COUNT bounds setExtraStorageImage's slot range, which addresses bindings
+                // contiguously from WORLD_G_NORMAL. Folding the reservoirs in there would let a guide
+                // slot index walk into them.
+                def reservoirs = ordinary.findAll { suffix, ignored -> (suffix as String).startsWith("RESERVOIR_") }
+                def storageImages = guides + reservoirs + ordinary.findAll { suffix, ignored -> suffix == "OUTPUT" }
                 def samplers = ordinary.findAll { suffix, ignored -> suffix != "TLAS" && !storageImages.containsKey(suffix) }
                 constants.WORLD_GUIDE_COUNT = guides.size()
+                constants.WORLD_RESERVOIR_COUNT = reservoirs.size()
                 constants.WORLD_SET_BINDING_COUNT = ordinary.values()*.index.max() + 1
                 constants.WORLD_SET_STORAGE_IMAGE_COUNT = storageImages.size()
                 constants.WORLD_SET_SAMPLER_COUNT = samplers.size()

@@ -20,6 +20,7 @@ import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float4;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Int4;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.BiomeColors;
+import net.minecraft.world.attribute.EnvironmentAttributes;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.ModelBakery;
@@ -37,6 +38,8 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.KHRSynchronization2;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VkClearColorValue;
+import org.lwjgl.vulkan.VkImageSubresourceRange;
 import org.lwjgl.vulkan.VkBufferImageCopy;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDependencyInfo;
@@ -69,6 +72,7 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtSdrPresentPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtExposure;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtToneLut;
+import dev.comfyfluffy.caustica.rt.terrain.RtCloudNoise;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 
 import java.nio.ByteBuffer;
@@ -244,6 +248,24 @@ public final class RtComposite {
     private RtImage gMotion;
     private RtImage gSpecAlbedo;
     private RtImage gSpecMotion;
+    /**
+     * ReSTIR temporal reservoirs. Two images, both bound for the pipeline's lifetime, swapping the
+     * roles of history and destination each frame via a push constant rather than by rewriting
+     * descriptors — see {@link RtPipeline#setReservoirImages}. Double-width: two texels per pixel.
+     */
+    /**
+     * Precomputed cloud shape field. Created once and never rewritten — the wind offset moves the
+     * sampling domain rather than the data, so nothing here changes after upload.
+     */
+    private RtImage cloudNoise;
+    private long cloudNoiseSampler;
+    private RtImage reservoirA;
+    private RtImage reservoirB;
+    /** Flips each frame; 0 means A is history. */
+    private int reservoirParity;
+    /** Set whenever history becomes meaningless — first frame, resize, dimension change. */
+    private boolean reservoirHistoryValid;
+    private Object reservoirDimension;
     // Display-res RT image the display mapper reads: DLSS-RR writes it (render -> display denoise+upscale), or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
@@ -604,12 +626,20 @@ public final class RtComposite {
                 debugPresentPipeline = RtDebugPresentPipeline.create(ctx);
             }
             if (sdrToneLut == null) {
-                sdrToneLut = RtToneLut.load(ctx, "sdr_aces2_rec709.bin");
+                // SDR view transform is selectable: ACES 2.0 (the renderer's default) or either AgX
+                // appearance baked from sobotka/AgX. Only the SDR path branches — AgX has no HDR output
+                // transform, so the PQ path below stays ACES 2.0 regardless of this setting.
+                sdrToneLut = RtToneLut.load(ctx, CausticaConfig.Rt.Tonemap.sdrLutResource());
             }
             // The mastering target is live, so track it each frame.
             int wantedHdrNits = CausticaConfig.Rt.Hdr.PEAK_NITS.value();
             if (hdrToneLut == null || loadedHdrLutNits != wantedHdrNits) {
-                RtToneLut newHdrLut = RtToneLut.load(ctx, "hdr_aces2_rec2020_" + wantedHdrNits + "nit.bin");
+                // The AgX HDR LUT has no per-peak variants: its tone curve rolls off to its own white
+                // point rather than to the display's, so a 4000 nit bake would be identical to a 500
+                // nit one. That is the honest consequence of AgX having no HDR output transform — this
+                // is the AgX look in a PQ container, not AgX extended to HDR range.
+                String hdrLutName = CausticaConfig.Rt.Tonemap.hdrLutResource(wantedHdrNits);
+                RtToneLut newHdrLut = RtToneLut.load(ctx, hdrLutName);
                 if (newHdrLut.size != sdrToneLut.size) {
                     // display.comp's lutSize push constant is shared by both LUT samples (see
                     // lutTexCoord()); bake_display_lut.py currently always sizes both the same, but
@@ -722,6 +752,9 @@ public final class RtComposite {
                     new String[]{"sky.rmiss.spv", "guide.rmiss.spv"},
                     "closest_hit.rchit.spv", "any_hit.rahit.spv",
                     WorldPushConstantsData.BYTE_SIZE, bindlessTextureCapacity);
+            // Cloud noise is a descriptor owned by the world pipeline. Create/bind it only after the pipeline
+            // exists; recreating the pipeline simply rebinds the device-lifetime texture and sampler.
+            ensureCloudNoise(ctx);
             // Per-frame world data lives in this BDA ring; the pipeline pushes its address and hot fields.
             if (pushRing == null) {
                 pushRing = new PushSlot[PUSH_RING];
@@ -857,6 +890,7 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(3, gMotion.view);
         worldPipeline.setExtraStorageImage(4, gSpecAlbedo.view);
         worldPipeline.setExtraStorageImage(5, gSpecMotion.view);
+        worldPipeline.setReservoirImages(reservoirA.view, reservoirB.view);
     }
 
     private void destroyGuideImages() {
@@ -883,6 +917,14 @@ public final class RtComposite {
         if (gSpecMotion != null) {
             gSpecMotion.destroy();
             gSpecMotion = null;
+        }
+        if (reservoirA != null) {
+            reservoirA.destroy();
+            reservoirA = null;
+        }
+        if (reservoirB != null) {
+            reservoirB.destroy();
+            reservoirB = null;
         }
         if (rrOutput != null) {
             rrOutput.destroy();
@@ -968,6 +1010,31 @@ public final class RtComposite {
         gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide motion " + renderW + "x" + renderH);
         gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderW + "x" + renderH);
         gSpecMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderW + "x" + renderH);
+        // ReSTIR reservoirs, at RENDER resolution and double width (two texels per pixel). rgba32f
+        // because the stored emitter position is a rebased world coordinate: a half there quantises
+        // light positions into visible banding across a large room. Recreated with the guides, so a
+        // resolution or DLSS-quality change reallocates them and invalidates history along with it.
+        reservoirA = ctx.createStorageImage(renderW * 2, renderH, VK10.VK_FORMAT_R32G32B32A32_SFLOAT,
+                "ReSTIR reservoir A " + renderW + "x" + renderH);
+        reservoirB = ctx.createStorageImage(renderW * 2, renderH, VK10.VK_FORMAT_R32G32B32A32_SFLOAT,
+                "ReSTIR reservoir B " + renderW + "x" + renderH);
+        reservoirHistoryValid = false;
+        reservoirParity = 0;
+        // Zero both images at creation. The history-valid flag guards the frame AFTER a reallocation,
+        // but it is a whole-frame switch and reservoir writes are per-pixel: a pixel the raygen never
+        // reaches — sky, or any pixel whose primary ray found no emitter-lit surface — is never written,
+        // so once the flag flips on, that pixel's neighbours read whatever the allocator left in memory.
+        // packedValid() rejects M<=0, and zeroed memory gives exactly that; undefined memory does not.
+        ctx.submitSync(cmd -> {
+            try (MemoryStack clearStack = MemoryStack.stackPush()) {
+                VkClearColorValue zero = VkClearColorValue.calloc(clearStack);
+                VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, clearStack);
+                range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+                VK10.vkCmdClearColorImage(cmd, reservoirA.image, VK10.VK_IMAGE_LAYOUT_GENERAL, zero, range);
+                VK10.vkCmdClearColorImage(cmd, reservoirB.image, VK10.VK_IMAGE_LAYOUT_GENERAL, zero, range);
+            }
+        });
         // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
         rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
         exposure.ensureResources(ctx);
@@ -1121,6 +1188,182 @@ public final class RtComposite {
             // resolved slot rides along with the uploadPending() call right below.
             BreakEntry[] breaking = breakingEntries(terrain);
             SkyPush sky = skyPush();
+            // Height fog. The reference plane is authored in world Y but the shader works in rebased
+            // coordinates, so the terrain origin is subtracted here rather than pushing the origin into
+            // the shader: it keeps the value small enough for fp32 no matter how far the player walks.
+            // falloff is 1/scale-height; the clamp only guards a hand-edited config, since the setting
+            // itself is already bounded away from zero.
+            // Weather and biome climate. Both are read once per frame from the camera's position: fog and
+            // a cloud deck are whole-sky properties, so sampling them per-pixel would buy nothing but a
+            // seam where two biomes meet.
+            //
+            // Vanilla interpolates rain and thunder over ~½ second, and getRainLevel already returns the
+            // smoothed value, so weather ramps in and out without any easing of ours. Thunder is layered
+            // on top of rain rather than replacing it — vanilla raises both during a storm.
+            float rainLevel = 0f;
+            float thunderLevel = 0f;
+            // Biome climate stands in for the per-biome sky colours that 26.2 no longer carries:
+            // BiomeSpecialEffects was reduced to water and foliage tints, so temperature and whether the
+            // biome has precipitation are the only atmosphere-relevant signals vanilla still exposes.
+            // Cold and wet reads as hazy, hot and dry as clear — the mapping a desert-vs-taiga eye test
+            // would produce anyway.
+            float biomeHaze = 1f;
+            float wetness = 0f;
+            if (level != null) {
+                rainLevel = Mth.clamp(level.getRainLevel(1.0f), 0f, 1f);
+                thunderLevel = Mth.clamp(level.getThunderLevel(1.0f), 0f, 1f);
+                // A negative override means "use the world". Applied after reading rather than instead
+                // of it, so turning the override off returns to live weather without a reload.
+                float rainOverride = CausticaConfig.Rt.Weather.RAIN_OVERRIDE.value();
+                if (rainOverride >= 0f) {
+                    rainLevel = rainOverride;
+                }
+                float thunderOverride = CausticaConfig.Rt.Weather.THUNDER_OVERRIDE.value();
+                if (thunderOverride >= 0f) {
+                    thunderLevel = thunderOverride;
+                }
+                var biome = level.getBiome(cameraBlockPos).value();
+                // getBaseTemperature is roughly 0 (snowy) to 2 (desert/nether) in vanilla data.
+                float temperature = Mth.clamp(biome.getBaseTemperature(), 0f, 2f);
+                float climate = (1f - temperature * 0.5f) * (biome.hasPrecipitation() ? 1f : 0.35f);
+                float biomeResponse = CausticaConfig.Rt.Fog.BIOME_RESPONSE.value();
+                biomeHaze = Mth.lerp(biomeResponse, 1f, 0.4f + climate * 1.2f);
+                // Wetness needs actual liquid water falling. A biome with no precipitation (desert) gets
+                // nothing, and one cold enough for snow gets nothing either — snow accumulates, it does
+                // not soak in, and a glossy snowfield would be plainly wrong. The 0.15 cutoff is where
+                // vanilla's own precipitation type flips.
+                boolean rainsHere = biome.hasPrecipitation() && biome.getBaseTemperature() > 0.15f;
+                wetness = rainsHere ? rainLevel * CausticaConfig.Rt.Clouds.WETNESS.value() : 0f;
+            }
+            // Rain multiplies fog density rather than adding to it, so a configured density of 0 stays
+            // 0 in a downpour. Weather driving a feature the user switched off would be a surprise.
+            float fogWeather = 1f + rainLevel * CausticaConfig.Rt.Fog.WEATHER_RESPONSE.value();
+            float fogScaleHeight = Math.max(CausticaConfig.Rt.Fog.SCALE_HEIGHT.value(), 1.0e-2f);
+            Float4 fog = new Float4(
+                    CausticaConfig.Rt.Fog.DENSITY.value() * fogWeather * biomeHaze,
+                    1.0f / fogScaleHeight,
+                    CausticaConfig.Rt.Fog.HEIGHT.value() - terrain.blockY,
+                    CausticaConfig.Rt.Fog.ALBEDO.value());
+
+            // Cloud deck. The wind offset is accumulated on the CPU from wall time rather than derived
+            // in the shader from frameIndex, so the deck drifts at a fixed blocks-per-second regardless
+            // of frame rate. Folding the terrain origin (mod 4096, same trick as the water wave anchor)
+            // into the offset keeps the noise domain pinned to the world across a terrain rebase — without
+            // it the whole sky would visibly slide sideways every time the player crossed a rebase
+            // boundary. The mask keeps the value small enough that fp32 still resolves the detail octave.
+            float cloudWind = CausticaConfig.Rt.Clouds.WIND_SPEED.value() * waterWaveTime;
+            // Storm response. Coverage closes the remaining gap toward overcast rather than adding a
+            // fixed amount, so a sky that is already at 0.8 does not overshoot past 1 and clip flat.
+            // Density rises and ambient falls together: that pairing — thicker and less sky bouncing
+            // around inside — is what makes a storm deck read as heavy rather than merely large.
+            float cloudWeather = CausticaConfig.Rt.Clouds.WEATHER_RESPONSE.value()
+                    * Math.min(rainLevel + thunderLevel * 0.5f, 1f);
+            // Cloud colour and height come from the same attribute system. CLOUD_HEIGHT is a world Y,
+            // so it is rebased alongside everything else below.
+            float cloudR = 1f, cloudG = 1f, cloudB = 1f;
+            float vanillaCloudHeight = Float.NaN;
+            if (level != null) {
+                var reader = level.environmentAttributes();
+                int cloudColor = reader.getValue(EnvironmentAttributes.CLOUD_COLOR, cameraBlockPos);
+                cloudR = srgbToLinear(((cloudColor >> 16) & 0xFF) / 255f);
+                cloudG = srgbToLinear(((cloudColor >> 8) & 0xFF) / 255f);
+                cloudB = srgbToLinear((cloudColor & 0xFF) / 255f);
+                vanillaCloudHeight = reader.getValue(EnvironmentAttributes.CLOUD_HEIGHT, cameraBlockPos);
+            }
+            Float4 dimCloud = new Float4(cloudR, cloudG, cloudB,
+                    CausticaConfig.Rt.Clouds.VANILLA_TINT.value());
+            Float4 cloud3 = new Float4(CausticaConfig.Rt.Clouds.QUALITY.value(), 0f, 0f, 0f);
+            Float4 fog2 = new Float4(CausticaConfig.Rt.Fog.DEBUG.value(), 0f, 0f, 0f);
+            // Vanilla's cloud height wins when enabled and actually reported — a dimension with no cloud
+            // layer leaves the attribute absent, in which case the configured altitude is the only
+            // sensible answer rather than dropping the deck to zero.
+            float cloudDeckBase = CausticaConfig.Rt.Clouds.VANILLA_HEIGHT.value()
+                    && !Float.isNaN(vanillaCloudHeight)
+                    ? vanillaCloudHeight
+                    : CausticaConfig.Rt.Clouds.ALTITUDE.value();
+            float cloudCoverage = CausticaConfig.Rt.Clouds.COVERAGE.value();
+            cloudCoverage += (1f - cloudCoverage) * cloudWeather * 0.85f;
+            Float4 cloud0 = new Float4(
+                    cloudCoverage,
+                    CausticaConfig.Rt.Clouds.DENSITY.value() * (1f + cloudWeather * 1.5f),
+                    cloudDeckBase - terrain.blockY,
+                    CausticaConfig.Rt.Clouds.THICKNESS.value());
+            Float4 cloud1 = new Float4(
+                    (terrain.blockX & WATER_ANCHOR_MASK) + cloudWind * 0.8f,
+                    (terrain.blockZ & WATER_ANCHOR_MASK) + cloudWind * 0.6f,
+                    CausticaConfig.Rt.Clouds.DETAIL.value(),
+                    CausticaConfig.Rt.Clouds.AMBIENT.value() * (1f - cloudWeather * 0.55f));
+            // Ground shadowing. The floor is lowered as the storm builds: a heavier deck really does pass
+            // less diffuse light, and holding the clear-sky floor through a thunderstorm is what makes an
+            // overcast world read as merely dimmed rather than actually overcast.
+            Float4 cloud2 = new Float4(
+                    CausticaConfig.Rt.Clouds.SHADOW_STRENGTH.value(),
+                    CausticaConfig.Rt.Clouds.SHADOW_FLOOR.value() * (1f - cloudWeather * 0.5f),
+                    wetness,
+                    CausticaConfig.Rt.Clouds.FEATURE_SIZE.value());
+            // Vanilla environment colours. 26.2 moved per-biome and per-dimension colour out of
+            // BiomeSpecialEffects into the EnvironmentAttributes system, which samples and interpolates
+            // across biome boundaries itself — so this is vanilla's own blended value at the camera,
+            // not a nearest-biome lookup that would pop at a border.
+            //
+            // Sampled once per frame at the camera. Sky and fog colour are whole-view properties; a
+            // per-pixel lookup would buy nothing and cost a chunk-lookup per ray.
+            int skyboxMode = 0;
+            float skyR = 0f, skyG = 0f, skyB = 0f;
+            float fogR = 0f, fogG = 0f, fogB = 0f;
+            float fogTintStrength = 0f;
+            if (level != null) {
+                var reader = level.environmentAttributes();
+                int skyColor = reader.getValue(EnvironmentAttributes.SKY_COLOR, cameraBlockPos);
+                int fogColor = reader.getValue(EnvironmentAttributes.FOG_COLOR, cameraBlockPos);
+                skyR = srgbToLinear(((skyColor >> 16) & 0xFF) / 255f);
+                skyG = srgbToLinear(((skyColor >> 8) & 0xFF) / 255f);
+                skyB = srgbToLinear((skyColor & 0xFF) / 255f);
+                fogR = srgbToLinear(((fogColor >> 16) & 0xFF) / 255f);
+                fogG = srgbToLinear(((fogColor >> 8) & 0xFF) / 255f);
+                fogB = srgbToLinear((fogColor & 0xFF) / 255f);
+                skyboxMode = switch (level.dimensionType().skybox()) {
+                    case OVERWORLD -> 0;
+                    case END -> 1;
+                    case NONE -> 2;
+                };
+                // In the Overworld the physical atmosphere is the truth and vanilla's fog colour is a
+                // light artistic tint on top of it. Elsewhere there is no atmosphere to defer to, so
+                // vanilla's colour becomes the whole answer.
+                fogTintStrength = skyboxMode == 0
+                        ? CausticaConfig.Rt.Fog.BIOME_RESPONSE.value() * 0.5f
+                        : 1.0f;
+            }
+            Float4 dimSky = new Float4(skyR, skyG, skyB, skyboxMode);
+            Float4 dimFog = new Float4(fogR, fogG, fogB, fogTintStrength);
+            // ReSTIR temporal reuse. History is only meaningful if it describes this world in this
+            // rebased space: a dimension change reuses the same images with positions from a different
+            // world entirely, which would light the Nether with the Overworld's torches until the
+            // reservoirs churned over. A resize already clears the flag when the images are recreated.
+            Object currentDimension = level == null ? null : level.dimension();
+            if (!java.util.Objects.equals(currentDimension, reservoirDimension)) {
+                reservoirDimension = currentDimension;
+                reservoirHistoryValid = false;
+            }
+            reservoirParity ^= 1;
+            float restirStrength = CausticaConfig.Rt.Restir.TEMPORAL.value();
+            Float4 restir = new Float4(
+                    reservoirHistoryValid ? restirStrength : 0f,
+                    reservoirParity,
+                    CausticaConfig.Rt.Restir.SPATIAL_TAPS.value(),
+                    CausticaConfig.Rt.Restir.SPATIAL_RADIUS.value());
+            // Valid from the frame after the first one that wrote anything: the destination image this
+            // frame becomes history next frame.
+            if (restirStrength > 0f) {
+                reservoirHistoryValid = true;
+            } else {
+                reservoirHistoryValid = false;
+            }
+            Float4 pom = new Float4(
+                    CausticaConfig.Rt.Pom.DEPTH.value(),
+                    CausticaConfig.Rt.Pom.QUALITY.value(),
+                    CausticaConfig.Rt.Pom.FADE_LOD.value(),
+                    0f);
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -1156,7 +1399,18 @@ public final class RtComposite {
                     CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
                     // Must be the SAME value the exposure resolve divides out this frame (it reads it
                     // from the same RtExposure accessor), or the two stop cancelling.
-                    exposure.preExposure()
+                    exposure.preExposure(),
+                    fog,
+                    cloud0,
+                    cloud1,
+                    cloud2,
+                    pom,
+                    dimSky,
+                    dimFog,
+                    dimCloud,
+                    cloud3,
+                    fog2,
+                    restir
             ).write(push);
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.
@@ -1262,7 +1516,15 @@ public final class RtComposite {
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.displayMap")) {
                 displayPipeline.dispatch(cmd, displayW, displayH, CausticaConfig.Rt.Hdr.enabled(),
                         sdrToneLut.size, CausticaConfig.Rt.Tonemap.GAMMA.value(), loadedHdrLutNits,
-                        true, lookLut.size, LOOK.bloom().strength() / bloomLevels.length);
+                        true, lookLut.size, LOOK.bloom().strength() / bloomLevels.length,
+                        CausticaConfig.Rt.Grade.ENABLED.value(),
+                        CausticaConfig.Rt.Grade.SATURATION.value(),
+                        CausticaConfig.Rt.Grade.CONTRAST.value(),
+                        CausticaConfig.Rt.Grade.GAIN.value(),
+                        CausticaConfig.Rt.Grade.HIGHLIGHT_SATURATION.value(),
+                        CausticaConfig.Rt.Grade.HIGHLIGHT_GAIN.value(),
+                        CausticaConfig.Rt.Grade.HIGHLIGHTS_MIN.value(),
+                        CausticaConfig.Rt.Grade.SHARPNESS.value());
             }
             hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // display output visible to debug composite
@@ -1441,6 +1703,14 @@ public final class RtComposite {
         celestialUvMoonPhase = moonPhase;
     }
 
+    /**
+     * sRGB EOTF for a single 0..1 channel. The environment-attribute colours arrive as packed sRGB
+     * bytes; the shader tints in linear, so they cross the transfer function exactly once, here.
+     */
+    private static float srgbToLinear(float code) {
+        return code <= 0.04045f ? code / 12.92f : (float) Math.pow((code + 0.055f) / 1.055f, 2.4);
+    }
+
     private static Float4 linearAcesCgFromSrgb(double r, double g, double b, float w) {
         return linearAcesCgFromBt709(
                 srgbToLinear(r), srgbToLinear(g), srgbToLinear(b), w);
@@ -1556,6 +1826,17 @@ public final class RtComposite {
             worldPipeline.destroy();
             worldPipeline = null;
         }
+        if (cloudNoise != null) {
+            cloudNoise.destroy();
+            cloudNoise = null;
+        }
+        if (cloudNoiseSampler != 0L) {
+            RtContext ctx = RtContext.currentOrNull();
+            if (ctx != null) {
+                VK10.vkDestroySampler(ctx.vk(), cloudNoiseSampler, null);
+            }
+            cloudNoiseSampler = 0L;
+        }
         bindlessTextureCapacity = 0;
         materialBindingsReady = false;
         materialEpochTraceGate = false;
@@ -1575,6 +1856,41 @@ public final class RtComposite {
             }
             atlasSampler = 0L;
         }
+    }
+
+    /**
+     * Creates and binds the cloud shape texture, once. LINEAR filtering with REPEAT addressing in all
+     * three axes: the field is generated to tile, so the hardware's wrap does the domain folding and
+     * the shader needs no fract() on its coordinate.
+     */
+    private void ensureCloudNoise(RtContext ctx) {
+        if (cloudNoise != null) {
+            worldPipeline.setCloudNoise(cloudNoise.view, cloudNoiseSampler);
+            return;
+        }
+        java.nio.ByteBuffer data = RtCloudNoise.generate();
+        try {
+            cloudNoise = ctx.createSampled3dImage(RtCloudNoise.SIZE, RtCloudNoise.SIZE, RtCloudNoise.SIZE,
+                    VK10.VK_FORMAT_R8G8_UNORM, RtCloudNoise.BYTES_PER_TEXEL, data, "cloud noise 128^3");
+        } finally {
+            org.lwjgl.system.MemoryUtil.memFree(data);
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
+                    .magFilter(VK10.VK_FILTER_LINEAR).minFilter(VK10.VK_FILTER_LINEAR)
+                    .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                    .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                    .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                    .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                    .minLod(0f).maxLod(0f);
+            LongBuffer p = stack.mallocLong(1);
+            if (VK10.vkCreateSampler(ctx.vk(), sci, null, p) != VK10.VK_SUCCESS) {
+                throw new IllegalStateException("vkCreateSampler(cloud noise) failed");
+            }
+            cloudNoiseSampler = p.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SAMPLER, cloudNoiseSampler, "cloud noise sampler");
+        }
+        worldPipeline.setCloudNoise(cloudNoise.view, cloudNoiseSampler);
     }
 
     private long atlasSampler(RtContext ctx) {

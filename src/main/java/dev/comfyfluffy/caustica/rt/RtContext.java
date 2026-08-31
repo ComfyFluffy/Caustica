@@ -24,6 +24,9 @@ import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkFenceCreateInfo;
 import org.lwjgl.vulkan.VkFormatProperties;
+import java.nio.ByteBuffer;
+import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.vulkan.VkBufferImageCopy;
 import org.lwjgl.vulkan.VkImageCreateInfo;
 import org.lwjgl.vulkan.VkImageFormatProperties;
 import org.lwjgl.vulkan.VkImageMemoryBarrier;
@@ -390,6 +393,96 @@ public final class RtContext {
                         0, null, null, b);
             }
         });
+        return new RtImage(vma, vk, image, allocation, view, width, height);
+    }
+
+    /**
+     * Creates a tiling 3D texture from host data and leaves it in SHADER_READ_ONLY_OPTIMAL.
+     *
+     * <p>Written once at creation and never again, which is why it takes the simple synchronous path:
+     * no ping-pong, no per-frame descriptor churn, nothing for a frame in flight to race against. That
+     * is the whole reason this is a much smaller risk than a storage image the shaders write to.
+     *
+     * @param data tightly packed texels, depth-major, sized width*height*depth*bytesPerTexel
+     */
+    public RtImage createSampled3dImage(int width, int height, int depth, int format,
+                                        int bytesPerTexel, ByteBuffer data, String label) {
+        long imageBytes = (long) width * height * depth * bytesPerTexel;
+        int usage = VK10.VK_IMAGE_USAGE_SAMPLED_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        long image;
+        long allocation;
+        long view;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
+                    .imageType(VK10.VK_IMAGE_TYPE_3D).format(format)
+                    .mipLevels(1).arrayLayers(1).samples(VK10.VK_SAMPLE_COUNT_1_BIT)
+                    .tiling(VK10.VK_IMAGE_TILING_OPTIMAL).usage(usage)
+                    .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE)
+                    .initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);
+            ici.extent().set(width, height, depth);
+            VmaAllocationCreateInfo iaci = VmaAllocationCreateInfo.calloc(stack)
+                    .usage(Vma.VMA_MEMORY_USAGE_AUTO);
+            LongBuffer pImage = stack.mallocLong(1);
+            PointerBuffer pAlloc = stack.mallocPointer(1);
+            check(Vma.vmaCreateImage(vma, ici, iaci, pImage, pAlloc, null), "vmaCreateImage(3D)");
+            image = pImage.get(0);
+            allocation = pAlloc.get(0);
+            RtDebugLabels.nameImage(this, image, label);
+
+            VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default()
+                    .image(image).viewType(VK10.VK_IMAGE_VIEW_TYPE_3D).format(format);
+            vci.subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
+            LongBuffer pView = stack.mallocLong(1);
+            check(VK10.vkCreateImageView(vk, vci, null, pView), "vkCreateImageView(3D)");
+            view = pView.get(0);
+            RtDebugLabels.nameImageView(this, view, label + " view");
+        }
+
+        RtBuffer staging = createUploadBuffer(imageBytes, label + " upload");
+        MemoryUtil.memCopy(MemoryUtil.memAddress(data), staging.mapped, imageBytes);
+        staging.flush();
+        long imageFinal = image;
+        submitSync(cmd -> {
+            try (MemoryStack stack = MemoryStack.stackPush();
+                 RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "upload " + label)) {
+                VkImageMemoryBarrier.Buffer toDst = VkImageMemoryBarrier.calloc(1, stack);
+                toDst.get(0).sType$Default()
+                        .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED)
+                        .newLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .image(imageFinal);
+                toDst.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .levelCount(1).layerCount(1);
+                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK10.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, null, null, toDst);
+
+                VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
+                region.get(0).bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+                region.get(0).imageSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(0).baseArrayLayer(0).layerCount(1);
+                region.get(0).imageOffset().set(0, 0, 0);
+                region.get(0).imageExtent().set(width, height, depth);
+                VK10.vkCmdCopyBufferToImage(cmd, staging.handle, imageFinal,
+                        VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+
+                VkImageMemoryBarrier.Buffer toRead = VkImageMemoryBarrier.calloc(1, stack);
+                toRead.get(0).sType$Default()
+                        .oldLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .newLayout(VK10.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .image(imageFinal);
+                toRead.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                        .levelCount(1).layerCount(1);
+                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, null, null, toRead);
+            }
+        });
+        staging.destroy();
         return new RtImage(vma, vk, image, allocation, view, width, height);
     }
 

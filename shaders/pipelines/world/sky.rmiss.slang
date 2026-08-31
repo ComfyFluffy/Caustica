@@ -14,6 +14,7 @@
 import world_common;
 import sky;
 import bindings;
+import clouds;
 
 // Vanilla celestials atlas (sun + moon-phase sprites), bound by RtComposite. Sampled with an explicit LOD
 // (a miss shader has no derivatives). Keeping the real sprites means a resource pack's sun and moon still
@@ -37,6 +38,10 @@ float hash13(float3 p3) {
     p3 += dot(p3, p3.zyx + 31.32);
     return frac((p3.x + p3.y) * p3.z);
 }
+
+// How much of the Overworld starfield the End keeps. Dimmer than a clear night: the End's own sky
+// colour already lifts the black floor, and full-strength stars over it read as an Overworld night.
+static const float END_STAR_STRENGTH = 0.35;
 
 // Rotate v about a unit axis by angle (Rodrigues). Used to wheel the starfield about the celestial pole.
 float3 rotateAxis(float3 v, float3 axis, float ang) {
@@ -149,6 +154,43 @@ void main(inout Payload payload) {
         }
         // No separate horizon gate on either body. A set sun or moon goes dark because its extinction is
         // zero below the horizon, matching the NEE visibility test.
+    }
+
+    // Non-Overworld dimensions. The atmosphere LUTs model an Earth sky: Rayleigh, Mie, ozone, a planet
+    // radius, a sun. None of that exists in the Nether or the End, and running it there produces a blue
+    // daytime sky in a place that should have neither. Vanilla classifies this itself via
+    // DimensionType.skybox(), which is what the mode here mirrors — so custom dimensions declaring one of
+    // those skyboxes get the right treatment too, without a hardcoded dimension-name list.
+    uint skyboxMode = uint(worldPush.dimSky.w + 0.5);
+    if (skyboxMode != SKYBOX_OVERWORLD) {
+        // Both non-Overworld skies are flat-lit from vanilla's own SKY_COLOR for the camera's position,
+        // so a crimson forest and a soul sand valley differ here exactly as they do in vanilla.
+        float3 flat709 = max(worldPush.dimSky.rgb, float3(0.0));
+        float3 flatSky = bt709ToAcesCg(flat709);
+        if (skyboxMode == SKYBOX_END) {
+            // The End keeps a starfield — it is the one thing that reads as "sky" rather than "ceiling"
+            // there — but no sun, no moon, no horizon gradient.
+            flatSky += bt709ToAcesCg(stars(dir, state, float3(1.0))) * END_STAR_STRENGTH;
+        }
+        packSky(payload, flatSky);
+        return;
+    }
+
+    // Cloud deck, composited over everything above. It sits at a few hundred blocks while the sky LUT
+    // models 100 km, so the deck is treated as a thin layer in front of the whole atmosphere: attenuate
+    // what is behind it, add what it scatters. Stars and the sun/moon discs are correctly occluded by
+    // this because they were accumulated into `color` above.
+    //
+    // Gated on showCelestial, which is exactly the set of rays that already pay for disc sprites: the
+    // primary ray and specular/dielectric continuations. A diffuse bounce's miss skips the march
+    // entirely and sees clear sky — see the cost note in clouds.slang.
+    if (showCelestial) {
+        CloudParams cloudParams = makeCloudParams(worldPush);
+        if (cloudsActive(cloudParams)) {
+            CloudResult deck = marchClouds(cloudParams, state, WorldRayOrigin(), dir,
+                                           worldPush.dimCloud.rgb, worldPush.dimCloud.w);
+            color = color * deck.transmittance + deck.scattering;
+        }
     }
 
     // The sky goes out in absolute scene units at full fp32 — packSky writes the payload's three surface

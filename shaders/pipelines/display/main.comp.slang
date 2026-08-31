@@ -44,6 +44,56 @@ float3 applyLook(float3 exposedAcesCg) {
     return shaperDecode(shaped);
 }
 
+// ---- Unreal-style colour grading -----------------------------------------------------------------
+//
+// A reimplementation of UE's ColorCorrectAll from PostProcessCombineLUTs.usf, so that a grade authored
+// against a UE post-process volume — such as the one in the "Ultra Realism Tonemapper" guide — produces
+// the same image here. Two things make that transfer exact rather than approximate: UE's default
+// working colour space is AP1, which is this renderer's working space too, and UE grades scene-referred
+// before its tonemapper, which is where this sits relative to the output transform.
+//
+// The 0.18 contrast pivot is what keeps contrast from also being an exposure change: scaling around
+// mid grey leaves mid grey fixed, so contrast and exposure stay independent controls.
+// ACEScg luma weights, matching world_common.slang's ACESCG_LUMA. Duplicated rather than imported:
+// this pipeline does not otherwise depend on the ray tracer's module tree.
+static const float3 ACESCG_LUMA = float3(0.27222872, 0.67408177, 0.05368952);
+static const float GRADE_PIVOT = 0.18;
+// UE's ColorCorrectionShadowsMax / HighlightsMax defaults. Only HighlightsMin is worth exposing —
+// it is the one the guide actually moves, and the other two only reshape the blend between regions.
+static const float GRADE_SHADOWS_MAX = 0.09;
+static const float GRADE_HIGHLIGHTS_MAX = 1.0;
+
+float3 colorCorrect(float3 color, float saturation, float contrast, float gain) {
+    float luma = dot(color, ACESCG_LUMA);
+    // Saturation as a lerp from luma, clamped at zero: values above 1 extrapolate away from grey, and
+    // without the clamp a strongly saturated colour can extrapolate a channel negative and come back
+    // through the tone LUT as a hard chroma artifact.
+    color = max(lerp(float3(luma), color, saturation), float3(0.0));
+    color = pow(max(color / GRADE_PIVOT, float3(0.0)), float3(contrast)) * GRADE_PIVOT;
+    return color * gain;
+}
+
+float3 applyGrade(float3 acesCg) {
+    if (pc.gradeEnabled == 0) {
+        return acesCg;
+    }
+    float luma = dot(acesCg, ACESCG_LUMA);
+    // Region weights sum to 1 by construction, so the three graded results blend without changing
+    // overall level — the midtone weight is whatever the other two leave behind.
+    float shadowWeight = 1.0 - smoothstep(0.0, GRADE_SHADOWS_MAX, luma);
+    float highlightWeight = smoothstep(pc.highlightsMin, GRADE_HIGHLIGHTS_MAX, luma);
+    float midWeight = max(1.0 - shadowWeight - highlightWeight, 0.0);
+
+    // Region parameters multiply the global ones, exactly as UE composes them — so the guide's
+    // highlight saturation of 0.95 means 0.95 x the global 0.75, not 0.95 outright.
+    float3 midtones = colorCorrect(acesCg, pc.saturation, pc.contrast, pc.gain);
+    float3 highlights = colorCorrect(acesCg, pc.saturation * pc.highlightSaturation,
+                                     pc.contrast, pc.gain * pc.highlightGain);
+    // Shadows use the global grade unmodified: the guide overrides no shadow-region parameters, and
+    // inventing a shadow lift here would silently diverge from the source it is reproducing.
+    return midtones * (shadowWeight + midWeight) + highlights * highlightWeight;
+}
+
 float3 sampleBloom(int2 outputPixel, uint outputWidth, uint outputHeight) {
     float2 uv = (float2(outputPixel) + 0.5) / float2(outputWidth, outputHeight);
     return bloomImage.SampleLevel(uv, 0.0).rgb;
@@ -141,6 +191,55 @@ float3 tonemapHdr(float3 lookedAcesCg) {
     return displayGammaHdr(hdrToneLut.SampleLevel(lutTexCoord(uvw, pc.lutSize), 0.0).rgb);
 }
 
+// Everything up to, but not including, the output transform. Factored out because RCAS below needs it
+// at four neighbouring pixels as well as the centre.
+float3 gradedAcesCg(int2 pix, float exposure, uint w, uint h) {
+    float3 exposedAcesCg = max(rtImage[pix].rgb * exposure, float3(0.0));
+    exposedAcesCg += sampleBloom(pix, w, h) * max(pc.bloomStrength, 0.0);
+    return applyGrade(applyLook(exposedAcesCg));
+}
+
+// ---- RCAS ------------------------------------------------------------------------------------------
+//
+// AMD's Robust Contrast-Adaptive Sharpening, from FSR. "Robust" is the operative word: rather than a
+// fixed unsharp kernel, it derives a per-pixel sharpening lobe from how much headroom the local
+// neighbourhood actually has, so it cannot ring a highlight into clipping or crush a shadow. That makes
+// it the right choice downstream of DLSS Ray Reconstruction, where a fixed sharpen would amplify the
+// denoiser's own reconstruction error along edges.
+//
+// TWO DELIBERATE PLACEMENT DECISIONS:
+//
+// It runs AFTER the output transform, on display code values, not on scene-linear radiance. RCAS's
+// headroom maths assumes a bounded signal with a peak of 1. Scene-linear HDR has no such bound — a
+// 10,000 nit emitter is just a large number — and sharpening it would produce overshoot proportional to
+// the highlight's absolute intensity rather than to its visible contrast.
+//
+// The HDR path sharpens PQ code values, which is what "HDR-aware" means here. PQ is perceptually
+// uniform and bounded [0,1], so the same lobe produces the same *apparent* edge enhancement at 100 nits
+// and at 1000 nits. Sharpening linear nits instead would make bright highlights receive hundreds of
+// times more absolute overshoot than midtones, which reads as ringing exactly where the display is most
+// able to show it.
+//
+// Cost is four extra pipeline evaluations per pixel. Gated on sharpness, so a disabled slider costs one
+// comparison.
+static const float RCAS_LIMIT = -0.1875; // FSR's clamp on the lobe; beyond it the filter visibly rings.
+
+float3 rcas(float3 e, float3 b, float3 d, float3 f, float3 h, float sharpness) {
+    float3 mn4 = min(min(b, d), min(f, h));
+    float3 mx4 = max(max(b, d), max(f, h));
+    // Headroom to black and to peak white, per channel. The tighter of the two bounds the lobe, so a
+    // pixel already near either end of the range is sharpened less rather than pushed past it.
+    float3 hitMin = mn4 / (4.0 * max(mx4, float3(1.0e-6)));
+    float3 hitMax = (1.0 - mx4) / (4.0 * max(mx4, float3(1.0e-6)));
+    float3 lobeRgb = max(-hitMin, hitMax);
+    float lobe = max(RCAS_LIMIT, min(max(lobeRgb.r, max(lobeRgb.g, lobeRgb.b)), 0.0)) * sharpness;
+    return (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+}
+
+int2 clampPixel(int2 pix, uint w, uint h) {
+    return int2(clamp(pix.x, 0, int(w) - 1), clamp(pix.y, 0, int(h) - 1));
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void main(uint3 dispatchId : SV_DispatchThreadID) {
@@ -151,14 +250,31 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
         return;
     }
 
-    float4 rt = rtImage[pix];
     float exposure = max(exposureImage[int2(0, 0)], 0.0);
-    float3 exposedAcesCg = max(rt.rgb * exposure, float3(0.0));
-    exposedAcesCg += sampleBloom(pix, w, h) * max(pc.bloomStrength, 0.0);
-    float3 lookedAcesCg = applyLook(exposedAcesCg);
-    outputImage[pix] = float4(tonemap(lookedAcesCg), 1.0);
+    float3 lookedAcesCg = gradedAcesCg(pix, exposure, w, h);
+
+    float sharpness = max(pc.sharpness, 0.0);
+    if (sharpness <= 0.0) {
+        outputImage[pix] = float4(tonemap(lookedAcesCg), 1.0);
+        if (pc.hdrEnabled != 0) {
+            hdrImage[pix] = float4(tonemapHdr(lookedAcesCg), 1.0);
+        }
+        return;
+    }
+
+    // Edge pixels clamp to themselves, which makes the lobe collapse toward zero at the border rather
+    // than sharpening against a wrapped or undefined neighbour.
+    float3 upAcesCg = gradedAcesCg(clampPixel(pix + int2(0, -1), w, h), exposure, w, h);
+    float3 leftAcesCg = gradedAcesCg(clampPixel(pix + int2(-1, 0), w, h), exposure, w, h);
+    float3 rightAcesCg = gradedAcesCg(clampPixel(pix + int2(1, 0), w, h), exposure, w, h);
+    float3 downAcesCg = gradedAcesCg(clampPixel(pix + int2(0, 1), w, h), exposure, w, h);
+
+    outputImage[pix] = float4(rcas(tonemap(lookedAcesCg), tonemap(upAcesCg), tonemap(leftAcesCg),
+                                   tonemap(rightAcesCg), tonemap(downAcesCg), sharpness), 1.0);
 
     if (pc.hdrEnabled != 0) {
-        hdrImage[pix] = float4(tonemapHdr(lookedAcesCg), 1.0);
+        hdrImage[pix] = float4(rcas(tonemapHdr(lookedAcesCg), tonemapHdr(upAcesCg),
+                                    tonemapHdr(leftAcesCg), tonemapHdr(rightAcesCg),
+                                    tonemapHdr(downAcesCg), sharpness), 1.0);
     }
 }

@@ -158,6 +158,19 @@ public final class RtPipeline {
                 binds.get(binding).binding(binding).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                         .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             }
+            // ReSTIR reservoirs. Raygen only — the reservoirs are built and consumed there; no hit or
+            // miss stage touches them, and narrowing the stage flags keeps the driver from having to
+            // make them visible to shader stages that never read them.
+            for (int binding = WORLD_RESERVOIR_A; binding <= WORLD_RESERVOIR_B; binding++) {
+                binds.get(binding).binding(binding).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+            }
+            // Cloud noise: a sampled 3D texture, read by the miss shader (view march) and the raygen
+            // (shadow march), so both stages need visibility.
+            binds.get(WORLD_CLOUD_NOISE).binding(WORLD_CLOUD_NOISE)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1)
+                    .stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR);
             binds.get(WORLD_CELESTIALS).binding(WORLD_CELESTIALS)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_MISS_BIT_KHR);
@@ -407,6 +420,31 @@ public final class RtPipeline {
     }
 
     /** Write one DLSS-RR guide image into its canonical world binding across every ring slot. */
+    /**
+     * Binds the two ReSTIR reservoir images. Written once at creation and again on resize, never
+     * per-frame: the descriptor sets are ring-buffered across frames in flight, so rewriting them each
+     * frame would mutate a set an earlier frame is still reading. The two images swap roles through a
+     * push constant instead — see {@code worldPush.restir.y}.
+     */
+    public void setReservoirImages(long viewA, long viewB) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkDescriptorImageInfo.Buffer infoA = VkDescriptorImageInfo.calloc(1, stack);
+            infoA.get(0).imageView(viewA).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            VkDescriptorImageInfo.Buffer infoB = VkDescriptorImageInfo.calloc(1, stack);
+            infoB.get(0).imageView(viewB).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(RING * 2, stack);
+            for (int i = 0; i < RING; i++) {
+                write.get(i * 2).sType$Default().dstSet(descriptorSets[i]).dstBinding(WORLD_RESERVOIR_A)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .pImageInfo(infoA);
+                write.get(i * 2 + 1).sType$Default().dstSet(descriptorSets[i]).dstBinding(WORLD_RESERVOIR_B)
+                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .pImageInfo(infoB);
+            }
+            VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
+        }
+    }
+
     public void setExtraStorageImage(int slot, long imageView) {
         if (slot < 0 || slot >= WORLD_GUIDE_COUNT) {
             throw new IllegalArgumentException("Guide slot out of range: " + slot);
@@ -440,6 +478,14 @@ public final class RtPipeline {
     /** Bind the vanilla celestials atlas (sun + moon phases), sampled by world.rmiss for the discs. */
     public void setSkyAtlas(long imageView, long sampler) {
         writeAtlasBinding(WORLD_CELESTIALS, imageView, sampler);
+    }
+
+    /**
+     * Bind the precomputed cloud shape field. Written once when the texture is created; it is
+     * immutable for the session, so there is no per-frame descriptor traffic here.
+     */
+    public void setCloudNoise(long imageView, long sampler) {
+        writeAtlasBinding(WORLD_CLOUD_NOISE, imageView, sampler);
     }
 
     public boolean hasSkyAtlas() {

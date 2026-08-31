@@ -77,6 +77,19 @@ public struct DisplayPush {
     // SUM of every band, so RtComposite folds the 1/levelCount normalisation into this value: the authored
     // look-package strength then means the same thing whichever level count the resolution supports.
     public float bloomStrength;
+    // ---- Unreal-style scene-referred colour grading, applied after the LMT and before the output
+    // transform, which is where UE's own grade sits relative to its tonemapper. Values are the
+    // renderer's working space (ACEScg/AP1) and UE's default working space is also AP1, so the
+    // published numbers from a UE post-process volume transfer directly rather than approximately.
+    public int   gradeEnabled;           // 0 = skip the whole stage
+    public float saturation;             // global
+    public float contrast;               // global, pivoted at 0.18
+    public float gain;                   // global
+    public float highlightSaturation;    // multiplies the global value in the highlight region
+    public float highlightGain;          // multiplies the global value in the highlight region
+    public float highlightsMin;          // luma where the highlight region starts blending in
+    // ---- RCAS. 0 disables it and its four extra taps.
+    public float sharpness;
 };
 
 public struct BloomPush {

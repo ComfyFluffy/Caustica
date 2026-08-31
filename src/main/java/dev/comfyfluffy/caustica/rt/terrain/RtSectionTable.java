@@ -188,8 +188,13 @@ final class RtSectionTable {
     }
 
     RtAccel.Instance instanceFor(SectionGeom geom, int rbx, int rby, int rbz) {
-        float[] xform = {1, 0, 0, geom.sx - rbx, 0, 1, 0, geom.sy - rby,
-                0, 0, 1, geom.sz - rbz};
+        // Uniform scale on the diagonal for LOD sections (1 for ordinary terrain, so this stays the
+        // identity rotation it always was). The translation is the section's world origin rebased, and
+        // is NOT scaled: the origin is already in world blocks, only the section-local geometry needs
+        // expanding.
+        float s = geom.lodScale;
+        float[] xform = {s, 0, 0, geom.sx - rbx, 0, s, 0, geom.sy - rby,
+                0, 0, s, geom.sz - rbz};
         return new RtAccel.Instance(xform, geom.blas.deviceAddress, geom.slot);
     }
 
@@ -207,6 +212,14 @@ final class RtSectionTable {
         final float[] lights;
         int slot = -1;
         int instanceIndex = -1;
+        /**
+         * Blocks per virtual block. 1 for ordinary terrain. A distant-LOD section is meshed from a
+         * 16-cubed virtual grid whose blocks stand for 2^detail world blocks, so the same triangle
+         * budget covers a much larger volume; the instance transform scales it back up rather than the
+         * mesher emitting larger vertices, which keeps section-local positions in the same fp32 range
+         * for every section regardless of detail.
+         */
+        int lodScale = 1;
 
         SectionGeom(long key, RtBuffer uvs, RtBuffer material,
                     RtAccel blas, int[] triBase, int sx, int sy, int sz, float[] lights) {

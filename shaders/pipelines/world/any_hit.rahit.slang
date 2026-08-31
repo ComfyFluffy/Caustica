@@ -64,7 +64,13 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         int texSlot = int(epr.tint.w + 0.5);
         float4 texel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0);
         bool stochasticAlpha = false;
-        MaterialHeader materialHeader;
+        // Zero-initialised rather than left to the ENTITY_BIT branch below. Every read of this is
+        // already guarded by an instanceKind == ENTITY_BIT test, so the value is never observed
+        // unassigned -- but the compiler cannot prove that across the separate guards, and newer slangc
+        // versions promote the resulting may-be-uninitialised diagnostic to an error under the
+        // project's -warnings-as-errors. A defined zero is also the safer failure mode: model 0 falls
+        // through the dielectric and water branches instead of reading a stack value as a material.
+        MaterialHeader materialHeader = {};
         if (instanceKind == ENTITY_BIT) {
             materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[epr.materialId];
             stochasticAlpha = (materialHeader.features & MATERIAL_FEATURE_STOCHASTIC_ALPHA) != 0u;

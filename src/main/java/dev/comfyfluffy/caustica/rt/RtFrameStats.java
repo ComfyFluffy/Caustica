@@ -38,6 +38,11 @@ public final class RtFrameStats {
                     "terrain.drainCompletion",
                     "terrain.snapshotDispatch",
                     "terrain.publish",
+                    // Used at RtTerrain:521 but never registered here, so enabling frame stats crashed
+                    // the client on the first tick that published a light grid. Upstream bug, not a
+                    // LOD one — the stage name table and the call sites had drifted apart.
+                    "terrain.lightGridPublish",
+                    "terrain.lodDispatch",
                     "entity.capture",
                     "entity.capture.extract",
                     "entity.capture.submit",

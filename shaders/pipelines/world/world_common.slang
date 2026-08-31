@@ -88,7 +88,47 @@ public struct WorldPush {
     // near mid-grey at any scene brightness; the display pass divides it back out, so the two cancel
     // exactly and this cannot change the image. 1.0 disables it.
     public float    preExposure;
+    // ---- Height fog. x extinction per block at the reference height (0 disables), y 1/scale-height,
+    // z reference world Y in REBASED coordinates (Java subtracts the terrain origin, so this stays a
+    // small number as the player moves), w single-scattering albedo. Integrated analytically in
+    // fog.slang; the in-scatter colour comes from the sky view LUT, so nothing about the fog's colour
+    // lives here.
+    public float4   fog;
+    // ---- Cloud deck. cloud0: x coverage 0..1 (0 disables), y extinction per block at full density,
+    // z deck base as REBASED world Y, w deck thickness in blocks. cloud1: xy wind domain offset in
+    // blocks (advanced on the CPU so it is frame-rate independent and world-stable across a rebase),
+    // z detail erosion 0..1, w ambient multiple-scattering fraction.
+    public float4   cloud0;
+    public float4   cloud1;
+    // cloud2: x ground-shadow strength (0 disables shadowing without disabling the deck), y the
+    // multiple-scattering floor the shadow cannot darken past, z rain wetness 0..1,
+    // w cloud feature size in blocks (one noise period).
+    public float4   cloud2;
+    // ---- Parallax occlusion mapping. x depth in sprite-widths (0 disables it entirely), y step-count
+    // scale, z ray-cone LOD at which it has faded out, w unused.
+    public float4   pom;
+    // ---- Dimension / biome environment colours, read from 26.2's EnvironmentAttributes system.
+    // dimSky: rgb = SKY_COLOR (linear BT.709), w = skybox mode (0 overworld, 1 end, 2 none/nether).
+    // dimFog: rgb = FOG_COLOR (linear BT.709), w = how strongly it tints scattering, 0 = not at all.
+    public float4   dimSky;
+    public float4   dimFog;
+    // dimCloud: rgb = vanilla CLOUD_COLOR (linear BT.709), w = tint strength (0 = leave the deck lit
+    // purely by the atmosphere).
+    public float4   dimCloud;
+    // cloud3: x cloud march quality scale (1 = reference step counts), yzw unused.
+    public float4   cloud3;
+    // fog2: x = debug mode (1 = show raw fog in-scatter as the final colour), yzw unused.
+    public float4   fog2;
+    // ---- ReSTIR. x temporal reuse strength (0 disables it and both image accesses), y frame parity
+    // selecting which reservoir image is history this frame, z spatial neighbour taps per pixel
+    // (0 = temporal only), w spatial tap radius in render pixels.
+    public float4   restir;
 };
+
+// Skybox modes, mirroring vanilla's DimensionType.Skybox enum.
+public static const uint SKYBOX_OVERWORLD = 0u;
+public static const uint SKYBOX_END = 1u;
+public static const uint SKYBOX_NONE = 2u;
 
 // 32-byte hot area-light record. Linear ACEScg radiance uses packed R11G11B10; the
 // grid-relative owner section uses three unsigned 10-bit coordinates; the geometric normal is
