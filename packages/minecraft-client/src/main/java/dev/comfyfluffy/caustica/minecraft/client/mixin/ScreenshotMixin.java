@@ -33,7 +33,14 @@ public abstract class ScreenshotMixin {
             Consumer<Component> callback,
             CallbackInfo ci
     ) {
-        if (forceName == null && downscaleFactor == 1
+        boolean captureOwned = dev.comfyfluffy.caustica.minecraft.client.UltraCaptureSession.screenshotThreadToken() != 0L;
+        if (dev.comfyfluffy.caustica.minecraft.client.UltraCaptureSession.active() && !captureOwned) {
+            // One PNG write lease system-wide: manual grabs wait until the capture's write completes.
+            callback.accept(Component.translatable("caustica.status.ultraScreenshot.busy"));
+            ci.cancel();
+            return;
+        }
+        if (!captureOwned && forceName == null && downscaleFactor == 1
                 && CausticaClientComposition.current().runtime().frameActive()
                 && CausticaConfig.get(RendererOptions.Rt.Screenshots.EXR_ENABLED)) {
             String pairedPngName = RtScreenshotExporter.exportPaired(workDir, callback);

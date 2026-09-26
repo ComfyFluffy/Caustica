@@ -1,14 +1,16 @@
 package dev.comfyfluffy.caustica.minecraft.rendering;
 
-/** Immutable Minecraft photometric calibration supplied by runtime composition. */
-public record MinecraftLightingCalibration(float sunIlluminanceLux, float moonIlluminanceLux,
+/**
+ * Immutable Minecraft photometric calibration supplied by runtime composition. Moonlight is a sky option
+ * ({@code SkyLutPass.MOON_ILLUMINANCE_LUX}) rather than calibration.
+ */
+public record MinecraftLightingCalibration(float sunIlluminanceLux,
                                             float blockEmissionLuminanceCdM2,
                                             float nightAirglowLuminanceCdM2,
                                             float starLuminanceCdM2,
                                             float moonPhaseFixedFraction) {
     public MinecraftLightingCalibration {
         positive(sunIlluminanceLux, "sunIlluminanceLux");
-        positive(moonIlluminanceLux, "moonIlluminanceLux");
         positive(blockEmissionLuminanceCdM2, "blockEmissionLuminanceCdM2");
         nonNegative(nightAirglowLuminanceCdM2, "nightAirglowLuminanceCdM2");
         nonNegative(starLuminanceCdM2, "starLuminanceCdM2");

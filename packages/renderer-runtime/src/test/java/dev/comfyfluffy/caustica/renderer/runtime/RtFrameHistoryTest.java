@@ -41,7 +41,7 @@ final class RtFrameHistoryTest {
         var history = new RtFrameHistory();
         capture(history, snapshot(7, 1), 0);
         var retry = capture(history, snapshot(0, 2), 0);
-        assertFalse(retry.historyContinuous());
+        assertEquals(RtFrameHistory.Break.FIRST_FRAME, retry.historyBreak());
         assertTrue(history.changesScene(retry.snapshot()));
         assertEquals(RtJitter.sample(0, 1280, 1920).x(), retry.jitterX());
         assertEquals(new Float3(0, 0, 0), retry.cameraDelta());
@@ -72,12 +72,13 @@ final class RtFrameHistoryTest {
     }
 
     @Test
-    void frameGapsAndExplicitResetDiscardCameraHistory() {
+    void longInterruptionsAndExplicitResetDiscardCameraHistory() {
         var history = seeded();
-        assertReset(capture(history, snapshot(1, .02), 2));
+        assertReset(history.capture(snapshot(1, .02), 2, 300_000_000L, EXTENT, ROUTE, 1, 1, 1),
+                RtFrameHistory.Break.INTERRUPTED);
         history.reset();
         var reset = capture(history, snapshot(1, .02), 1);
-        assertReset(reset);
+        assertReset(reset, RtFrameHistory.Break.FIRST_FRAME);
         assertEquals(RtJitter.sample(1, 1280, 1920).x(), reset.jitterX());
         assertTrue(history.changesScene(reset.snapshot()));
     }
@@ -85,13 +86,13 @@ final class RtFrameHistoryTest {
     @Test
     void sceneScaleExtentAndRouteChangesResetHistory() {
         assertReset(capture(seeded(), snapshot(new SceneId() { }, SceneOrigin.ZERO, 0, .01,
-                1, false, new Matrix4f(), new Matrix4f()), 1));
+                1, false, new Matrix4f(), new Matrix4f()), 1), RtFrameHistory.Break.SCENE);
         assertReset(capture(seeded(), snapshot(SCENE, SceneOrigin.ZERO, 0, .01,
-                2, false, new Matrix4f(), new Matrix4f()), 1));
+                2, false, new Matrix4f(), new Matrix4f()), 1), RtFrameHistory.Break.SCENE);
         assertReset(seeded().capture(snapshot(0, .01), 1, 16_000_000L,
-                new TraceExtent(960, 540, 1920, 1080), ROUTE, 1, 1, 1));
+                new TraceExtent(960, 540, 1920, 1080), ROUTE, 1, 1, 1), RtFrameHistory.Break.EXTENT);
         assertReset(seeded().capture(snapshot(0, .01), 1, 16_000_000L,
-                EXTENT, DenoiserRoute.RAY_RECONSTRUCTION, 1, 1, 1));
+                EXTENT, DenoiserRoute.RAY_RECONSTRUCTION, 1, 1, 1), RtFrameHistory.Break.ROUTE);
         assertFalse(seeded().changesScene(snapshot(0, .01)));
     }
 
@@ -142,11 +143,12 @@ final class RtFrameHistoryTest {
 
     @Test
     void translationRotationAndProjectionCutsResetHistory() {
-        assertReset(capture(seeded(), snapshot(9, .01), 1));
+        assertReset(capture(seeded(), snapshot(9, .01), 1), RtFrameHistory.Break.CAMERA_CUT);
         assertReset(capture(seeded(), snapshot(SCENE, SceneOrigin.ZERO, 0, .01,
-                1, false, new Matrix4f(), new Matrix4f().rotationY((float) Math.PI / 2)), 1));
+                1, false, new Matrix4f(), new Matrix4f().rotationY((float) Math.PI / 2)), 1),
+                RtFrameHistory.Break.CAMERA_CUT);
         assertReset(capture(seeded(), snapshot(SCENE, SceneOrigin.ZERO, 0, .01,
-                1, false, new Matrix4f().m00(1.2f), new Matrix4f()), 1));
+                1, false, new Matrix4f().m00(1.2f), new Matrix4f()), 1), RtFrameHistory.Break.CAMERA_CUT);
     }
 
     @Test
@@ -177,7 +179,7 @@ final class RtFrameHistoryTest {
         assertEquals(0, raw.jitterY(), 0);
         history.submitted(raw);
         var temporal = history.capture(snapshot(0, .01), 1, 16_000_000L, EXTENT, ROUTE, 2, -1, -1);
-        assertReset(temporal);
+        assertReset(temporal, RtFrameHistory.Break.ROUTE);
         assertEquals(-RtJitter.sample(0, 1280, 1920).y(), temporal.jitterY());
         assertEquals(2, temporal.preExposure());
     }
@@ -198,7 +200,8 @@ final class RtFrameHistoryTest {
         return next;
     }
 
-    private static void assertReset(RtFrameInput frame) {
+    private static void assertReset(RtFrameInput frame, RtFrameHistory.Break cause) {
+        assertEquals(cause, frame.historyBreak());
         assertFalse(frame.historyContinuous());
         assertEquals(new Float3(0, 0, 0), frame.cameraDelta());
         assertEquals(frame.projectionView(), frame.previousProjectionView());
@@ -211,6 +214,18 @@ final class RtFrameHistoryTest {
         var history = new RtFrameHistory();
         history.submitted(capture(history, snapshot(0, 0), 0));
         return history;
+    }
+
+    @Test
+    void renderFramesWithoutAnRtCompositeKeepHistory() {
+        var history = new RtFrameHistory();
+        history.submitted(capture(history, snapshot(1, 1), 10));
+        // Frame 11 was a screen transition's redraw with no RT composite.
+        var next = capture(history, snapshot(1, 1.03), 12);
+        assertTrue(next.historyContinuous());
+        history.submitted(next);
+        var afterPause = history.capture(snapshot(1, 2), 13, 12 * 16_000_000L + 300_000_000L, EXTENT, ROUTE, 1, 1, 1);
+        assertEquals(RtFrameHistory.Break.INTERRUPTED, afterPause.historyBreak());
     }
 
     private static RtFrameInput capture(RtFrameHistory history, FrameSnapshot snapshot, long number) {

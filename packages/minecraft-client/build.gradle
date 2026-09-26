@@ -218,9 +218,7 @@ def compileShaders = tasks.register("compileShaders", CompileSlangShaders) {
 	includeDirectories.from(runtimeMinecraftSourceDir, configurations.slangShaderModules)
 	moduleAliases = [
 			"radiance_any_hit_rahit.slang":
-					"caustica/shaders/world/radiance_any_hit.rahit.slang",
-			"shadow_any_hit_rahit.slang":
-					"caustica/shaders/world/shadow_any_hit.rahit.slang"
+					"caustica/shaders/world/radiance_any_hit.rahit.slang"
 	]
 	descriptorHeapNative = true
 	mappedDescriptorBindingSources = [
@@ -300,7 +298,8 @@ def verifyEmbeddedApi = tasks.register("verifyEmbeddedApi") {
 		"minecraft-rendering": ["caustica/shaders/minecraft/"],
 		"nvidia-ngx": ["caustica/natives/"],
 		"renderer-presentation": ["caustica/shaders/pipelines/", "caustica/color/"],
-		"renderer-raytracing": ["caustica/shaders/world/", "caustica/shaders/fallback/", "caustica/shaders/pipelines/nee_at/"],
+		"renderer-raytracing": ["caustica/shaders/world/", "caustica/shaders/fallback/", "caustica/shaders/pipelines/nee_at/",
+				"caustica/sharc.properties"],
 		"shader-api": ["caustica/shaders/api/"],
 		"slang-runtime": ["caustica/natives/slang/"]
 	]

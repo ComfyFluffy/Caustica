@@ -11,6 +11,8 @@ public record VulkanDeviceCapabilities(
         boolean lowLatency,
         boolean presentIds,
         boolean hdrMetadata,
+        boolean shaderBufferInt64Atomics,
+        boolean storageBuffer16BitAccess,
         GpuRasterCapabilities raster) {
     public VulkanDeviceCapabilities {
         if (!rayTracing && (shaderExecutionReordering || opacityMicromap)) {
@@ -22,7 +24,7 @@ public record VulkanDeviceCapabilities(
     }
 
     public static VulkanDeviceCapabilities unavailable() {
-        return new VulkanDeviceCapabilities(false, false, false, false, false, false,
+        return new VulkanDeviceCapabilities(false, false, false, false, false, false, false, false,
                 new GpuRasterCapabilities(false, 1.0f, VK10.VK_SAMPLE_COUNT_1_BIT));
     }
 }

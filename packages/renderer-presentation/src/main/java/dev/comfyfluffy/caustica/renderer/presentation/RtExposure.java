@@ -31,8 +31,6 @@ public final class RtExposure {
     private static final Logger LOGGER = LoggerFactory.getLogger(RtExposure.class);
     /** {@code log2(100 / 12.5)} maps scene luminance in cd/m² onto the EV100 metering scale. */
     private static final float EV100_OFFSET = (float) (Math.log(8.0) / Math.log(2.0));
-    private static final float AUTO_MIN_EV = -15.0f;
-    private static final float AUTO_MAX_EV = -2.0f;
     private Settings settings;
     private GpuImage image;
     private GpuBuffer histogram;
@@ -53,7 +51,7 @@ public final class RtExposure {
 
     private static final int STATE_READBACK_SLOTS = 6;
 
-    public record Settings(String mode, float manualEv, float key,
+    public record Settings(String mode, String response, float manualEv, float key,
             float adaptDarken, float adaptBrighten, float lowPercentile, float highPercentile,
             int stride, float centerWeightSigma, float centerWeightFloor,
             float environmentWeightCap, float emissiveWeightCap,
@@ -305,8 +303,9 @@ public final class RtExposure {
         float evScene = snapshot.evScene();
         float evTarget = snapshot.evTarget();
         float evApplied = snapshot.evApplied();
-        String clamp = evTarget <= AUTO_MIN_EV + 0.01f ? " (min clamp)"
-                : evTarget >= AUTO_MAX_EV - 0.01f ? " (max clamp)" : "";
+        Response response = response();
+        String clamp = evTarget <= response.minEv() + 0.01f ? " (min clamp)"
+                : evTarget >= response.maxEv() - 0.01f ? " (max clamp)" : "";
         return String.format(java.util.Locale.ROOT, "Exposure: EV100 %.2f, applied %.2f EV%s",
                 evScene, evApplied, clamp);
     }
@@ -342,7 +341,8 @@ public final class RtExposure {
         Mode mode = mode();
         AutoConfig autoConfig = autoConfig();
         String exposureText = mode == Mode.AUTO
-                ? "auto(key=" + autoConfig.key + ", minEv=" + autoConfig.minEv + ", maxEv=" + autoConfig.maxEv
+                ? "auto(response=" + autoConfig.response.configName + ", key=" + autoConfig.key
+                + ", minEv=" + autoConfig.minEv + ", maxEv=" + autoConfig.maxEv
                 + ", adaptDarken=" + autoConfig.adaptDarken + ", adaptBrighten=" + autoConfig.adaptBrighten
                 + ", evBias=" + autoConfig.evBias + ", percentiles=" + autoConfig.lowPercentile
                 + ".." + autoConfig.highPercentile + ", stride=" + autoConfig.stride
@@ -360,11 +360,17 @@ public final class RtExposure {
         return Mode.parse(settings.mode());
     }
 
+    private Response response() {
+        return Response.parse(settings.response());
+    }
+
     private AutoConfig autoConfig() {
+        Response response = response();
         return new AutoConfig(
+                response,
                 settings.key(),
-                AUTO_MIN_EV,
-                AUTO_MAX_EV,
+                response.minEv(),
+                response.maxEv(),
                 settings.adaptDarken(),
                 settings.adaptBrighten(),
                 settings.manualEv(),
@@ -466,7 +472,7 @@ public final class RtExposure {
         return ExposureStateData.read(stateDataBuffer());
     }
 
-    record AutoConfig(float key, float minEv, float maxEv, float adaptDarken, float adaptBrighten,
+    record AutoConfig(Response response, float key, float minEv, float maxEv, float adaptDarken, float adaptBrighten,
                       float evBias,
                       float lowPercentile, float highPercentile, int stride,
                       float centerWeightSigma, float centerWeightFloor, float environmentWeightCap,
@@ -479,6 +485,68 @@ public final class RtExposure {
          */
         float evOffset() {
             return EV100_OFFSET - (float) (Math.log(Math.max(preExposure, 1.0e-12f)) / Math.log(2.0));
+        }
+    }
+
+    /**
+     * Auto-exposure response: compensation EV as a function of metered scene EV100, linear between four
+     * strictly increasing knots and constant beyond the end knots, with the absolute exposure bounds that
+     * belong to it. The resolve renders the metered mean at {@code key * 2^(evBias + compensation)} and
+     * clamps the absolute multiplier to {@code [2^minEv, 2^maxEv]}, where a multiplier of 1 maps 1 cd/m²
+     * to display-linear 1.
+     */
+    enum Response {
+        /**
+         * The 1:5 adaptation law {@code clamp(0.2 * (EV100 - 17.45), -5, 0)}: a scene metering at the noon
+         * reference EV100 17.45 renders at key, darker scenes render darker by one fifth of their luminance
+         * ratio down to the -5 EV floor, and compensation never brightens. The upper bound is the night
+         * ceiling: below about 6.8 cd/m² (EV100 5.8) the law demands more than 2^-7.5734, so darker scenes
+         * render at their luminance times that bound. The lower bound is a guard rail outside the law's
+         * working range.
+         */
+        ADAPTATION("adaptation", new float[]{-7.55f, 4.95f, 17.45f, 18.45f},
+                new float[]{-5.0f, -2.5f, 0.0f, 0.0f}, -30.5734f, -7.5734f),
+        /** Brightens scenes above EV100 8 by up to one EV. */
+        CURVE("curve", new float[]{-2.0f, 2.0f, 8.0f, 15.0f},
+                new float[]{-3.0f, -2.0f, 0.0f, 1.0f}, -15.0f, -2.0f);
+
+        private final String configName;
+        private final float[] sceneEv;
+        private final float[] compensationEv;
+        private final float minEv;
+        private final float maxEv;
+
+        Response(String configName, float[] sceneEv, float[] compensationEv, float minEv, float maxEv) {
+            this.configName = configName;
+            this.sceneEv = sceneEv;
+            this.compensationEv = compensationEv;
+            this.minEv = minEv;
+            this.maxEv = maxEv;
+        }
+
+        float sceneEv(int knot) {
+            return sceneEv[knot];
+        }
+
+        float compensationEv(int knot) {
+            return compensationEv[knot];
+        }
+
+        float minEv() {
+            return minEv;
+        }
+
+        float maxEv() {
+            return maxEv;
+        }
+
+        static Response parse(String value) {
+            for (Response response : values()) {
+                if (response.configName.equalsIgnoreCase(value)) {
+                    return response;
+                }
+            }
+            return ADAPTATION;
         }
     }
 

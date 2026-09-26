@@ -1,7 +1,7 @@
 package dev.comfyfluffy.caustica.minecraft.client.mixin;
 
 import dev.comfyfluffy.caustica.minecraft.client.MinecraftHostTelemetry;
-import dev.comfyfluffy.caustica.renderer.runtime.RendererOptions;
+import dev.comfyfluffy.caustica.renderer.runtime.RtRenderSettings;
 
 import com.mojang.blaze3d.systems.CommandEncoderBackend;
 import com.mojang.blaze3d.systems.GpuSurface;
@@ -284,9 +284,9 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * Mark the real frame's presentation for Reflex, attaching the same ID through
-	 * {@code VK_KHR_present_id} when supported. Generated-frame presents carry no Reflex markers;
-	 * Reflex paces the real frame. Requires sleep mode applied to this swapchain.
+	 * Present under the renderer device's queue lock and mark the real frame's presentation for Reflex,
+	 * attaching the same ID through {@code VK_KHR_present_id} when supported. Generated-frame presents
+	 * carry no Reflex markers; Reflex paces the real frame. Requires sleep mode applied to this swapchain.
 	 */
 	@Redirect(method = "present",
 			at = @At(value = "INVOKE",
@@ -302,7 +302,8 @@ public abstract class VulkanGpuSurfaceMixin {
 					&& this.swapchain == lowLatency.appliedSwapchain();
 		}
 		if (!reflexActive) {
-			return KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
+			return backend == null ? KHRSwapchain.vkQueuePresentKHR(queue, presentInfo)
+					: backend.synchronizedQueueOperation(() -> KHRSwapchain.vkQueuePresentKHR(queue, presentInfo));
 		}
 		VkDevice vkDevice = this.device.vkDevice();
 		// Own counter (not currentSimFrameId()): Minecraft can present outside the normal tick loop (e.g.
@@ -324,13 +325,13 @@ public abstract class VulkanGpuSurfaceMixin {
 						.pPresentIds(stack.longs(presentId));
 				presentInfo.pNext(vkPresentId.address());
 				try {
-					result = KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
+					result = backend.synchronizedQueueOperation(() -> KHRSwapchain.vkQueuePresentKHR(queue, presentInfo));
 				} finally {
 					presentInfo.pNext(vkPresentId.pNext());
 				}
 			}
 		} else {
-			result = KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
+			result = backend.synchronizedQueueOperation(() -> KHRSwapchain.vkQueuePresentKHR(queue, presentInfo));
 		}
 		try (var hostWork = MinecraftHostTelemetry.work("reflex.presentEnd")) {
 			lowLatency.marker(vkDevice, this.swapchain, VulkanLowLatency.PRESENT_END, presentId);
@@ -403,7 +404,7 @@ public abstract class VulkanGpuSurfaceMixin {
 				|| !backend.capabilities().hdrMetadata() || this.swapchain == 0L) {
 			return;
 		}
-		int peakNits = CausticaConfig.get(RendererOptions.Rt.Hdr.PEAK_NITS);
+		int peakNits = RtRenderSettings.effectivePeakNits(CausticaConfig.snapshot());
 		if (this.caustica$metadataSwapchain == this.swapchain
 				&& this.caustica$metadataPeakNits == peakNits) {
 			return;

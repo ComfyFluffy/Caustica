@@ -4,6 +4,7 @@ import dev.comfyfluffy.caustica.renderer.raytracing.gen.NeeAtStateData;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.NeeAtBakePushData;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.RetainedInstanceRecordData;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.RetainedLightRecordData;
+import dev.comfyfluffy.caustica.renderer.raytracing.gen.SharcFrameData;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.WorldPushData;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.ShadowDiagnosticsData;
 import dev.comfyfluffy.caustica.renderer.raytracing.layout.RtBindings;
@@ -44,7 +45,7 @@ final class RtShaderRecordAbiTest {
                 new WorldPushData.Float2(11, 12), 13, 14, 15,
                 new WorldPushData.Float3(16, 17, 18), new Matrix4f().scaling(19), 20, 21,
                 0x1111222233334444L, 22, 0x2222333344445555L, 0x3333444455556666L, 31,
-                new WorldPushData.Float3(-1024, 2048, -4096));
+                new WorldPushData.Float3(-1024, 2048, -4096), 0.25f);
         ByteBuffer bytes = storage(WorldPushData.BYTE_SIZE);
 
         value.write(bytes);
@@ -70,9 +71,9 @@ final class RtShaderRecordAbiTest {
         assertEquals(-1024, bytes.getFloat(320));
         assertEquals(2048, bytes.getFloat(324));
         assertEquals(-4096, bytes.getFloat(328));
+        assertEquals(0.25f, bytes.getFloat(332));
         assertEquals(0, bytes.getInt(292));
         assertEquals(0, bytes.getInt(316));
-        assertEquals(0, bytes.getInt(332));
     }
 
     @Test
@@ -139,9 +140,31 @@ final class RtShaderRecordAbiTest {
     }
 
     @Test
+    void sharcFramePacksTablesCamerasAndAlignedVectors() {
+        var value = new SharcFrameData(1L, 2L, 3L, new SharcFrameData.Float3(4, 5, 6), 7,
+                new SharcFrameData.Float3(8, 9, 10), 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                new SharcFrameData.Int2(20, 21), 22, 23);
+        ByteBuffer bytes = storage(SharcFrameData.BYTE_SIZE);
+
+        value.write(bytes);
+
+        assertEquals(112, bytes.capacity());
+        for (int address = 0; address < 3; address++) assertEquals(address + 1, bytes.getLong(address * 8));
+        assertEquals(4, bytes.getFloat(32));
+        assertEquals(7, bytes.getInt(44));
+        assertEquals(10, bytes.getFloat(56));
+        assertEquals(11, bytes.getInt(60));
+        assertEquals(16, bytes.getFloat(80));
+        assertEquals(21, bytes.getInt(100));
+        assertEquals(22, bytes.getFloat(104));
+        assertEquals(23, bytes.getInt(108));
+    }
+
+    @Test
     void worldPushRootsRetainTheirDescriptorHeapAbi() {
-        assertArrayEquals(new int[]{0, 8, 16, 24, 32, 40, 56, 68, 72, 76, 80, 84, 88, 92,
-                        96, 100, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 180, 184, 188, 192, 200, 208},
+        assertArrayEquals(new int[]{0, 8, 16, 24, 32, 40, 56, 68, 72, 76, 80, 84, 88, 92, 96,
+                        100, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 188, 192, 196, 200, 208, 216,
+                        224},
                 new int[]{RtBindings.WORLD_PUSH_ADDRESS_OFFSET, RtBindings.WORLD_COMPOSITION_DATA_ADDRESS_OFFSET,
                         RtBindings.WORLD_GEOMETRY_TABLE_ADDRESS_OFFSET, RtBindings.WORLD_PATH_QUEUE_ADDRESS_OFFSET,
                         RtBindings.WORLD_TOP_LEVEL_AS_INDEX_OFFSET, RtBindings.WORLD_STABLE_PLANE_METADATA_IMAGE_INDEX_OFFSET,
@@ -150,7 +173,8 @@ final class RtShaderRecordAbiTest {
                         RtBindings.WORLD_SPECULAR_RADIANCE_HIT_DISTANCE_INDEX_OFFSET, RtBindings.WORLD_NRD_VIEW_Z_INDEX_OFFSET,
                         RtBindings.WORLD_DENOISED_DIFFUSE_RADIANCE_HIT_DISTANCE_INDEX_OFFSET,
                         RtBindings.WORLD_DENOISED_SPECULAR_RADIANCE_HIT_DISTANCE_INDEX_OFFSET,
-                        RtBindings.WORLD_NRD_STABLE_RADIANCE_INDEX_OFFSET, RtBindings.WORLD_INITIAL_VOLUME_IMPLEMENTATION_OFFSET,
+                        RtBindings.WORLD_NRD_STABLE_RADIANCE_INDEX_OFFSET, RtBindings.WORLD_RESPONSIVITY_GUIDE_INDEX_OFFSET,
+                        RtBindings.WORLD_INITIAL_VOLUME_IMPLEMENTATION_OFFSET,
                         RtBindings.WORLD_INITIAL_VOLUME_ACTIVE_OFFSET, RtBindings.WORLD_INITIAL_VOLUME_BINDING_OFFSET,
                         RtBindings.WORLD_INITIAL_VOLUME_INSTANCE_OFFSET, RtBindings.WORLD_NEE_AT_STATE_ADDRESS_OFFSET,
                         RtBindings.WORLD_NRD_SIGNAL_ENCODING_OFFSET, RtBindings.WORLD_STABLE_PLANE_BUFFER_ADDRESS_OFFSET,
@@ -160,7 +184,8 @@ final class RtShaderRecordAbiTest {
                         RtBindings.WORLD_SPATIAL_MEDIUM_IMPLEMENTATION_OFFSET, RtBindings.WORLD_SPATIAL_MEDIUM_ACTIVE_OFFSET,
                         RtBindings.WORLD_SPATIAL_MEDIUM_ORIGIN_X_OFFSET, RtBindings.WORLD_SPATIAL_MEDIUM_ORIGIN_Y_OFFSET,
                         RtBindings.WORLD_SPATIAL_MEDIUM_ORIGIN_Z_OFFSET,
-                        RtBindings.WORLD_SHADOW_DIAGNOSTICS_ADDRESS_OFFSET, RtBindings.WORLD_PUSH_CONSTANT_SIZE});
+                        RtBindings.WORLD_SHADOW_DIAGNOSTICS_ADDRESS_OFFSET, RtBindings.WORLD_SHARC_FRAME_ADDRESS_OFFSET,
+                        RtBindings.WORLD_PUSH_CONSTANT_SIZE});
     }
 
     @Test

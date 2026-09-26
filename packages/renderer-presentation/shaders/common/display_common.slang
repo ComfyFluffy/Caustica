@@ -86,12 +86,31 @@ public struct DisplayPush {
     public uint hdrToneSamplerIndex;
     public uint lookLutIndex;
     public uint lookSamplerIndex;
-    public int hdrEnabled;      // 0 = SDR only, 1 = also write the PQ HDR image
     public float lutSize;       // toneLut/hdrToneLut texels per axis; both LUTs share one size (asserted at load)
     public float gamma;         // post-display artistic gamma; below 1 brightens midtones
     public float hdrPeakNits;   // mastering peak baked into the currently bound HDR ACES LUT
     public int lookEnabled;     // 0 = identity, 1 = apply the scene-referred ACES look LUT
     public float lookLutSize;   // lookLut texels per axis (independent of the output-transform LUT size)
+    // Analytic tone-mapper inputs; the selected SDR and HDR mappers are specialization constants of
+    // the display shader variant. Each mapper reads its controls from the leading parameters in order.
+    public float paperWhiteNits;
+    public float headroom;      // display peak over paper white
+    public float sdrParam0;
+    public float sdrParam1;
+    public float sdrParam2;
+    public float sdrParam3;
+    public float sdrParam4;
+    public float sdrParam5;
+    public float sdrParam6;
+    public float sdrParam7;
+    public float hdrParam0;
+    public float hdrParam1;
+    public float hdrParam2;
+    public float hdrParam3;
+    public float hdrParam4;
+    public float hdrParam5;
+    public float hdrParam6;
+    public float hdrParam7;
 };
 
 public struct DebugPresentPush {

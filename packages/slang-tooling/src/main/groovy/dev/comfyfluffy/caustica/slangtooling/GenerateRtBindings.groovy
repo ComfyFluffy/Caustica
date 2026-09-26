@@ -47,7 +47,7 @@ abstract class GenerateRtBindings extends DefaultTask {
                         GEOMETRY_TABLE: "geometryTableAddress", PATH_QUEUE: "pathQueueAddress",
                         STABLE_PLANE_BUFFER: "stablePlaneBufferAddress",
                         VISIBILITY_RAYS: "visibilityRaysAddress", VISIBILITY_RESULTS: "visibilityResultsAddress",
-                        NEE_AT_STATE: "neeAtStateAddress"],
+                        NEE_AT_STATE: "neeAtStateAddress", SHARC_FRAME: "sharcFrameAddress"],
             words: [SPATIAL_MEDIUM_BINDING_DATA: "spatialMediumBindingData",
                     SPATIAL_MEDIUM_INSTANCE_DATA: "spatialMediumInstanceData",
                     INITIAL_VOLUME_BINDING: "initialVolumeBinding",
@@ -73,7 +73,8 @@ abstract class GenerateRtBindings extends DefaultTask {
                         "nrdViewZ": "StorageImageIndex",
                         "denoisedDiffuseRadianceHitDistance": "StorageImageIndex",
                         "denoisedSpecularRadianceHitDistance": "StorageImageIndex",
-                        "nrdStableRadiance": "StorageImageIndex"]
+                        "nrdStableRadiance": "StorageImageIndex",
+                        "responsivityGuide": "StorageImageIndex"]
     ]
 
     // Gradle decorates this task; closure dispatch cannot resolve a private static helper through it.

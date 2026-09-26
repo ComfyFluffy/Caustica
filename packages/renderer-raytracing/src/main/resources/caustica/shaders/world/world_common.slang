@@ -161,10 +161,10 @@ public struct WorldPush {
     public float3   proceduralDomainOffset;
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public float    previousTime;     // `time` last frame; equal to `time` with no adjacent frame
-    // Pre-exposure scalar applied to radiance at the outImage write
-    // ONLY, so all light transport above stays in absolute scene units. Keeps stored fp16 values
-    // near mid-grey at any scene brightness; the display pass divides it back out, so the two cancel
-    // exactly and this cannot change the image. 1.0 disables it.
+    // Pre-exposure scalar applied to radiance only where it is stored as fp16: the outImage write and the
+    // stable-plane radiance words, whose accessors divide it back out. All light transport stays in absolute
+    // scene units. Keeps stored fp16 values near mid-grey at any scene brightness; the display pass divides
+    // it back out, so the two cancel exactly and this cannot change the image. 1.0 disables it.
     public float    preExposure;
     // Scene-selected environment tuple resolved against the currently published shader program.
     public uint64_t environmentBinding;
@@ -174,4 +174,6 @@ public struct WorldPush {
     public uint previousInstanceTableMask;
     // Previous revision origin minus current revision origin, subtracted in host double precision.
     public float3 previousOriginDelta;
+    // DLSS-RR responsivity in [0, 1] for pixels whose history remains reusable; 0 keeps full accumulation.
+    public float responsivityFloor;
 };

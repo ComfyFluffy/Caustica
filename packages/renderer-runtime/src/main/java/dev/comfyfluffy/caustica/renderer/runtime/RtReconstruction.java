@@ -148,7 +148,7 @@ final class RtReconstruction implements AutoCloseable {
              RtTelemetry.Scope ignored = telemetry.frame().stage("frame.dlssRr")) {
             boolean success = rayReconstruction.evaluate(command, source, images.depth(), images.motion(),
                     images.diffuseAlbedo(), images.specularAlbedo(), images.normalRoughness(), images.specularMotion(),
-                    images.reconstructedColor(), extent.renderWidth(), extent.renderHeight(),
+                    images.responsivity(), images.reconstructedColor(), extent.renderWidth(), extent.renderHeight(),
                     extent.displayWidth(), extent.displayHeight(), -frame.jitterX(), -frame.jitterY(), frame.preExposure());
             if (!success) rayReconstruction.resetHistory();
             return success;

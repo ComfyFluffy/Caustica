@@ -82,7 +82,8 @@ public final class MinecraftMaterialCatalogBuilder {
                         1.0f / (sprite.getV1() - sprite.getV0())),
                 spec.isPresent(), normal.isPresent(), spec.isPresent() || inferEmission,
                 OpenPbrColorBinding.BASE_COLOR, OpenPbrColorBinding.BASE_COLOR,
-                MinecraftMaterialClassifier.dielectricIor(material), uniformEmissionLuminance);
+                MinecraftMaterialClassifier.dielectricIor(material),
+                uniformEmissionLuminance * MinecraftMaterialClassifier.emissionScale(material));
     }
 
     private static List<MaterialTextureResource> standaloneResources(Set<ResourceId> blockNames,

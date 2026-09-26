@@ -62,8 +62,8 @@ float4 fogPrefixAt(uint2 pixel, uint2 extent, float distance, float maximumDista
     float4* prefix = (float4*)pc.prefixAddress;
     uint planeSize = extent.x * extent.y;
     // The terminal prefix integrates only to its conservative depth limit.
-    float limit = prefix[pixel.x + pixel.y * extent.x + (pc.steps + 1u) * planeSize].x;
-    interval.y = min(interval.y, max(0.0, limit - interval.x));
+    Texture2D<float> limits = ResourceDescriptorHeap[pc.fogIndex];
+    interval.y = min(interval.y, max(0.0, limits.Load(int3(pixel,0)) - interval.x));
     uint base = pixel.x + pixel.y * extent.x + step * planeSize;
     float4 before = prefix[base], after = prefix[base + planeSize];
     if (interval.y <= 0.0) return before;
@@ -77,18 +77,38 @@ float4 fogPrefixAt(uint2 pixel, uint2 extent, float distance, float maximumDista
     float scatteringFraction = 1.0 - segmentT > 1e-5 ? (1.0 - partialT) / (1.0 - segmentT) : fraction;
     return float4(lerp(before.rgb, after.rgb, scatteringFraction), before.a * partialT);
 }
+float fogDistance(float2 uv, float depth, float maximumDistance) {
+    return depth <= 0.0 ? maximumDistance : min(length(unproject(uv, depth)), maximumDistance);
+}
+// Fraction of a pixel's path that a column may run past its own first surface while keeping half its weight.
+static const float FOG_COLUMN_PENETRATION = 0.1;
 float4 fogTransportAt(float2 uv, float depth, uint2 extent, float maximumDistance) {
-    float distance = depth <= 0.0 ? maximumDistance : min(length(unproject(uv, depth)), maximumDistance);
+    float distance = fogDistance(uv, depth, maximumDistance);
+    Texture2D<float> primaryDepth = ResourceDescriptorHeap[pc.depthIndex];
+    uint w,h; primaryDepth.GetDimensions(w,h);
     float2 grid = uv * float2(extent) - 0.5;
     int2 base = int2(floor(grid));
     float2 blend = grid - floor(grid);
     float4 volume = 0.0;
+    float total = 0.0;
     for (int y=0;y<2;y++) for (int x=0;x<2;x++) {
         int2 p = clamp(base+int2(x,y), int2(0), int2(extent-1));
-        float weight = (x == 0 ? 1-blend.x : blend.x)*(y == 0 ? 1-blend.y : blend.y);
+        // A column integrates along its center ray through every surface. The jittered primary sample
+        // nearest that ray gives the column's first physical surface.
+        float2 center = (float2(p) + 0.5) / float2(extent) * float2(w,h);
+        int2 sample = clamp(int2(floor(center - pc.traceData.xy)), int2(0), int2(w-1,h-1));
+        float columnDistance = fogDistance((float2(sample) + 0.5 + pc.traceData.xy) / float2(w,h),
+                primaryDepth.Load(int3(sample,0)), maximumDistance);
+        // Past that surface the column's transport lies inside or behind an occluder beside this pixel's ray.
+        // Columns that stay clear to this pixel's endpoint keep their bilinear weight.
+        float penetration = max(0.0, distance - columnDistance) / (FOG_COLUMN_PENETRATION * distance);
+        penetration *= penetration;
+        float weight = (x == 0 ? 1-blend.x : blend.x)*(y == 0 ? 1-blend.y : blend.y)
+                     / (1.0 + penetration * penetration);
         volume += fogPrefixAt(uint2(p), extent, distance, maximumDistance) * weight;
+        total += weight;
     }
-    return volume;
+    return volume / total;
 }
 float4 previousLighting(float3 center, uint2 extent, float maximumDistance, float3 lightDirection) {
     float4 q = pc.previousClipX * center.x + pc.previousClipY * center.y
@@ -119,106 +139,111 @@ float4 previousLighting(float3 center, uint2 extent, float maximumDistance, floa
     if (result.a > 0.0) result.rgb /= result.a;
     return result;
 }
-public void runFog(uint3 id) {
+// Each frame records BOUND, then PREPARE, volume lighting, INTEGRATE and ACCUMULATE for every batch of depth
+// steps, then COMPOSE. PREPARE and INTEGRATE run one invocation per column and step, with the batch step in Z.
+static const uint FOG_INTEGRATE = 0u;
+static const uint FOG_COMPOSE = 1u;
+static const uint FOG_PREPARE = 2u;
+static const uint FOG_BOUND = 3u;
+static const uint FOG_ACCUMULATE = 4u;
+void composeFog(uint2 pixel, FogVolumeData medium) {
     RWTexture2D<float4> output = ResourceDescriptorHeap[pc.destinationIndex];
     uint w,h; output.GetDimensions(w,h);
-    if(any(id.xy >= uint2(w,h))) return;
-    float2 uv = (float2(id.xy)+0.5)/float2(w,h);
+    if(any(pixel >= uint2(w,h))) return;
+    Texture2D<float> limits = ResourceDescriptorHeap[pc.fogIndex];
+    uint fw,fh; limits.GetDimensions(fw,fh);
+    // Scene effects share the traced pixel's jitter and physical endpoint before reconstruction.
+    Texture2D<float> depth = ResourceDescriptorHeap[pc.depthIndex];
+    float2 uv = (float2(pixel)+0.5)/float2(w,h) + pc.traceData.xy / float2(w,h);
+    float4 volume = fogTransportAt(uv, depth.Load(int3(pixel,0)), uint2(fw,fh), medium.profile.w);
+    if(pc.debug == 1) { output[pixel] = float4(volume.aaa,1.0); return; }
+    if(pc.debug == 2) { output[pixel] = float4(volume.rgb,1.0); return; }
+    Texture2D<float4> scene = ResourceDescriptorHeap[pc.sceneIndex];
+    float4 color = scene.Load(int3(pixel,0));
+    output[pixel] = float4(color.rgb*volume.a+volume.rgb,color.a);
+}
+public void runFog(uint3 id) {
     FogVolumeData medium = ((FogVolumeData*)pc.volumeAddress)[0];
-    uint visibilityCount = 8;
-    uint firstStep = uint(pc.traceData.w);
-    uint visibilityBase = (id.x+id.y*w)*visibilityCount;
-    if(pc.mode == 2) {
-        float3 direction = normalize(unproject(uv,0.0001));
-        float4* rays = (float4*)pc.visibilityRaysAddress;
-        float4* prefix = (float4*)pc.prefixAddress;
-        // Each depth plane is contiguous so neighboring invocations access neighboring transport values.
-        uint prefixBase = id.x + id.y * w;
-        // The extra plane retains the conservative limit across all eight-sample batches.
-        uint limitIndex = prefixBase + (pc.steps+1u)*w*h;
-        if (firstStep == 0u) prefix[limitIndex] = float4(fogDepthLimit(id.xy,uint2(w,h),medium.profile.w),0,0,0);
-        float depthLimit = prefix[limitIndex].x;
-        for(uint j=0;j<visibilityCount;j++) {
-            uint step = firstStep+j;
-            float2 interval = fogInterval(step, medium.profile.w);
-            // Sampling beyond the terminal limit can import light from behind the visible boundary.
-            interval.y = min(interval.y, max(0.0, depthLimit - interval.x));
-            float3 p = direction*(interval.x+fogSamplePhase(id.xy,step)*interval.y);
-            float sigma = step < pc.steps && interval.y > 0.0
-                    ? intervalDensity(medium, direction, interval) : 0.0;
-            // The integration dispatch consumes this density before replacing it with cumulative transport.
-            if (step < pc.steps) prefix[prefixBase+(step+1u)*w*h] = float4(0,0,0,sigma);
-            uint base = (visibilityBase+j)*4;
-            rays[base] = float4(p+pc.tlasCamera.xyz,pc.tlasCamera.w);
-            rays[base+1] = float4(direction, 0.45);
-            uint seed = (id.x + id.y*w) * 0x9e3779b9u ^ step * 0x85ebca6bu ^ asuint(pc.mediumCamera.w) * 0xc2b2ae35u;
-            rays[base+2] = float4(uv, asfloat(seed), sigma > 0.0 ? 1.0 : 0.0);
-            rays[base+3] = float4(medium.ambientRadiance.xyz, 0.0);
-        }
-        return;
-    }
-    if(pc.mode == 0) {
-        float3 direction = normalize(unproject(uv,0.0001));
-        float4 accumulated = firstStep == 0 ? float4(0,0,0,1) : output[id.xy];
-        float transmittance = accumulated.a;
-        float3 scattering = accumulated.rgb;
-        float4* prefix = (float4*)pc.prefixAddress;
-        float4* history = (float4*)pc.historyAddress;
-        if (firstStep == 0u && all(id.xy == uint2(0))) {
+    if(pc.mode == FOG_COMPOSE) { composeFog(id.xy, medium); return; }
+    // The limit image holds each column's conservative depth limit and defines the column grid.
+    Texture2D<float> limits = ResourceDescriptorHeap[pc.fogIndex];
+    uint w,h; limits.GetDimensions(w,h);
+    if(any(id.xy >= uint2(w,h))) return;
+    uint planeSize = w*h;
+    // Each depth plane is contiguous so neighboring invocations access neighboring transport values.
+    uint column = id.x + id.y*w;
+    float4* prefix = (float4*)pc.prefixAddress;
+    if(pc.mode == FOG_BOUND) {
+        [format("r32f")] RWTexture2D<float> bound = ResourceDescriptorHeap[pc.destinationIndex];
+        bound[id.xy] = fogDepthLimit(id.xy,uint2(w,h),medium.profile.w);
+        prefix[column] = float4(0,0,0,1);
+        if (all(id.xy == uint2(0))) {
+            float4* history = (float4*)pc.historyAddress;
             history[0] = float4(medium.lightDirection.xyz, pc.mediumCamera.w);
             history[1] = pc.clipX; history[2] = pc.clipY; history[3] = pc.clipZ; history[4] = pc.clipW;
         }
-        uint prefixBase = id.x + id.y * w;
-        if (firstStep == 0u) prefix[prefixBase] = accumulated;
-        float3 lighting = 0.0;
-        float4* visibilityResults = (float4*)pc.visibilityResultsAddress;
-        for(uint i=firstStep;i<min(firstStep+visibilityCount,pc.steps);i++) {
-            float2 interval = fogInterval(i, medium.profile.w);
-            float depthLimit = prefix[prefixBase + (pc.steps + 1u)*w*h].x;
-            interval.y = min(interval.y, max(0.0, depthLimit - interval.x));
-            float segmentLength = interval.y;
-            float3 p = direction*(interval.x+0.5*segmentLength);
-            float sigma = prefix[prefixBase+(i+1u)*w*h].a;
-            if (sigma == 0.0) {
-                history[5u + id.x + id.y * w + i*w*h] = 0.0;
-                prefix[prefixBase+(i+1u)*w*h] = float4(scattering,transmittance);
-                continue;
-            }
-            lighting = visibilityResults[visibilityBase+i-firstStep].rgb;
-            float4 previous = previousLighting(p, uint2(w,h), medium.profile.w, medium.lightDirection.xyz);
-            float3 minimumLighting = lighting, maximumLighting = lighting;
-            float4* rays = (float4*)pc.visibilityRaysAddress;
-            for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
-                uint2 neighbor = uint2(clamp(int2(id.xy) + int2(x,y), int2(0), int2(w-1,h-1)));
-                uint sampleIndex = (neighbor.x + neighbor.y * w) * visibilityCount + i - firstStep;
-                if (rays[sampleIndex * 4u + 2u].w == 0.0) continue;
-                float3 currentLighting = visibilityResults[sampleIndex].rgb;
-                minimumLighting = min(minimumLighting, currentLighting);
-                maximumLighting = max(maximumLighting, currentLighting);
-            }
-            // Current local lighting bounds retire stale radiance when lights or occluders change.
-            previous.rgb = clamp(previous.rgb, minimumLighting, maximumLighting);
-            float confidence = min(previous.a + 1.0, 8.0);
-            lighting = lerp(previous.rgb, lighting, 1.0 / confidence);
-            history[5u + id.x + id.y * w + i*w*h] = float4(lighting, confidence);
-            float segmentT = exp(-sigma*segmentLength);
-            float3 source = lighting * pc.traceData.z;
-            scattering += transmittance * (1.0-segmentT) * source * 0.95;
-            transmittance *= segmentT;
-            prefix[prefixBase+(i+1u)*w*h] = float4(scattering,transmittance);
-        }
-        output[id.xy] = float4(scattering,transmittance);
-    } else {
-        Texture2D<float4> fog = ResourceDescriptorHeap[pc.fogIndex];
-        uint fw,fh; fog.GetDimensions(fw,fh);
-        // Scene effects share the traced pixel's jitter and physical endpoint before reconstruction.
-        Texture2D<float> depth = ResourceDescriptorHeap[pc.depthIndex];
-        uv += pc.traceData.xy / float2(w,h);
-        float4 volume = fogTransportAt(uv, depth.Load(int3(id.xy,0)), uint2(fw,fh), medium.profile.w);
-        if(pc.debug == 1) { output[id.xy] = float4(volume.aaa,1.0); return; }
-        if(pc.debug == 2) { output[id.xy] = float4(volume.rgb,1.0); return; }
-        Texture2D<float4> scene = ResourceDescriptorHeap[pc.sceneIndex];
-        float4 color = scene.Load(int3(id.xy,0));
-        output[id.xy] = float4(color.rgb*volume.a+volume.rgb,color.a);
+        return;
     }
+    uint firstStep = uint(pc.traceData.w);
+    if(pc.mode == FOG_ACCUMULATE) {
+        // Front-to-back composition of the batch's segments continues from the preceding batch's prefix.
+        float4 accumulated = prefix[column + firstStep*planeSize];
+        float3 scattering = accumulated.rgb;
+        float transmittance = accumulated.a;
+        for(uint i=firstStep+1u;i<=firstStep+pc.batchSteps;i++) {
+            float4 segment = prefix[column + i*planeSize];
+            scattering += transmittance * (1.0-segment.a) * segment.rgb * 0.95;
+            transmittance *= segment.a;
+            prefix[column + i*planeSize] = float4(scattering,transmittance);
+        }
+        return;
+    }
+    float2 uv = (float2(id.xy)+0.5)/float2(w,h);
+    float3 direction = normalize(unproject(uv,0.0001));
+    uint step = firstStep + id.z;
+    float2 interval = fogInterval(step, medium.profile.w);
+    // Sampling beyond the terminal limit can import light from behind the visible boundary.
+    interval.y = min(interval.y, max(0.0, limits.Load(int3(id.xy,0)) - interval.x));
+    uint slot = column + (step+1u)*planeSize;
+    // Lighting records follow the prefix layout: one plane of columns per batch step.
+    uint sampleIndex = column + id.z*planeSize;
+    float4* rays = (float4*)pc.visibilityRaysAddress;
+    if(pc.mode == FOG_PREPARE) {
+        float3 p = direction*(interval.x+fogSamplePhase(id.xy,step)*interval.y);
+        float sigma = interval.y > 0.0 ? intervalDensity(medium, direction, interval) : 0.0;
+        // Integration consumes this density before replacing it with the segment's source and transmittance.
+        prefix[slot] = float4(0,0,0,sigma);
+        uint seed = column * 0x9e3779b9u ^ step * 0x85ebca6bu ^ asuint(pc.mediumCamera.w) * 0xc2b2ae35u;
+        rays[sampleIndex*4u] = float4(p+pc.tlasCamera.xyz,pc.tlasCamera.w);
+        rays[sampleIndex*4u+1u] = float4(direction, 0.45);
+        rays[sampleIndex*4u+2u] = float4(uv, asfloat(seed), sigma > 0.0 ? 1.0 : 0.0);
+        rays[sampleIndex*4u+3u] = float4(medium.ambientRadiance.xyz, 0.0);
+        return;
+    }
+    float4* history = (float4*)pc.historyAddress;
+    float sigma = prefix[slot].a;
+    if (sigma == 0.0) {
+        history[5u + column + step*planeSize] = 0.0;
+        prefix[slot] = float4(0,0,0,1);
+        return;
+    }
+    float3 p = direction*(interval.x+0.5*interval.y);
+    float4* visibilityResults = (float4*)pc.visibilityResultsAddress;
+    float3 lighting = visibilityResults[sampleIndex].rgb;
+    float4 previous = previousLighting(p, uint2(w,h), medium.profile.w, medium.lightDirection.xyz);
+    float3 minimumLighting = lighting, maximumLighting = lighting;
+    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+        uint2 neighbor = uint2(clamp(int2(id.xy) + int2(x,y), int2(0), int2(w-1,h-1)));
+        uint neighborIndex = neighbor.x + neighbor.y * w + id.z*planeSize;
+        if (rays[neighborIndex * 4u + 2u].w == 0.0) continue;
+        float3 currentLighting = visibilityResults[neighborIndex].rgb;
+        minimumLighting = min(minimumLighting, currentLighting);
+        maximumLighting = max(maximumLighting, currentLighting);
+    }
+    // Current local lighting bounds retire stale radiance when lights or occluders change.
+    previous.rgb = clamp(previous.rgb, minimumLighting, maximumLighting);
+    float confidence = min(previous.a + 1.0, 8.0);
+    lighting = lerp(previous.rgb, lighting, 1.0 / confidence);
+    history[5u + column + step*planeSize] = float4(lighting, confidence);
+    prefix[slot] = float4(lighting * pc.traceData.z, exp(-sigma*interval.y));
 }

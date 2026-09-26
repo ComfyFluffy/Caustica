@@ -4,8 +4,8 @@ import java.util.TreeMap;
 
 /** Scene-local offsets; each captured frame keeps its own buffers and immutable range generations. */
 final class RtStableTraceRanges {
-    // Two SBT hit records per geometry must fit Vulkan's 24-bit instance offset.
-    private final Ranges geometry = new Ranges(1 << 23);
+    // Geometry bases are Vulkan's 24-bit instance custom index and, at one hit record each, SBT offset.
+    private final Ranges geometry = new Ranges(1 << 24);
     private final Ranges emitters = new Ranges(Integer.MAX_VALUE);
 
     /** Object identity distinguishes a new occupant of a reused numeric range. */

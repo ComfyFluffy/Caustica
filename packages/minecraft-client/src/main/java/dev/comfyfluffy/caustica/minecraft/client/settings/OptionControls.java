@@ -77,8 +77,9 @@ public final class OptionControls {
         @Override public double sliderMaximum() { return option.sliderMaximum(); }
         @Override public double step() { return option.kind() == Option.Kind.INTEGER ? 1 : option.step(); }
         @Override public Component format(double value) {
-            return Component.literal(step() == 1.0
-                    ? Integer.toString((int) Math.round(value)) : SettingsFormat.decimal(value));
+            String number = step() == 1.0
+                    ? Integer.toString((int) Math.round(value)) : SettingsFormat.decimal(value);
+            return LangKeys.optionValue(featureId, option, number, SettingsFormat.decimal(value * 100.0));
         }
     }
 

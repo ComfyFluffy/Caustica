@@ -7,6 +7,8 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import dev.comfyfluffy.caustica.engine.vulkan.VulkanDiagnostics;
 import dev.comfyfluffy.caustica.minecraft.client.config.CausticaConfig;
+import dev.comfyfluffy.caustica.minecraft.client.screen.CausticaPageScreen;
+import dev.comfyfluffy.caustica.minecraft.client.settings.CausticaPages;
 import dev.comfyfluffy.caustica.renderer.runtime.RendererOptions;
 import dev.comfyfluffy.caustica.renderer.presentation.BorrowedImage;
 import dev.comfyfluffy.caustica.renderer.runtime.RtFrameCapture;
@@ -17,6 +19,8 @@ import jdk.jfr.Recording;
 import jdk.jfr.RecordingState;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
+import net.minecraft.client.gui.screens.options.OptionsScreen;
+import net.minecraft.client.gui.screens.options.VideoSettingsScreen;
 import org.lwjgl.glfw.GLFW;
 
 import java.io.IOException;
@@ -164,7 +168,7 @@ public final class MinecraftDebugService implements AutoCloseable {
             case "schema" -> future.complete(Map.of("views", VIEWS,
                     "images", debugImageNames(),
                     "operations", List.of("schema", "status", "terrain.status", "memory.capture", "passes.capture",
-                    "settings.get", "settings.set", "runtime.set", "resources.reload", "world.leave", "view.set", "screen.close", "window.resize", "window.fullscreen", "window.maximize", "window.restore", "input.set", "wait", "command", "screenshot", "image.capture", "jfr.start", "jfr.dump", "jfr.stop", "nsight.status", "nsight.start", "client.stop", "job")));
+                    "settings.get", "settings.set", "runtime.set", "resources.reload", "world.leave", "view.set", "screen.close", "screen.open", "window.resize", "window.fullscreen", "window.maximize", "window.restore", "input.set", "wait", "command", "screenshot", "image.capture", "jfr.start", "jfr.dump", "jfr.stop", "nsight.status", "nsight.start", "client.stop", "job")));
             case "nsight.status", "nsight.start" -> future.complete(NsightDebug.execute(op.equals("nsight.start"),
                     CausticaClientComposition.current().runtime().telemetry().frameSerial()));
             case "passes.capture" -> {
@@ -252,6 +256,23 @@ public final class MinecraftDebugService implements AutoCloseable {
                 // Screens can send protocol actions on close, including respawn after the End credits.
                 if (screen != null) screen.onClose();
                 future.complete(Map.of("closed", screen != null));
+            }
+            case "screen.open" -> {
+                String name = request.get("screen").getAsString();
+                var video = new VideoSettingsScreen(new OptionsScreen(null, client.options, client.level != null),
+                        client, client.options);
+                if (name.equals("video")) {
+                    client.gui.setScreen(video);
+                } else {
+                    var composition = CausticaClientComposition.current();
+                    var services = composition.apiServices();
+                    var link = CausticaPages.links(services.settings(), services.options(),
+                                    composition.runtime()::settingAvailable).stream()
+                            .filter(candidate -> candidate.id().equals(name)).findFirst()
+                            .orElseThrow(() -> new IllegalArgumentException("Unknown options page " + name));
+                    client.gui.setScreen(new CausticaPageScreen(video, link.page(), services.options()));
+                }
+                future.complete(Map.of("screen", client.gui.screen().getClass().getName()));
             }
             case "input.set" -> {
                 requireWorld();

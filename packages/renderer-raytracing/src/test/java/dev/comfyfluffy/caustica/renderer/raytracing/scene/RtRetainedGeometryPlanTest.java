@@ -30,7 +30,7 @@ final class RtRetainedGeometryPlanTest {
     private static final ProgramComposition PROGRAMS = new ProgramComposition(List.of(), java.util.Map.of(SURFACE, 1));
 
     @Test
-    void onlyCertifiedSurfaceGetsBlockerRoutingAndCapturePreservesItsCertificate() {
+    void onlyCertifiedSurfaceGetsBlockerFlagAndCapturePreservesItsCertificate() {
         var ordinary = new MeshBuild.SurfaceSlot<>(SURFACE, BINDING.data(11), new MeshBuild.CoveragePolicy.Opaque());
         var blocker = new MeshBuild.SurfaceSlot<>(SURFACE, BINDING.data(22), new MeshBuild.CoveragePolicy.Opaque(),
                 MeshBuild.ShadowPolicy.GUARANTEED_BLOCKER);
@@ -46,9 +46,7 @@ final class RtRetainedGeometryPlanTest {
             assertEquals(RtRetainedGeometryPlan.GUARANTEED_SHADOW_BLOCKER,
                     records.get(1).flags() & RtRetainedGeometryPlan.GUARANTEED_SHADOW_BLOCKER);
             assertEquals(List.of(RtRetainedGeometryPlan.HitGroup.RADIANCE_OPAQUE,
-                            RtRetainedGeometryPlan.HitGroup.SHADOW_OPAQUE,
-                            RtRetainedGeometryPlan.HitGroup.RADIANCE_OPAQUE,
-                            RtRetainedGeometryPlan.HitGroup.SHADOW_BLOCKER),
+                            RtRetainedGeometryPlan.HitGroup.RADIANCE_OPAQUE),
                     RtRetainedGeometryPlan.hitGroups(records));
             assertEquals(records.get(1).flags(), RtRetainedGeometryPlan.pack(records)
                     .getInt(RtRetainedGeometryPlan.RECORD_BYTES + RtRetainedGeometryPlan.FLAGS_OFFSET));
@@ -70,7 +68,7 @@ final class RtRetainedGeometryPlanTest {
         assertFalse(RtRetainedGeometryPlan.canRefitBlas(first,moved));
         assertEquals(RtRetainedGeometryPlan.hitGroups(RtRetainedGeometryPlan.records(
                 RtRetainedGeometryPlan.resolve(first,PROGRAMS),0)),
-                List.of(RtRetainedGeometryPlan.HitGroup.RADIANCE_CUTOUT, RtRetainedGeometryPlan.HitGroup.SHADOW_CUTOUT));
+                List.of(RtRetainedGeometryPlan.HitGroup.RADIANCE_CUTOUT));
     }
 
     @Test
@@ -102,8 +100,7 @@ final class RtRetainedGeometryPlanTest {
         assertEquals(17, record.instanceIndex());
         assertEquals(build.indices().bytes().address(), record.indexAddress());
         assertEquals(12, record.firstIndex());
-        assertEquals(List.of(RtRetainedGeometryPlan.HitGroup.RADIANCE_CUTOUT,
-                        RtRetainedGeometryPlan.HitGroup.SHADOW_CUTOUT),
+        assertEquals(List.of(RtRetainedGeometryPlan.HitGroup.RADIANCE_CUTOUT),
                 RtRetainedGeometryPlan.hitGroups(List.of(record)));
     }
 
@@ -223,9 +220,7 @@ final class RtRetainedGeometryPlanTest {
         assertEquals(0x5555, packed.getInt(64 + RtRetainedGeometryPlan.INSTANCE_INDEX_OFFSET));
         assertEquals(0, packed.getLong(64 + RtRetainedGeometryPlan.EMITTER_INDEX_ADDRESS_OFFSET));
         assertEquals(List.of(RtRetainedGeometryPlan.HitGroup.RADIANCE_OPAQUE,
-                        RtRetainedGeometryPlan.HitGroup.SHADOW_TRANSMISSIVE,
-                        RtRetainedGeometryPlan.HitGroup.RADIANCE_OPAQUE,
-                        RtRetainedGeometryPlan.HitGroup.SHADOW_OPAQUE),
+                        RtRetainedGeometryPlan.HitGroup.RADIANCE_OPAQUE),
                 RtRetainedGeometryPlan.hitGroups(List.of(first, second)));
     }
 
@@ -249,7 +244,7 @@ final class RtRetainedGeometryPlanTest {
     }
 
     @Test
-    void volumeBoundaryUsesOpaqueRadianceAndTransmissiveShadowRouting() {
+    void volumeBoundaryUsesOpaqueRadianceRouting() {
         MeshBuild.Stream positions = stream(0x1000, 256, 12);
         MeshBuild.Stream indices = stream(0x2000, 64, 4);
         MeshBuild<Instance> build = new MeshBuild<>(positions, indices, 8,
@@ -264,10 +259,45 @@ final class RtRetainedGeometryPlanTest {
                 1, 2, 0.5f, 3, indices.bytes().address(), 0, null, 0);
 
         assertTrue(range.opaque());
-        assertEquals(List.of(RtRetainedGeometryPlan.HitGroup.RADIANCE_OPAQUE,
-                        RtRetainedGeometryPlan.HitGroup.SHADOW_TRANSMISSIVE),
+        assertEquals(List.of(RtRetainedGeometryPlan.HitGroup.RADIANCE_OPAQUE),
                 RtRetainedGeometryPlan.hitGroups(List.of(record)));
         assertTrue((record.flags() & RtRetainedGeometryPlan.CUTOUT) != 0);
+    }
+
+    @Test
+    void onlyCoverageTestedSurfacesWithoutVolumeAreNonOpaque() {
+        var opaque = new MeshBuild.CoveragePolicy.Opaque();
+        var cutout = new MeshBuild.CoveragePolicy.Cutout(0.5f);
+        var volume = new MeshBuild.VolumeSlot<>(VOLUME, BINDING.data(9));
+        var micromap = new dev.comfyfluffy.caustica.api.geometry.OpacityMicromap(0, 1, new byte[]{1});
+        List<MeshBuild.Geometry<Instance>> geometries = List.of(
+                new MeshBuild.Geometry<>(new MeshBuild.SurfaceSlot<>(SURFACE, BINDING.data(1), opaque), null, 0, 3),
+                new MeshBuild.Geometry<>(new MeshBuild.SurfaceSlot<>(SURFACE, BINDING.data(2), opaque,
+                        MeshBuild.ShadowPolicy.GUARANTEED_BLOCKER), null, 3, 3),
+                new MeshBuild.Geometry<>(new MeshBuild.SurfaceSlot<>(SURFACE, BINDING.data(3), opaque), volume, 6, 3),
+                new MeshBuild.Geometry<>(new MeshBuild.SurfaceSlot<>(SURFACE, BINDING.data(4), cutout), volume, 9, 3),
+                new MeshBuild.Geometry<>(null, volume, 12, 3),
+                new MeshBuild.Geometry<>(new MeshBuild.SurfaceSlot<>(SURFACE, BINDING.data(5), cutout),
+                        null, 15, 3, micromap),
+                new MeshBuild.Geometry<>(new MeshBuild.SurfaceSlot<>(SURFACE, BINDING.data(6),
+                        new MeshBuild.CoveragePolicy.Stochastic(0.5f)), null, 18, 3));
+        MeshBuild<Instance> build = new MeshBuild<>(stream(0x1000, 96, 12), stream(0x2000, 84, 4), 8,
+                new MeshBuild.IndexRevision(1), MeshBuild.BuildPolicy.STATIC, geometries);
+
+        var ranges = RtRetainedGeometryPlan.blasRanges(build);
+        var records = RtRetainedGeometryPlan.records(RtRetainedGeometryPlan.resolve(build, PROGRAMS), 0);
+
+        // Visibility queries test coverage only on non-opaque candidates and see blockers only as committed hits.
+        assertEquals(List.of(true, true, true, true, true, false, false),
+                ranges.stream().map(RtAccel.GeometryRange::opaque).toList());
+        for (int geometry = 0; geometry < records.size(); geometry++) {
+            int flags = records.get(geometry).flags();
+            assertEquals(!ranges.get(geometry).opaque(),
+                    (flags & (RtRetainedGeometryPlan.CUTOUT | RtRetainedGeometryPlan.STOCHASTIC)) != 0
+                            && (flags & RtRetainedGeometryPlan.HAS_VOLUME) == 0);
+        }
+        assertEquals(RtRetainedGeometryPlan.GUARANTEED_SHADOW_BLOCKER,
+                records.get(1).flags() & RtRetainedGeometryPlan.GUARANTEED_SHADOW_BLOCKER);
     }
 
     @Test

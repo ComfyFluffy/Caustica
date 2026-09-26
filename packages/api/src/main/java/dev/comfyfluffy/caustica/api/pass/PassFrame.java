@@ -25,7 +25,9 @@ public interface PassFrame extends FrameResources {
     VkCommandBuffer commandBuffer();
 
     /**
-     * The renderer's frame counter, increasing by one per rendered frame.
+     * The renderer's temporal frame index. It increases by one for each rendered frame that continues
+     * temporal history and by more across a history break (scene change, camera cut, resize, or an
+     * interruption), so a value exactly one above the previous frame's means history may be reused.
      *
      * <p>Use this value to share a stable snapshot across an extension's passes in the same frame.
      */

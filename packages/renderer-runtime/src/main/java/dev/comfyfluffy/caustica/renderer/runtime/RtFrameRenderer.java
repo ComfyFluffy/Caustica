@@ -1,6 +1,7 @@
 package dev.comfyfluffy.caustica.renderer.runtime;
 
 import dev.comfyfluffy.caustica.support.SharedResource;
+import dev.comfyfluffy.caustica.vulkan.ResourceLifetime;
 import dev.comfyfluffy.caustica.renderer.denoising.DenoiserBackendFactory;
 import dev.comfyfluffy.caustica.renderer.denoising.DenoiserRoute;
 import dev.comfyfluffy.caustica.renderer.denoising.DenoiserSignalEncoding;
@@ -23,6 +24,7 @@ import dev.comfyfluffy.caustica.engine.frame.FrameSnapshot;
 import dev.comfyfluffy.caustica.engine.resource.ResourceOwners;
 import dev.comfyfluffy.caustica.engine.scene.SceneOrigin;
 import dev.comfyfluffy.caustica.engine.session.EngineSessionServices;
+import dev.comfyfluffy.caustica.renderer.raytracing.gen.SharcFrameData;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.WorldPushData;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.WorldPushData.Float2;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.WorldPushData.Float3;
@@ -104,14 +106,20 @@ public final class RtFrameRenderer {
     private float debugCapturePreExposure;
     private RtDenoisingSettings debugCaptureDenoising;
     private DebugProjection debugCaptureProjection;
+    // Advances by one per submitted frame that continues history and by two across a break, so temporal
+    // passes comparing consecutive indices follow RT history rather than raw render frames.
+    private long temporalFrameIndex;
 
     private static final class FrameExecution {
         final GraphicsUse graphicsUse;
         final ResourceOwners resources = new ResourceOwners();
         RtFrameInput frame;
+        long temporalFrameIndex;
         RtRetainedSceneBackend.PreparedTrace trace;
         RtProgramBackend.Published program;
         VulkanDeviceAddress worldPushAddress;
+        // This frame's SharcFrame, or null when the frame does not use the SHaRC cache.
+        VulkanDeviceAddress sharcFrameAddress;
 
         FrameExecution(GraphicsUse graphicsUse) {
             this.graphicsUse = graphicsUse;
@@ -470,12 +478,14 @@ public final class RtFrameRenderer {
     private void ensurePresentationResources(int width, int height)
             throws IOException {
         presentationResources().configureExposure(settings.exposure());
-        frameResources.presentation().ensurePipelines(context, settings.peakNits());
+        frameResources.presentation().ensurePipelines(context, settings.hdrLutNits());
         if (frameResources.ensureSized(context, width, height, reconstruction.settings().route(),
                 reconstruction::closeBackendAfterIdle)) {
             resetSceneHistory();
         }
         reconstruction.ensureBackend(traceExtent());
+        frameResources.ensureSharc(context, settings.sharc().enabled() && programs.compilesSharc(),
+                settings.sharc().cacheExponent());
     }
 
     /**
@@ -494,6 +504,8 @@ public final class RtFrameRenderer {
     /** Invalidate renderer state that cannot cross a provider-requested scene discontinuity. */
     public void resetSceneHistory() {
         resetExposureHistory();
+        RtSharcCache sharc = frameResources.sharc();
+        if (sharc != null) sharc.requestReset();
         reconstruction.resetHistory();
         presenter.resetSceneHistory();
         history.reset();
@@ -519,13 +531,17 @@ public final class RtFrameRenderer {
         presentationResources().exposure().beginFrame(graphicsUse, telemetry.frameSerial());
         execution.frame = history.capture(snapshot, frameCounter, System.nanoTime(), traceExtent(),
                 reconstruction.settings().route(), exposure().preExposure(), settings.jitterSignX(), settings.jitterSignY());
+        execution.temporalFrameIndex = temporalFrameIndex + (execution.frame.historyContinuous() ? 1 : 2);
         try (RtTelemetry.Scope ignored = telemetry.frame().stage("frame.assembleScenes")) {
             try (var previous = execution.frame.historyContinuous() ? submittedScenes.acquire() : null) {
                 scenes.beginFrame(revision.get().traceScenes(),
                         previous == null ? null : previous.get().traceScenes(), graphicsUse);
             }
         }
-        if (!execution.frame.historyContinuous()) reconstruction.resetHistory();
+        if (!execution.frame.historyContinuous()) {
+            reconstruction.resetHistory();
+            telemetry.frame().count(execution.frame.historyBreak().metric, 1L);
+        }
         int debugView = settings.debugView();
         try (RtFrameCommands commands = new RtFrameCommands(ctx, gpuTiming, graphicsUse,
                 telemetry.frameSerial(), telemetry.frame());
@@ -552,6 +568,7 @@ public final class RtFrameRenderer {
             debugCaptureDenoising = reconstruction.settings();
             debugCaptureProjection = DebugProjection.capture(execution.frame);
             history.submitted(execution.frame);
+            temporalFrameIndex = execution.temporalFrameIndex;
             submittedScenes.submitted(revision);
             reconstruction.submitted(execution.frame);
         }
@@ -633,7 +650,8 @@ public final class RtFrameRenderer {
                 environmentState.implementation(),
                 geometryHistory.currentInstances().value(),
                 geometryHistory.previousInstances() == null ? 0L : geometryHistory.previousInstances().value(),
-                geometryHistory.previousMask(), previousOriginDelta
+                geometryHistory.previousMask(), previousOriginDelta,
+                settings.rrResponsivity()
         ).write(push);
         pushBuf.flush(0L, WORLD_PUSH_SIZE);
         VulkanBarriers.memoryBarrier(cmd, stack);
@@ -653,6 +671,18 @@ public final class RtFrameRenderer {
             execution.trace = trace;
             execution.program = program;
             execution.worldPushAddress = pushBuf.deviceAddress();
+            // Tables exist only while the cache is on for a backend whose programs carry the SHaRC stages.
+            RtSharcCache sharc = frameResources.sharc();
+            execution.sharcFrameAddress = null;
+            if (sharc != null) {
+                Float3 offset = frame.cameraOffset();
+                SharcFrameData.Float3 camera = new SharcFrameData.Float3(offset.x(), offset.y(), offset.z());
+                SharcFrameData.Float3 previousCamera = sharc.beginFrame(sceneOrigin, camera, settings.sharc());
+                GpuBuffer sharcFrame = sharc.writeFrame(ctx, (int) frameCounter, camera, previousCamera,
+                        frame.preExposure(), traceExtent().renderWidth(), traceExtent().renderHeight());
+                graphicsUse.whenComplete(sharcFrame::destroy);
+                execution.sharcFrameAddress = sharcFrame.deviceAddress();
+            }
             ByteBuffer roots = stack.calloc(RtBindings.WORLD_PUSH_CONSTANT_SIZE).order(ByteOrder.nativeOrder());
             writeFrameRoots(roots, pushBuf.deviceAddress(), snapshot, pathScratch, program);
             program.writeCompositionDataAddress(roots);
@@ -679,6 +709,29 @@ public final class RtFrameRenderer {
                 scenes.bakeLocal(lighting, cmd,
                         storageIndex(traceImages().nrdViewZ()), storageIndex(traceImages().motion()));
             }
+            if (sharc != null) {
+                // SHaRC update -> resolve -> query: the resolve drains the update's accumulation into
+                // the resolved table that the query fill reads, so each pass waits for the one before.
+                sharc.recordPendingClear(cmd);
+                VulkanBarriers.memoryBarrier(cmd, stack);
+                try (var gpu = commands.time("SHaRC sparse update");
+                     var ignored = RtDebugLabels.scope(ctx, cmd, "SHaRC sparse update");
+                     RtTelemetry.Scope ignoredStats = telemetry.frame().stage("frame.sharcUpdate")) {
+                    int tile = settings.sharc().updateTileSize();
+                    program.pipeline().trace(cmd, Math.ceilDiv(traceExtent().renderWidth(), tile),
+                            Math.ceilDiv(traceExtent().renderHeight(), tile), roots,
+                            RtProgramBackend.SHARC_UPDATE_RAYGEN_INDEX, trace.hitTable());
+                }
+                VulkanBarriers.memoryBarrier(cmd, stack);
+                try (var gpu = commands.time("SHaRC resolve");
+                     var ignored = RtDebugLabels.scope(ctx, cmd, "SHaRC resolve");
+                     RtTelemetry.Scope ignoredStats = telemetry.frame().stage("frame.sharcResolve")) {
+                    program.sharcResolve().dispatch(cmd, execution.sharcFrameAddress, sharc.capacity());
+                }
+                VulkanBarriers.memoryBarrier(cmd, stack);
+            }
+            // The first frames after a cache reset trace the ordinary fill while the cache warms up.
+            int fillRaygen = sharc != null && sharc.queryReady() ? RtProgramBackend.SHARC_QUERY_RAYGEN_INDEX : 1;
             RtShadowDiagnostics.Reservation shadowCounters = null;
             if (RtShadowDiagnostics.ENABLED) {
                 shadowCounters = shadowDiagnostics.begin(ctx, cmd, stack, graphicsUse, telemetry.frameSerial(), "fill stable planes");
@@ -688,7 +741,7 @@ public final class RtFrameRenderer {
                  var ignored = RtDebugLabels.scope(ctx, cmd, "fill stable planes");
                  RtTelemetry.Scope ignoredStats = telemetry.frame().stage("frame.fillStablePlanes")) {
                 program.pipeline().trace(cmd, traceExtent().renderWidth(), traceExtent().renderHeight(),
-                        RtDenoiserState.PLANE_COUNT, roots, 1, trace.hitTable());
+                        RtDenoiserState.PLANE_COUNT, roots, fillRaygen, trace.hitTable());
             }
             try (var gpu = commands.time("resolve stable planes");
                  var ignored = RtDebugLabels.scope(ctx, cmd, "resolve stable planes")) {
@@ -759,7 +812,7 @@ public final class RtFrameRenderer {
                         presentationResources().hdrDisplayImage(), presentationResources().sdrToneLut(),
                         presentationResources().hdrToneLut(), displayLookLut,
                         settings.hdr(), settings.exposure().gamma(),
-                        presentationResources().loadedHdrLutNits(), true);
+                        presentationResources().loadedHdrLutNits(), true, settings.toneMapping());
             }
             VulkanBarriers.memoryBarrier(cmd, stack); // display output visible to debug composite
 
@@ -810,7 +863,8 @@ public final class RtFrameRenderer {
 
     private RtPassSchedulerBackend.FrameState passFrame(VkCommandBuffer commandBuffer, GraphicsUse graphicsUse,
             RtPassSchedulerBackend.UiState ui, GpuImage output, GpuImage targetA, GpuImage targetB) {
-        return new RtPassSchedulerBackend.FrameState(commandBuffer, graphicsUse, execution.resources, frameCounter,
+        return new RtPassSchedulerBackend.FrameState(commandBuffer, graphicsUse, execution.resources,
+                execution.temporalFrameIndex,
                 execution.frame.snapshot().view(), execution.frame.snapshot().timeSeconds(),
                 execution.frame.snapshot().metersPerWorldUnit(),
                 traceExtent().renderWidth(), traceExtent().renderHeight(), output,
@@ -875,6 +929,8 @@ public final class RtFrameRenderer {
                 storageIndex(traceImages().specularAlbedo()));
         target.putInt(base + RtBindings.WORLD_SPECULAR_MOTION_GUIDE_INDEX_OFFSET,
                 storageIndex(traceImages().specularMotion()));
+        target.putInt(base + RtBindings.WORLD_RESPONSIVITY_GUIDE_INDEX_OFFSET,
+                storageIndex(traceImages().responsivity()));
         target.putInt(base + RtBindings.WORLD_DIFFUSE_RADIANCE_HIT_DISTANCE_INDEX_OFFSET,
                 storageIndex(traceImages().diffuseRadianceHitDistance()));
         target.putInt(base + RtBindings.WORLD_SPECULAR_RADIANCE_HIT_DISTANCE_INDEX_OFFSET,
@@ -890,6 +946,8 @@ public final class RtFrameRenderer {
         target.putInt(base + RtBindings.WORLD_NRD_SIGNAL_ENCODING_OFFSET,
                 reconstruction.settings().signalEncoding() == DenoiserSignalEncoding.YCOCG_NORMALIZED_HIT_DISTANCE
                         ? 1 : 0);
+        target.putLong(base + RtBindings.WORLD_SHARC_FRAME_ADDRESS_OFFSET,
+                execution.sharcFrameAddress == null ? 0L : execution.sharcFrameAddress.value());
         ViewMedium medium = snapshot.view().medium();
         int implementation = medium instanceof ViewMedium.Volume<?, ?> volume
                 ? program.resolve(volume.implementation()) : 0;
@@ -965,19 +1023,21 @@ public final class RtFrameRenderer {
         return image.descriptor(GpuImageDescriptorKind.STORAGE).index().value();
     }
 
+    /** Releases renderer resources after device idle; each step runs even after an earlier one fails. */
     public void destroy() {
-        scenePublication.close();
-        scenes.releaseView(this);
-        gpuTiming.close();
-        shadowDiagnostics.close();
-        reconstruction.close();
-        presenter.invalidateRenderedFrame();
-        frameResources.destroy();
-        history.reset();
-        submittedScenes.close();
-        loggedActive = false;
-        releaseCapturedFrame();
-        execution = null;
+        new ResourceLifetime(
+                scenePublication::close,
+                () -> scenes.releaseView(this),
+                gpuTiming::close,
+                shadowDiagnostics::close,
+                reconstruction::close,
+                presenter::invalidateRenderedFrame,
+                frameResources::destroy,
+                history::reset,
+                submittedScenes::close,
+                () -> loggedActive = false,
+                this::releaseCapturedFrame,
+                () -> execution = null).close();
     }
 
     private static VkImageCopy2.Buffer copyRegion(MemoryStack stack, int width, int height) {

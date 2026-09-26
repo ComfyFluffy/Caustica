@@ -7,8 +7,9 @@ public record MinecraftCelestialFrame(float sunAngleRadians, float moonAngleRadi
                                       float starAngleRadians, float starBrightness,
                                       int moonPhaseIndex, int seaLevel, double cameraY,
                                       double metersPerSceneUnit,
-                                      MinecraftLightingCalibration lighting) {
+                                      MinecraftLightingCalibration lighting, MinecraftWeather weather) {
     public MinecraftCelestialFrame {
         Objects.requireNonNull(lighting, "lighting");
+        Objects.requireNonNull(weather, "weather");
     }
 }

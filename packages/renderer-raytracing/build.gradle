@@ -62,10 +62,11 @@ def worldShaderNames = [
         "path_tracer.slang", "retained_lights.slang", "trace_transport.slang", "visibility_rays.slang",
         "trace_diagnostics.slang", "trace_diagnostics_types.slang", "trace_diagnostics_config.slang",
         "retained_trace_ordinary.slang", "retained_trace_policy.slang",
-        "retained_trace_reordered.slang", "shadow_any_hit.rahit.slang", "environment_miss.slang",
-        "shadow_closest_hit.slang", "shadow.rmiss.slang", "shadow_blocker.slang",
+        "retained_trace_reordered.slang", "environment_miss.slang",
         "stable_planes.slang", "stable_plane_types.slang", "nrd_compose_types.slang", "surface_bsdf.slang", "nrd_signals.slang",
-        "world_common.slang", "world_minimal.slang"
+        "world_common.slang", "world_minimal.slang",
+        "sharc_types.slang", "sharc_policy.slang", "sharc_bridge.slang", "sharc_resolve.slang",
+        "fill_sharc_query.slang", "fill_sharc_query_ser.slang", "fill_sharc_update.slang", "fill_sharc_update_ser.slang"
 ] as Set
 
 def fallbackShaderNames = ["surface/caustica_error_surface.slang", "surface/caustica_error_coverage.slang",
@@ -82,6 +83,47 @@ def compileRayTracingShaders = tasks.register("compileRayTracingShaders", Compil
     aliasSourceDirectory = worldShaderModules
     outputDirectory = generatedShaderResources.map { it.dir("caustica/shaders") }
 }
+
+// NVIDIA SHaRC is an optional, separately licensed input. -PsharcSdk=<SHaRC 1.8.0.0 SDK> records the
+// SDK location for the runtime world-shader compiler once its headers match the pinned release
+// (SharcSdk verifies them again at run time). The headers never enter the repository or an artifact.
+def sharcSdk = findProperty("sharcSdk")?.toString()?.with { file(it).absoluteFile }
+if (sharcSdk != null) {
+    [
+            "SharcCommon.h": "d4b6e2765828a4b1c71bbf40609b2dbe72b4aec8ff4d80ccda21a83ab634ecc4",
+            "SharcTypes.h": "cde3f200e4e84f029968dffd9eede5228f2ae0b0bbc166d2babb1aa88dc044b3",
+            "HashGridCommon.h": "5a6d67186a88e61f0d47518f5986021f309f2897ccb482ab9e011a7a08749e7f",
+            "HashGridTypes.h": "34012bcffff0f2545c108a7c9dcb223298a70ebc2c377a86fbddfd1ecd76d614"
+    ].each { name, expected ->
+        def header = new File(sharcSdk, "include/${name}")
+        def text = header.isFile() ? header.getText("UTF-8").replace("\r\n", "\n") : null
+        def actual = text == null ? "missing" : java.security.MessageDigest.getInstance("SHA-256")
+                .digest(text.getBytes("UTF-8")).encodeHex().toString()
+        if (actual != expected) {
+            throw new GradleException("-PsharcSdk must be the SHaRC 1.8.0.0 SDK; ${header} is ${actual}")
+        }
+    }
+}
+def sharcResources = layout.buildDirectory.dir("generated/sharc-resources")
+def generateSharcMetadata = tasks.register("generateSharcMetadata") {
+    group = "build"
+    description = "Records the -PsharcSdk location, or records nothing without it."
+    def location = sharcSdk?.path?.replace('\\', '/') ?: ""
+    inputs.property("sharcSdk", location)
+    outputs.dir(sharcResources)
+    doLast {
+        def root = sharcResources.get().asFile
+        if (root.exists() && !root.deleteDir()) throw new GradleException("failed to clear ${root}")
+        root.mkdirs()
+        if (!location.isEmpty()) {
+            def metadata = new File(root, "caustica/sharc.properties")
+            metadata.parentFile.mkdirs()
+            // java.util.Properties reads a backslash as an escape, so the path uses forward slashes.
+            metadata.setText("sdk=${location}\n", "UTF-8")
+        }
+    }
+}
+
 def reflectionRoot = layout.buildDirectory.dir("generated/reflection-sources")
 def prepareRayTracingReflectionSources = tasks.register("prepareRayTracingReflectionSources", Sync) {
     from(worldShaderModules) { into "pipelines/world" }
@@ -98,7 +140,8 @@ def rayTracingRecordSpecs = [
         "buffer|retainedLightRecordLayoutProbe|RetainedLightRecord|dev.comfyfluffy.caustica.renderer.raytracing.gen|RetainedLightRecordData|false",
         "buffer|neeAtStateLayoutProbe|NeeAtState|dev.comfyfluffy.caustica.renderer.raytracing.gen|NeeAtStateData|false",
         "buffer|packedPathSegmentLayoutProbe|PackedPathSegment|dev.comfyfluffy.caustica.renderer.raytracing.gen|PackedPathSegmentData|false",
-        "buffer|stablePlaneRecordLayoutProbe|StablePlaneRecord|dev.comfyfluffy.caustica.renderer.raytracing.gen|StablePlaneRecordData|false",
+        "buffer|packedStablePlaneLayoutProbe|PackedStablePlane|dev.comfyfluffy.caustica.renderer.raytracing.gen|PackedStablePlaneData|false",
+        "buffer|sharcFrameLayoutProbe|SharcFrame|dev.comfyfluffy.caustica.renderer.raytracing.gen|SharcFrameData|false",
         "push|nrdComposePushProbe|NrdComposePush|dev.comfyfluffy.caustica.renderer.raytracing.gen|NrdComposePushData|false",
         "buffer|nrdPlaneFrameLayoutProbe|NrdPlaneFrame|dev.comfyfluffy.caustica.renderer.raytracing.gen|NrdPlaneFrameData|false"
 ]
@@ -128,6 +171,7 @@ def generateRayTracingBindings = tasks.register("generateRayTracingBindings", Ge
 sourceSets.main.java.srcDir(files(generatedRecordRoot).builtBy(generateRayTracingRecords))
 sourceSets.main.java.srcDir(files(generatedBindingsRoot).builtBy(generateRayTracingBindings))
 sourceSets.main.resources.srcDir(files(generatedShaderResources).builtBy(compileRayTracingShaders))
+sourceSets.main.resources.srcDir(files(sharcResources).builtBy(generateSharcMetadata))
 
 def verifyRayTracingAbi = tasks.register("verifyRayTracingAbi", Test) {
     group = "verification"
@@ -265,7 +309,8 @@ def verifyRendererRayTracingJar = tasks.register("verifyRendererRayTracingJar") 
         } as Set
         def expectedGeneratedTopLevelClasses = ["WorldPushData", "RetainedGeometryRecordData", "RetainedInstanceRecordData",
                 "RetainedLightRecordData", "NeeAtStateData", "NeeAtBakePushData", "PackedPathSegmentData",
-                "StablePlaneRecordData", "NrdComposePushData", "NrdPlaneFrameData", "ShadowDiagnosticsData"].collect {
+                "PackedStablePlaneData", "SharcFrameData", "NrdComposePushData", "NrdPlaneFrameData",
+                "ShadowDiagnosticsData"].collect {
             "${generatedRecordClassRoot}${it}.class"
         } as Set
         def packagedShaders = names.findAll {
@@ -279,22 +324,25 @@ def verifyRendererRayTracingJar = tasks.register("verifyRendererRayTracingJar") 
         def packagedPipelineShaders = names.findAll {
             it.startsWith("caustica/shaders/pipelines/") && it.endsWith(".spv")
         } as Set
+        def sharcMetadata = "caustica/sharc.properties"
         def foreignResources = names.findAll {
             it.startsWith("caustica/") && !it.endsWith("/")
                     && !it.startsWith("caustica/shaders/world/") && !expectedPipelineShaders.contains(it)
-                    && !it.startsWith("caustica/shaders/fallback/")
+                    && !it.startsWith("caustica/shaders/fallback/") && it != sharcMetadata
         }
         if (!foreignClasses.empty || generatedTopLevelClasses != expectedGeneratedTopLevelClasses
                 || !names.contains(generatedBindingsClass) || !names.containsAll(ownedResourceClasses)
                 || packagedShaders != worldShaderNames || packagedPipelineShaders != expectedPipelineShaders
                 || packagedFallbackShaders != fallbackShaderNames
+                || names.contains(sharcMetadata) != (sharcSdk != null)
                 || !foreignResources.empty) {
             throw new GradleException("renderer-raytracing JAR mismatch; foreignClasses=${foreignClasses}, "
                     + "generatedClasses=${generatedTopLevelClasses}, ownedResources=${ownedResourceClasses - names}, "
                     + "missingShaders=${worldShaderNames - packagedShaders}, "
                     + "unexpectedShaders=${packagedShaders - worldShaderNames}, "
                     + "fallbackShaders=${packagedFallbackShaders}, "
-                    + "pipelineShaders=${packagedPipelineShaders}, foreignResources=${foreignResources}")
+                    + "pipelineShaders=${packagedPipelineShaders}, foreignResources=${foreignResources}, "
+                    + "sharcMetadata=${names.contains(sharcMetadata)} with -PsharcSdk=${sharcSdk != null}")
         }
     }
 }
@@ -304,6 +352,7 @@ tasks.named("test", Test) {
     useJUnitPlatform()
     jvmArgs "--enable-native-access=ALL-UNNAMED"
     systemProperty "caustica.test.spirvVal", rootProject.slangTooling.spirvVal.get()
+    if (sharcSdk != null) systemProperty "caustica.test.sharcSdk", sharcSdk.path
 }
 tasks.named("check") {
     dependsOn(verifyRendererRayTracingDependencies, verifyRendererRayTracingResources,

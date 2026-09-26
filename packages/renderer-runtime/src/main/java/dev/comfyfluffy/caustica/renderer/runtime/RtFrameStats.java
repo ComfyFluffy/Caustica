@@ -48,6 +48,8 @@ public final class RtFrameStats {
             "frame.environmentLut",
             "frame.buildStablePlanes",
             "frame.fillStablePlanes",
+            "frame.sharcUpdate",
+            "frame.sharcResolve",
             "frame.bakeLocal",
             "frame.exposure",
             "frame.dlssRr",
@@ -58,7 +60,7 @@ public final class RtFrameStats {
             "frame.sceneEffects",
             "frame.displayMap",
             "frame.debugPresent",
-            "frame.copyOutput"), List.of());
+            "frame.copyOutput"), Arrays.stream(RtFrameHistory.Break.values()).map(cause -> cause.metric).toList());
 
     private volatile long frameSerial;
     private boolean renderFrameStarted;

@@ -7,6 +7,7 @@ import dev.comfyfluffy.caustica.api.light.LightId;
 import dev.comfyfluffy.caustica.api.scene.SceneId;
 import dev.comfyfluffy.caustica.minecraft.rendering.MinecraftCelestialFrame;
 import dev.comfyfluffy.caustica.minecraft.rendering.MinecraftLightFrame;
+import dev.comfyfluffy.caustica.minecraft.rendering.MinecraftWeather;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -87,10 +88,13 @@ public final class MinecraftLightProvider implements AutoCloseable {
     }
 
     static CelestialLights celestialLights(CelestialFrame frame) {
-        Optional<LightDescriptor.Distant> sun = aboveHorizon(frame.sunAngleRadians(),
-                frame.noonTiltRadians(), frame.sunIlluminanceLux(), frame.sunAngularRadiusRadians());
+        // Sunlight follows the weather's daylight darkening; moonlight belongs to the night floor it keeps.
+        double beam = frame.weather().beamTransmittance();
+        Optional<LightDescriptor.Distant> sun = aboveHorizon(frame.sunAngleRadians(), frame.noonTiltRadians(),
+                frame.sunIlluminanceLux() * frame.weather().daylightFactor() * beam,
+                frame.sunAngularRadiusRadians());
         double litFraction = Math.abs(frame.moonPhaseIndex() - 4.0) / 4.0;
-        double moonIlluminance = frame.moonIlluminanceLux()
+        double moonIlluminance = frame.moonIlluminanceLux() * beam
                 * (frame.moonPhaseFixedFraction()
                 + (1.0 - frame.moonPhaseFixedFraction()) * litFraction);
         Optional<LightDescriptor.Distant> moon = aboveHorizon(frame.moonAngleRadians(),
@@ -104,11 +108,11 @@ public final class MinecraftLightProvider implements AutoCloseable {
                 captured.sunAngleRadians(), captured.moonAngleRadians(),
                 settings.noonTiltDegrees() * TO_RADIANS,
                 lighting.sunIlluminanceLux() * SURFACE_TO_TOP_ILLUMINANCE,
-                lighting.moonIlluminanceLux() * SURFACE_TO_TOP_ILLUMINANCE,
+                settings.moonIlluminanceLux() * SURFACE_TO_TOP_ILLUMINANCE,
                 captured.moonPhaseIndex(),
                 lighting.moonPhaseFixedFraction(),
                 settings.sunAngularRadiusDegrees() * TO_RADIANS,
-                settings.moonAngularRadiusDegrees() * TO_RADIANS);
+                settings.moonAngularRadiusDegrees() * TO_RADIANS, captured.weather());
     }
 
     private static Optional<LightDescriptor.Distant> aboveHorizon(double angle, double noonTilt,
@@ -132,12 +136,12 @@ public final class MinecraftLightProvider implements AutoCloseable {
                           double noonTiltRadians, double sunIlluminanceLux,
                           double moonIlluminanceLux, int moonPhaseIndex,
                           double moonPhaseFixedFraction, double sunAngularRadiusRadians,
-                          double moonAngularRadiusRadians) {
+                          double moonAngularRadiusRadians, MinecraftWeather weather) {
     }
 
-    /** Sky-owned angular settings sampled by this contribution without process-global option access. */
+    /** Sky-owned celestial settings sampled by this contribution without process-global option access. */
     public record CelestialSettings(double noonTiltDegrees, double sunAngularRadiusDegrees,
-                                    double moonAngularRadiusDegrees) {
+                                    double moonAngularRadiusDegrees, double moonIlluminanceLux) {
     }
 
 }

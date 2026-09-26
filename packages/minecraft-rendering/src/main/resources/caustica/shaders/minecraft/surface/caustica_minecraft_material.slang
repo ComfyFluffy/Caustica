@@ -114,6 +114,29 @@ public float4 minecraftSampleBase(MinecraftHitData hit, float2 coordinates, floa
     return sampleTexture2DLod(hit.primitive.baseTexture, hit.primitive.baseSampler, coordinates, lod);
 }
 
+/**
+ * Squared ray-cone footprint per unit area of the primitive's texture coordinates. A texture of
+ * width by height texels addressed by those coordinates takes LOD 0.5 * log2(area * width * height).
+ * The cosine enters once, matching the area of the elliptical surface footprint rather than its major
+ * axis, which keeps slopes sharper; RTXPT uses the same slope term.
+ */
+float minecraftFootprintArea(SurfaceInput input, MinecraftHitData hit) {
+    float2 uvU = hit.primitive.textureCoordinates[1] - hit.primitive.textureCoordinates[0];
+    float2 uvV = hit.primitive.textureCoordinates[2] - hit.primitive.textureCoordinates[0];
+    float3 sceneU = transformDirection(input.objectToScene, input.objectEdgeU);
+    float3 sceneV = transformDirection(input.objectToScene, input.objectEdgeV);
+    float cosine = abs(dot(input.geometricNormal, input.outgoingDirection));
+    return input.textureFootprint * input.textureFootprint * abs(uvU.x * uvV.y - uvU.y * uvV.x)
+            / (length(cross(sceneU, sceneV)) * cosine);
+}
+
+// Footprints narrower than a texel, including the zero footprint, magnify level zero.
+float minecraftTextureLod(SampledTexture2DIndex texture, float footprintArea) {
+    uint width, height;
+    sampledTexture2D(texture).GetDimensions(width, height);
+    return 0.5 * log2(max(footprintArea * float(width) * float(height), 1.0));
+}
+
 public OpenPbrSurface evaluateMinecraftMaterial(SurfaceInput input) {
     MinecraftHitData hit = minecraftHitData(input.implementationData, input.bindingData,
             input.instanceData, input.primitiveIndex, input.barycentrics);
@@ -129,10 +152,12 @@ public OpenPbrSurface evaluateMinecraftMaterial(SurfaceInput input) {
     material.emission_luminance = data.emissionLuminance;
 
     float3 geometryTint = hit.primitive.tint * hit.instance.tint * hit.vertexColor.rgb;
+    float footprintArea = minecraftFootprintArea(input, hit);
     if ((hit.primitive.textureFlags & MINECRAFT_TEXTURE_PRESENT) == 0u) {
         material.base_color *= geometryTint;
     } else {
-        float4 texel = minecraftSampleBase(hit, hit.textureCoordinate, 0.0);
+        float4 texel = minecraftSampleBase(hit, hit.textureCoordinate,
+                minecraftTextureLod(hit.primitive.baseTexture, footprintArea));
         float3 sampled = (hit.primitive.textureFlags & MINECRAFT_TEXTURE_LINEAR) != 0u
                 ? texel.rgb : srgbToLinear(texel.rgb);
         sampled = bt709ToAcesCg(sampled);
@@ -145,7 +170,13 @@ public OpenPbrSurface evaluateMinecraftMaterial(SurfaceInput input) {
     float2 localUv = clamp((hit.textureCoordinate - data.baseColorUv.xy) * data.baseColorUv.zw,
             float2(0.0), float2(1.0));
     float2 pageUv = data.materialUv.xy + localUv * data.materialUv.zw;
-    float pageLod = min(input.textureFootprint, data.maxLod);
+    // Page textures share one size, and surface0 is a page whenever a page feature is set.
+    float pageLod = 0.0;
+    if ((data.features & (MINECRAFT_MATERIAL_SPEC | MINECRAFT_MATERIAL_NORMAL
+            | MINECRAFT_MATERIAL_EMISSION_MASK)) != 0u) {
+        float pageScale = abs(data.baseColorUv.z * data.baseColorUv.w * data.materialUv.z * data.materialUv.w);
+        pageLod = min(minecraftTextureLod(data.surface0Texture, footprintArea * pageScale), data.maxLod);
+    }
     if ((data.features & (MINECRAFT_MATERIAL_SPEC | MINECRAFT_MATERIAL_EMISSION_MASK)) != 0u) {
         float4 surface0 = minecraftSampleMaterial(hit, data.surface0Texture, pageUv, pageLod);
         if ((data.features & MINECRAFT_MATERIAL_SPEC) != 0u) {

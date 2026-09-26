@@ -21,6 +21,8 @@ final class RtFrameResources {
     private final PresentationResources presentation;
     private DenoiserRoute renderSizeRoute;
     private int renderSizeConfiguration = Integer.MIN_VALUE;
+    private RtSharcCache sharc;
+    private int sharcExponent;
 
     RtFrameResources(RtFramePresenter presenter, DlssRayReconstruction rayReconstruction,
                      DlssSuperResolution upscaler, RtExposure.Settings exposureSettings) {
@@ -32,6 +34,28 @@ final class RtFrameResources {
 
     TraceResources trace() {
         return trace;
+    }
+
+    /** The SHaRC tables, or null while the cache is off. */
+    RtSharcCache sharc() {
+        return sharc;
+    }
+
+    /**
+     * Keeps SHaRC tables of the configured size while the cache is wanted. Submitted frames read the
+     * tables, so replacing or releasing them waits for the device; only a settings change does that.
+     */
+    void ensureSharc(VulkanDeviceContext context, boolean wanted, int exponent) {
+        if (sharc != null && wanted && sharcExponent == exponent) return;
+        if (sharc != null) {
+            context.waitIdle();
+            sharc.destroy();
+            sharc = null;
+        }
+        if (wanted) {
+            sharc = RtSharcCache.create(context, exponent);
+            sharcExponent = exponent;
+        }
     }
 
     PresentationResources presentation() {
@@ -75,6 +99,9 @@ final class RtFrameResources {
     void destroy() {
         renderSizeRoute = null;
         renderSizeConfiguration = Integer.MIN_VALUE;
-        new ResourceLifetime(trace::destroy, presentation::destroy).close();
+        RtSharcCache closing = sharc;
+        sharc = null;
+        new ResourceLifetime(trace::destroy, presentation::destroy,
+                () -> { if (closing != null) closing.destroy(); }).close();
     }
 }

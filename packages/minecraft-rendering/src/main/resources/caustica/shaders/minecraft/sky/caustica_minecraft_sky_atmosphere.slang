@@ -9,6 +9,8 @@ import caustica_resources;
 
 
 public static const float SKY_PI = 3.14159265359;
+/** Luminance weights of linear BT.709. */
+public static const float3 BT709_LUMINANCE = float3(0.2126, 0.7152, 0.0722);
 
 // ---- Medium. Rayleigh/Mie/ozone coefficients are Hillaire's Earth reference values.
 public static const float ATMOS_BOTTOM_KM = 6360.0;
@@ -289,13 +291,18 @@ public struct ScatteringResult {
  * angular size instead of switching it per sample, preventing the transition from landing on the
  * primary march's sample lattice.
  *
+ * <p>{@code beamFraction} is the part of the light that arrives as a collimated beam and scatters through the
+ * Rayleigh and Mie phase functions; the rest arrives diffused and scatters isotropically. Every phase function
+ * integrates to one over the sphere, so the fraction moves in-scattered light between directions without
+ * changing its total: zero leaves no Mie aureole around the light.
+ *
  * <p>{@code clipGround} false marches straight past the planet to the far side of the shell and adds no
  * ground bounce. Evaluated exactly along the ground-tangent direction that is the limit of the
  * above-horizon sky, which is what {@code sky_view.comp} blends the below-horizon rows toward.
  */
 public ScatteringResult integrateScatteredLuminance(
         float3 originKm, float3 dir, float3 lightDir, float3 illuminance,
-        float lightAngularRadius, int steps, bool applyPhase,
+        float lightAngularRadius, int steps, float beamFraction,
         bool useMultiScatter, SampledTexture2DIndex transmittanceLut,
         SampledTexture2DIndex multiScatterLut, SamplerIndex samplerIndex,
         float groundAlbedo, bool clipGround) {
@@ -312,8 +319,8 @@ public ScatteringResult integrateScatteredLuminance(
     float tMax = hitGround ? tGround : tTop;
 
     float cosTheta = dot(dir, lightDir);
-    float phaseR = applyPhase ? rayleighPhase(cosTheta) : ISOTROPIC_PHASE;
-    float phaseM = applyPhase ? miePhase(cosTheta) : ISOTROPIC_PHASE;
+    float phaseR = lerp(ISOTROPIC_PHASE, rayleighPhase(cosTheta), beamFraction);
+    float phaseM = lerp(ISOTROPIC_PHASE, miePhase(cosTheta), beamFraction);
     float shadowSoftness = max(sin(lightAngularRadius), 1.0e-4);
 
     float3 throughput = float3(1.0);
@@ -427,9 +434,9 @@ public bool celestialSquareLocal(float3 dir, float3 bodyDir, float halfAngle, ou
 // The Overworld sky's own per-frame inputs: only what the CPU alone can know — Minecraft's three eased
 // celestial angles (the 26.2 timeline drives them through a cubic-bezier ease and a datapack may replace
 // the track, so they are read from the attribute probe rather than re-derived from the tick), its star
-// brightness and moon phase, the photometric anchors, and SkyLutPass's own sky.* geometry options. Every
-// direction, colour, level and transmittance is derived from these below, so no atmosphere maths runs on
-// the CPU.
+// brightness, moon phase and weather factors, the photometric anchors, and SkyLutPass's own sky.* geometry
+// options. Every direction, colour, level and transmittance is derived from these below, so no atmosphere
+// maths runs on the CPU.
 //
 // SkyLutPass fills one of these per frame and publishes it two ways: inline in its LUT dispatch push data
 // and through the stable LUT-lifetime device buffer referenced by every live environment binding. The
@@ -450,7 +457,11 @@ public struct SkyInputs {
     // x drawn sun half-angle (rad), y drawn moon half-angle (rad), z viewer altitude (km),
     // w moon phase index (0 full .. 4 new).
     public float4 skyLook2;
-    public float4 skyLook3;         // x ground albedo, y horizon soften (rad), zw reserved
+    // x ground albedo, y horizon soften (rad), z weather daylight factor, w weather beam transmittance
+    // (both 0..1, from MinecraftWeather).
+    public float4 skyLook3;
+    // x weather sky saturation (0..1, from MinecraftWeather), yzw reserved.
+    public float4 skyLook4;
     public float4 sunUv;            // vanilla sun sprite atlas rect (u0,v0,u1,v1)
     public float4 moonUv;           // vanilla current-moon-phase sprite atlas rect
 };
@@ -458,15 +469,18 @@ public struct SkyInputs {
 // ---- Per-frame sky state ------------------------------------------------------------------------
 //
 // SkyInputs carries Minecraft's three eased celestial
-// angles, its star brightness, the moon phase, the photometric anchors, and SkyLutPass's sky.* options.
+// angles, its star brightness, the moon phase, the weather factors, the photometric anchors, and
+// SkyLutPass's sky.* options.
 // Every direction, colour, level, and transmittance is derived here so atmospheric physics has one
 // implementation — shared by the LUT bakes and the sky slot's LUT-lifetime device-address buffer.
 
 public struct SkyState {
     public float3 sunDir;
     public float3 moonDir;
-    public float  sunIlluminance;      // lux, top of atmosphere
+    public float  sunIlluminance;      // lux, top of atmosphere, after the weather's daylight darkening
     public float  moonIlluminance;     // lux, already scaled by the visible phase
+    public float  beamTransmittance;   // fraction of each body's direct beam that passes the rain
+    public float  skySaturation;       // fraction of the dome's saturation that the weather keeps
     public float  viewerRadiusKm;      // planet centre to viewer
     public float  sunAngularRadius;    // physical half-angle, also the planet-shadow softness
     public float  moonAngularRadius;
@@ -492,7 +506,11 @@ public SkyState skyState(SkyInputs push) {
     s.noonTilt = push.skyLook1.x;
     s.sunDir = celestialDirection(push.celestial.x, s.noonTilt);
     s.moonDir = celestialDirection(push.celestial.y, s.noonTilt);
-    s.sunIlluminance = push.skyLook0.x;
+    // Weather darkens only sunlight, which drives the whole daylit sky; the moonlit sky and airglow are the
+    // night floor that vanilla's weather keeps. Rain's zero star brightness arrives through the probe.
+    s.sunIlluminance = push.skyLook0.x * push.skyLook3.z;
+    s.beamTransmittance = push.skyLook3.w;
+    s.skySaturation = push.skyLook4.x;
     // A fixed floor plus the visible phase: a new moon still casts a little directional light, which is
     // a gameplay calibration independent of the astronomical phase.
     float phaseFixed = push.skyLook1.w;

@@ -75,7 +75,7 @@ final class MinecraftProvidersExtensionTest {
         var entities = new dev.comfyfluffy.caustica.minecraft.client.entity.RtEntities(
                 textures, MinecraftTelemetry.disabled());
         return new MinecraftProvidersExtension(selector -> () -> { }, (sink, calibration) -> () -> { },
-                materials, new MinecraftLightingCalibration(1, 1, 1, 0, 0, 0),
+                materials, new MinecraftLightingCalibration(1, 1, 0, 0, 0),
                 textures, entities,
                 new RtTerrain(new RtWorkerPool(), MinecraftTelemetry.disabled()),
                 MinecraftTelemetry.disabled());

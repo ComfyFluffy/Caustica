@@ -10,8 +10,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 final class NvidiaNgxApiTest {
     @Test
-    void runtimeRetainsTheTypedVulkanDevice() throws NoSuchFieldException {
-        assertEquals(VkDevice.class, NgxRuntime.class.getDeclaredField("initializedDevice").getType());
+    void runtimeRetainsTheTypedVulkanDevice() throws ClassNotFoundException, NoSuchFieldException {
+        Class<?> initialized = Class.forName(NgxRuntime.class.getName() + "$Initialized");
+        assertEquals(VkDevice.class, initialized.getDeclaredField("device").getType());
     }
 
     @Test

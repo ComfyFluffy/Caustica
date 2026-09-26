@@ -27,6 +27,15 @@ public record MinecraftTextureSampler(Filter minFilter, Filter magFilter,
         }
     }
 
+    /**
+     * This filtering across every level of a {@code mipLevels}-level view. A fractional LOD blends the two
+     * nearest levels; an explicit LOD of zero still reads level zero alone.
+     */
+    public MinecraftTextureSampler withMipLevels(int mipLevels) {
+        return new MinecraftTextureSampler(minFilter, magFilter, addressModeU, addressModeV,
+                MipmapMode.LINEAR, mipLevels - 1, maxAnisotropy);
+    }
+
     public enum Filter { NEAREST, LINEAR }
     public enum AddressMode { REPEAT, CLAMP_TO_EDGE }
     public enum MipmapMode { NEAREST, LINEAR }

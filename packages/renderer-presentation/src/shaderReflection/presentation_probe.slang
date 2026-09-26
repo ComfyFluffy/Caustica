@@ -40,7 +40,7 @@ void probeExposureResolvePush(uint3 id : SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void probeDisplayPush(uint3 id : SV_DispatchThreadID) {
-    if (id.x == 0xFFFFFFFFu) { float sink = float(displayPushProbe.hdrEnabled) + displayPushProbe.hdrPeakNits; }
+    if (id.x == 0xFFFFFFFFu) { float sink = displayPushProbe.gamma + displayPushProbe.hdrPeakNits; }
 }
 
 [[vk::push_constant]] DebugPresentPush debugPresentPushProbe;

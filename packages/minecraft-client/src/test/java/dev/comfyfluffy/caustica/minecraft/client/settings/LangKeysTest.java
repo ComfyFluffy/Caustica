@@ -2,9 +2,13 @@ package dev.comfyfluffy.caustica.minecraft.client.settings;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import dev.comfyfluffy.caustica.minecraft.client.MinecraftProvidersExtension;
 import dev.comfyfluffy.caustica.minecraft.client.config.CausticaConfig;
 import dev.comfyfluffy.caustica.minecraft.client.MinecraftOptions;
 import dev.comfyfluffy.caustica.minecraft.client.config.CausticaOptions;
+import dev.comfyfluffy.caustica.minecraft.rendering.sky.SkyLutPass;
+import dev.comfyfluffy.caustica.renderer.presentation.bloom.BloomExtension;
+import dev.comfyfluffy.caustica.renderer.presentation.fog.FogPass;
 import dev.comfyfluffy.caustica.settings.FeatureSettings;
 import dev.comfyfluffy.caustica.settings.Option;
 import dev.comfyfluffy.caustica.settings.ResourceId;
@@ -22,7 +26,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -100,11 +103,10 @@ final class LangKeysTest {
         JsonObject lang = lang();
         List<String> missing = new ArrayList<>();
         for (String key : List.of(
-                "caustica.options.open", "caustica.screen.title", "caustica.screen.done",
-                "caustica.screen.reset_section", "caustica.screen.close",
-                "caustica.screen.group.expanded", "caustica.screen.group.collapsed",
-                "caustica.nav.engine", "caustica.nav.extensions",
-                "caustica.section.engine", "caustica.group.other")) {
+                "caustica.options.header", "caustica.page.reset", "caustica.page.reset.tooltip",
+                "caustica.page.reset_page", "caustica.page.reset_page.tooltip",
+                "caustica.page.section.show_advanced", "caustica.page.section.hide_advanced",
+                "caustica.group.other")) {
             if (!lang.has(key)) {
                 missing.add(key);
             }
@@ -112,18 +114,54 @@ final class LangKeysTest {
         assertTrue(missing.isEmpty(), "missing en_us.json entries: " + missing);
     }
 
-    /** Engine group titles come from a list in CausticaSections, not from any setting's own declaration. */
+    /**
+     * Pages also show ungrouped renderer options and one mapper's and one denoiser's rows at a time, so this walks
+     * every page in every HDR, tone-mapper and denoiser state rather than the declarations alone.
+     */
     @Test
-    void everyEngineGroupThatHasRowsHasATitle() throws IOException {
+    void everyPageRowAndHeadingHasAnEnglishEntry() throws IOException {
         JsonObject lang = lang();
         List<String> missing = new ArrayList<>();
         SettingsRegistry registry = new SettingsRegistry();
         MinecraftOptions.register(registry);
-        CausticaOptions options = CausticaOptions.load(configDir.resolve("settings.toml"), registry);
-        SettingsSection engine = CausticaSections.engine(options, ignored -> true);
+        new BloomExtension().registerSettings(registry);
+        registry.feature(MinecraftProvidersExtension.ID).group(SkyLutPass.GROUP).options(SkyLutPass.OPTIONS)
+                .group(FogPass.GROUP).options(FogPass.OPTIONS).register();
+        CausticaOptions options = CausticaOptions.load(configDir.resolve("pages.toml"), registry);
+        CausticaPages.Engine engine = new CausticaPages.Engine(registry, options, ignored -> true);
 
-        assertFalse(engine.groups().isEmpty());
-        engine.groups().forEach(group -> require(lang, missing, group.title()));
+        List<SettingsPage> pages = new ArrayList<>(CausticaPagesTest.everyPageState(engine));
+        List<CausticaPages.Link> links = CausticaPages.links(registry, options, ignored -> true);
+        links.forEach(link -> pages.add(link.page().get()));
+        for (SettingsPage page : pages) {
+            for (SettingGroup section : page.sections()) {
+                require(lang, missing, section.title());
+                for (SettingControl control : section.rows()) {
+                    require(lang, missing, control.label());
+                    require(lang, missing, control.tooltip());
+                }
+            }
+        }
+        for (SettingControl control : CausticaPages.videoSettings(registry, options, ignored -> true)) {
+            require(lang, missing, control.label());
+            require(lang, missing, control.tooltip());
+        }
+        for (CausticaPages.Link link : links) {
+            if (link.title().getContents() instanceof TranslatableContents) {
+                require(lang, missing, link.title());
+                require(lang, missing, link.tooltip());
+            }
+        }
+
         assertTrue(missing.isEmpty(), "missing en_us.json entries: " + missing);
+        assertTrue(checked.contains("caustica.setting.exposure.adapt-darken.tooltip"), checked.toString());
+        assertTrue(checked.contains("caustica.page.upscaling.nrd"), checked.toString());
+        assertTrue(checked.contains("caustica.page.tone-mapping.mapper"), checked.toString());
+        assertTrue(checked.contains("caustica.setting.hdr.psychov69.source-awareness.tooltip"), checked.toString());
+        assertTrue(checked.contains("caustica.group.engine.entities"), checked.toString());
+        assertTrue(checked.contains("caustica.group.caustica.minecraft.fog"), checked.toString());
+        assertTrue(checked.contains("feature.caustica.bloom.description"), checked.toString());
+        assertTrue(checked.contains("caustica.page.radiance-cache.tooltip"), checked.toString());
+        assertTrue(checked.contains("caustica.setting.sharc.anti-firefly.tooltip"), checked.toString());
     }
 }

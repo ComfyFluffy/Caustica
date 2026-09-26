@@ -39,7 +39,11 @@ public final class MinecraftApiBootstrap {
         List<CausticaExtension> extensions = new ArrayList<>();
         extensions.add(new BloomExtension());
         extensions.addAll(platform.extensions());
-        var calibration = new MinecraftLightingCalibration(128_000.0f, 5.0f, 2_000.0f, 0.002f, 10.0f, 0.1f);
+        float sunIlluminanceLux = 128_000.0f;
+        // A level-15 emitter texel of white albedo radiates 5/21 of the sun's top-of-atmosphere lux value
+        // as cd/m² (30,476 cd/m²); the auto-exposure night ceiling is calibrated against this balance.
+        var calibration = new MinecraftLightingCalibration(sunIlluminanceLux,
+                sunIlluminanceLux * 5.0f / 21.0f, 0.002f, 10.0f, 0.1f);
         MinecraftProvidersExtension minecraftProviders = new MinecraftProvidersExtension(
                 frameAdapter::installFrameSelector, frameAdapter::installFrameCapture,
                 new MinecraftClientMaterialEpochCompiler(calibration), calibration,

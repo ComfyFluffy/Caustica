@@ -164,10 +164,11 @@ public ShadowPayload traceShadowQuery<TComposition : IComposition>(RayDesc ray,
         uint seed, float3 absorption, float ior, inout ShadowDiagnosticTrace diagnostics, out float3 geometricNormal) {
     geometricNormal = float3(0.0);
     ShadowPayload shadow = {};
-    shadow.seed = seed;
     shadow.volumeAbsorption = absorption;
     shadow.volumeIor = ior;
-    RayQuery<RAY_FLAG_FORCE_NON_OPAQUE> query;
+    // Traversal resolves opaque geometry and known micromap states itself, so only coverage-tested
+    // surfaces without a volume reach this loop.
+    RayQuery<RAY_FLAG_NONE> query;
     query.TraceRayInline(worldAccelerationStructure(), RAY_FLAG_NONE,
             WORLD_RAY_MASK_SECONDARY, ray);
     uint proceedCount = 0u;
@@ -178,26 +179,17 @@ public ShadowPayload traceShadowQuery<TComposition : IComposition>(RayDesc ray,
         uint primitiveIndex = query.CandidatePrimitiveIndex();
         RetainedGeometryRecord record = ((ConstPtr<RetainedGeometryRecord>)worldBindings.geometryTableAddress)
                 [instanceBase + geometryIndex];
-        // A certified blocker has full coverage and zero transmission across its entire revision.
-        if ((record.flags & RETAINED_GEOMETRY_GUARANTEED_SHADOW_BLOCKER) != 0u) {
-            shadow.hitDistance = query.CandidateTriangleRayT();
-            query.Abort();
-            shadowDiagnosticQuery(diagnostics, proceedCount, true, uint2(instanceBase + geometryIndex, primitiveIndex));
-            return shadow;
-        }
-        if ((record.flags & RETAINED_GEOMETRY_HAS_VOLUME) == 0u) {
-            CoverageInput input = {};
-            input.shaderRoot = worldShaderRoot();
-            input.bindingData = record.surfaceBinding;
-            input.instanceData = worldInstanceRecord(record).instanceData;
-            input.primitiveIndex = primitiveIndex;
-            input.barycentrics = query.CandidateTriangleBarycentrics();
-            TComposition.Coverages coverages = {};
-            float coverage = clamp(coverages.evaluateCoverage(record.coverageImplementation, input), 0.0, 1.0);
-            bool stochastic = (record.flags & RETAINED_GEOMETRY_STOCHASTIC) != 0u;
-            if (stochastic ? worldCoverageRandom(seed, instanceBase, geometryIndex, primitiveIndex) >= coverage
-                    : coverage < record.alphaCutoff) continue;
-        }
+        CoverageInput input = {};
+        input.shaderRoot = worldShaderRoot();
+        input.bindingData = record.surfaceBinding;
+        input.instanceData = worldInstanceRecord(record).instanceData;
+        input.primitiveIndex = primitiveIndex;
+        input.barycentrics = query.CandidateTriangleBarycentrics();
+        TComposition.Coverages coverages = {};
+        float coverage = clamp(coverages.evaluateCoverage(record.coverageImplementation, input), 0.0, 1.0);
+        bool stochastic = (record.flags & RETAINED_GEOMETRY_STOCHASTIC) != 0u;
+        if (stochastic ? worldCoverageRandom(seed, instanceBase, geometryIndex, primitiveIndex) >= coverage
+                : coverage < record.alphaCutoff) continue;
         // Committing narrows the search distance; traversal still finds the nearest accepted surface.
         query.CommitNonOpaqueTriangleHit();
     }
@@ -212,6 +204,8 @@ public ShadowPayload traceShadowQuery<TComposition : IComposition>(RayDesc ray,
     shadowDiagnosticQuery(diagnostics, proceedCount, true,
             uint2(query.CommittedInstanceID() + query.CommittedGeometryIndex(), primitiveIndex));
     shadow.hitDistance = query.CommittedRayT();
+    // A certified blocker has full coverage and zero transmission across its entire revision.
+    if ((record.flags & RETAINED_GEOMETRY_GUARANTEED_SHADOW_BLOCKER) != 0u) return shadow;
     WorldInstanceHistory history = worldInstanceHistory(record, false);
     uint3 indices = worldTriangleIndices(record, primitiveIndex);
     float3 p0 = worldVertex(history.current, indices.x);
@@ -298,7 +292,14 @@ public float3 traceVisibility<TComposition : IComposition>(PackedPathSegment pat
     ray.Direction = selected.direction;
     ray.TMin = traceEpsilon();
     ray.TMax = selected.maximumDistance;
-    return traceVisibilityRay<TComposition>(ray, path.absorption, path.ior, seed);
+    float3 visibility = traceVisibilityRay<TComposition>(ray, path.absorption, path.ior, seed);
+    // Outdoor light connections attenuate through the spatial medium; explicit interiors carry
+    // their absorption in the shadow state and stay on the interior contract.
+    if (path.ior == 1.0 && !any(path.absorption > 0.0)) {
+        visibility *= traceSpatialLightTransmittance<TComposition>(
+                ray.Origin, ray.Direction, selected.maximumDistance);
+    }
+    return visibility;
 }
 
 public struct TraceSpatialMedium {
@@ -378,7 +379,10 @@ public float3 traceVolumeLighting<TComposition : IComposition>(float3 position, 
     ray.Direction = selected.direction;
     ray.TMin = minimumDistance;
     ray.TMax = min(selected.maximumDistance, maximumDistance);
-    float3 visibility = traceVisibilityRay<TComposition>(ray, float3(0.0), 1.0, seed);
+    // The scattering point is in the spatial medium by construction; the helper holds identity when
+    // the medium is inactive.
+    float3 visibility = traceVisibilityRay<TComposition>(ray, float3(0.0), 1.0, seed)
+            * traceSpatialLightTransmittance<TComposition>(ray.Origin, ray.Direction, ray.TMax);
     return selectedRadiance * visibility * (totalWeight / (float(candidates) * selectedWeight));
 }
 
@@ -452,6 +456,38 @@ public TraceSpatialMedium traceSpatialMediumSegment<TComposition : IComposition>
     }
     result.scatteringDistance = scatteringWeight > 0.0 ? result.scatteringDistance / scatteringWeight : 0.0;
     return result;
+}
+
+// Light connections attenuate through the spatial medium with the same quadrature ladder and range
+// cap as continuation segments. Scattering stays owned by the path integrator, so only extinction is
+// evaluated; the deterministic nodes need no seed. Returns identity when the medium is inactive.
+public float3 traceSpatialLightTransmittance<TComposition : IComposition>(
+        float3 origin, float3 direction, float distance) {
+    float3 transmittance = float3(1.0);
+    if (worldBindings.spatialMediumActive == 0u) return transmittance;
+    NeeAtState state = neeAtState(worldBindings.neeAtStateAddress)[0];
+    float length = min(distance, 256.0 / state.metersPerSceneUnit);
+    float lengthMeters = length * state.metersPerSceneUnit;
+    uint sampleCount = lengthMeters <= 1.0 ? 1u : lengthMeters <= 4.0 ? 2u : lengthMeters <= 8.0 ? 4u : 8u;
+    WorldPush frame = ((ConstPtr<WorldPush>)worldBindings.worldPushAddress)[0];
+    TComposition.Volumes volumes = {};
+    SpatialMediumInput input = {};
+    input.shaderRoot = worldShaderRoot();
+    input.bindingData = worldBindings.spatialMediumBindingData;
+    input.instanceData = worldBindings.spatialMediumInstanceData;
+    input.metersPerSceneUnit = state.metersPerSceneUnit;
+    input.time = frame.time;
+    for (uint i = 0u; i < sampleCount; i++) {
+        float2 quadrature = SPATIAL_QUADRATURE[sampleCount - 1u + i];
+        float3 p = origin + direction * (length * quadrature.x);
+        input.position = p + float3(worldBindings.spatialMediumOriginX,
+                worldBindings.spatialMediumOriginY, worldBindings.spatialMediumOriginZ);
+        input.proceduralPosition = p + frame.proceduralDomainOffset;
+        SpatialMediumProperties medium = volumes.evaluateSpatialMedium(
+                worldBindings.spatialMediumImplementation, input);
+        transmittance *= exp(-medium.extinction * (length * quadrature.y));
+    }
+    return transmittance;
 }
 
 public struct TraceDirect {
@@ -533,13 +569,40 @@ public float tracePhase(float cosine, float g) {
     return (1.0 - g * g) / (12.5663706144 * pow(1.0 + g * g - 2.0 * g * cosine, 1.5));
 }
 
+float2 traceCameraClip(uint2 pixel, uint2 extent, WorldPush frame) {
+    return (float2(pixel) + 0.5 + frame.jitter) * (2.0 / float2(extent)) - 1.0;
+}
+
+float3 traceCameraDirection(float2 clip, WorldPush frame) {
+    float4 point = mul(frame.invViewProj, float4(clip, 0.0, 1.0));
+    return normalize(point.xyz / point.w);
+}
+
+/**
+ * Angle between this pixel's camera ray and the ray one trace-resolution pixel above it. A camera ray
+ * cone starts at the eye with zero width and this spread. Delta events at flat triangles keep the
+ * spread, so the cone's width is spread times unfolded path length until a continuous scatter widens it.
+ */
+public float traceCameraSpread(uint2 pixel, uint2 extent, WorldPush frame) {
+    float2 clip = traceCameraClip(pixel, extent, frame);
+    return length(traceCameraDirection(clip + float2(0.0, 2.0 / float(extent.y)), frame)
+            - traceCameraDirection(clip, frame));
+}
+
+/**
+ * Spread a continuous scatter adds to a ray cone: 0.3 times the apex angle of the cone whose solid
+ * angle is 1 / pdf. RTXPT's factor deliberately under-estimates the lobe because stochastic paths
+ * already antialias, while over-blur would be visible.
+ */
+public float traceConeSpreadGrowth(float pdf) {
+    return 0.6 * acos(max(-1.0, 1.0 - 1.0 / (6.28318530718 * pdf)));
+}
+
 public PackedPathSegment traceCamera<TComposition : IComposition>(uint2 pixel,
         uint2 extent, WorldPush frame) {
     PackedPathSegment path = {};
-    float2 clip = (float2(pixel) + 0.5 + frame.jitter) * (2.0 / float2(extent)) - 1.0;
-    float4 point = mul(frame.invViewProj, float4(clip, 0.0, 1.0));
     path.origin = frame.camOffset;
-    path.direction = normalize(point.xyz / point.w);
+    path.direction = traceCameraDirection(traceCameraClip(pixel, extent, frame), frame);
     path.throughput = float3(1.0);
     path.ior = 1.0;
     path.flags = PATH_ENDPOINT_VALID;

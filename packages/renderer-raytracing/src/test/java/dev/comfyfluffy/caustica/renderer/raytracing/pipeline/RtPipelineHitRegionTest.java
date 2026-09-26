@@ -11,23 +11,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 final class RtPipelineHitRegionTest {
     @Test
-    void shadowGroupsUseTheirDedicatedPayloadStages() {
-        for (HitGroup group : HitGroup.values()) {
-            boolean shadow = switch (group) {
-                case SHADOW_OPAQUE, SHADOW_CUTOUT, SHADOW_TRANSMISSIVE, SHADOW_BLOCKER -> true;
-                case RADIANCE_OPAQUE, RADIANCE_CUTOUT -> false;
-            };
-            assertEquals(group == HitGroup.SHADOW_BLOCKER ? VK_SHADER_UNUSED_KHR : shadow ? 13 : 7,
-                    RtPipeline.closestHitStage(group, 7, 13));
-            int anyHit = RtPipeline.anyHitStage(group, 8, 14, 19);
-            if (group == HitGroup.SHADOW_BLOCKER) {
-                assertEquals(19, anyHit);
-            } else if (group == HitGroup.SHADOW_OPAQUE || group == HitGroup.RADIANCE_OPAQUE) {
-                assertEquals(VK_SHADER_UNUSED_KHR, anyHit);
-            } else {
-                assertEquals(shadow ? 14 : 8, anyHit);
-            }
-        }
+    void onlyCutoutGroupsRunCoverageAnyHit() {
+        assertEquals(VK_SHADER_UNUSED_KHR, RtPipeline.anyHitStage(HitGroup.RADIANCE_OPAQUE, 8));
+        assertEquals(8, RtPipeline.anyHitStage(HitGroup.RADIANCE_CUTOUT, 8));
     }
 
     @Test

@@ -2,7 +2,7 @@ package dev.comfyfluffy.caustica.renderer.raytracing;
 
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.PackedPathSegmentData;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.PackedPathSegmentData.Float3;
-import dev.comfyfluffy.caustica.renderer.raytracing.gen.StablePlaneRecordData;
+import dev.comfyfluffy.caustica.renderer.raytracing.gen.PackedStablePlaneData;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -47,8 +47,31 @@ final class RtPathQueueAbiTest {
 
     @Test
     void stablePlaneCapacityUsesThreeReflectedRecordsPerPixel() {
-        assertEquals(112, StablePlaneRecordData.BYTE_SIZE);
-        assertEquals(1920L * 1080L * 3L * StablePlaneRecordData.BYTE_SIZE,
+        assertEquals(64, PackedStablePlaneData.BYTE_SIZE);
+        assertEquals(1920L * 1080L * 3L * PackedStablePlaneData.BYTE_SIZE,
                 TraceResources.stablePlaneBytes(1920, 1080));
+    }
+
+    @Test
+    void packedStablePlaneFieldsFollowTheirWordStreams() {
+        assertEquals(0, PackedStablePlaneData.CURRENT_VIRTUAL_POSITION_OFFSET);
+        int[] wordOffsets = {
+                PackedStablePlaneData.THROUGHPUT_LUMINANCE_OFFSET,
+                PackedStablePlaneData.BRANCH_ID_OFFSET,
+                PackedStablePlaneData.FLAGS_OFFSET,
+                PackedStablePlaneData.NORMAL_OFFSET,
+                PackedStablePlaneData.MOTION_XY_OFFSET,
+                PackedStablePlaneData.MOTION_ZROUGHNESS_OFFSET,
+                PackedStablePlaneData.DIFFUSE_BSDF_ESTIMATE_XY_OFFSET,
+                PackedStablePlaneData.DIFFUSE_BSDF_ESTIMATE_ZSPECULAR_BSDF_ESTIMATE_X_OFFSET,
+                PackedStablePlaneData.SPECULAR_BSDF_ESTIMATE_YZ_OFFSET,
+                PackedStablePlaneData.NOISY_DIFFUSE_RADIANCE_XY_OFFSET,
+                PackedStablePlaneData.NOISY_DIFFUSE_RADIANCE_ZDIFFUSE_HIT_DISTANCE_OFFSET,
+                PackedStablePlaneData.NOISY_SPECULAR_RADIANCE_XY_OFFSET,
+                PackedStablePlaneData.NOISY_SPECULAR_RADIANCE_ZSPECULAR_HIT_DISTANCE_OFFSET
+        };
+        for (int field = 0; field < wordOffsets.length; field++) {
+            assertEquals((3 + field) * Integer.BYTES, wordOffsets[field]);
+        }
     }
 }

@@ -35,7 +35,7 @@ public void runClosestHit<TComposition : IComposition>(inout WorldPayload payloa
 }
 
 public WorldHit resolveWorldHit<TComposition : IComposition>(WorldPayload intersection,
-        RayDesc ray, float previousBsdfPdf) {
+        RayDesc ray, float previousBsdfPdf, float textureFootprint) {
     WorldHit payload = {};
     payload.pathFlags = intersection.pathFlags;
     payload.hitDistance = intersection.hitDistance;
@@ -57,6 +57,7 @@ public WorldHit resolveWorldHit<TComposition : IComposition>(WorldPayload inters
     SurfaceInput input = worldSurfaceInput(intersection.barycentrics, intersection.primitiveIndex,
             ray.Origin + ray.Direction * intersection.hitDistance, ray.Direction, edgeU, edgeV,
             record, history, reconstructionAnchor);
+    input.textureFootprint = textureFootprint;
     TComposition.Surfaces surfaces = {};
     OpenPbrSurface material = surfaces.evaluateSurface(record.surfaceImplementation, input);
     material.geometry_thin_walled = !volume;

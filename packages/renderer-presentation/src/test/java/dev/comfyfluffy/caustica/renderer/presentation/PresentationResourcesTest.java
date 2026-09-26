@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 final class PresentationResourcesTest {
     @Test
     void failingImageReleaseStillDestroysEveryImageAndDetachesThem() throws Exception {
-        var settings = new RtExposure.Settings("manual", 0, 0.18f, 1, 1,
+        var settings = new RtExposure.Settings("manual", "adaptation", 0, 0.18f, 1, 1,
                 0.1f, 0.9f, 1, 1, 0, 1, 1, true, 2.2f);
         var resources = new PresentationResources(settings);
         var releases = new AtomicInteger();
@@ -41,7 +41,7 @@ final class PresentationResourcesTest {
 
     @Test
     void startsUnsizedWithItsOwnExposureController() {
-        RtExposure.Settings settings = new RtExposure.Settings("manual", 0.0f, 0.18f,
+        RtExposure.Settings settings = new RtExposure.Settings("manual", "adaptation", 0.0f, 0.18f,
                 1.0f, 1.0f, 0.1f, 0.9f, 1, 1.0f, 0.0f,
                 1.0f, 1.0f, true, 2.2f);
         PresentationResources resources = new PresentationResources(settings);

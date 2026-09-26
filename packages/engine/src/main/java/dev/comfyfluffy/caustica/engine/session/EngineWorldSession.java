@@ -100,7 +100,7 @@ public final class EngineWorldSession implements AutoCloseable {
         return failure;
     }
 
-    private static Throwable runClosing(Throwable primary, Runnable action) {
+    static Throwable runClosing(Throwable primary, Runnable action) {
         try {
             action.run();
         } catch (Throwable failure) {
@@ -110,7 +110,7 @@ public final class EngineWorldSession implements AutoCloseable {
         return primary;
     }
 
-    private static RuntimeException propagate(Throwable failure, String message) {
+    static RuntimeException propagate(Throwable failure, String message) {
         if (failure instanceof RuntimeException runtime) return runtime;
         if (failure instanceof Error error) throw error;
         return new IllegalStateException(message, failure);

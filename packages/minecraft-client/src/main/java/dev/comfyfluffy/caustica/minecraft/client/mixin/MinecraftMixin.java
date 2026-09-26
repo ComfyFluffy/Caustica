@@ -1,20 +1,28 @@
 package dev.comfyfluffy.caustica.minecraft.client.mixin;
 
 import dev.comfyfluffy.caustica.minecraft.client.MinecraftHostTelemetry;
+import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
+import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 
 import dev.comfyfluffy.caustica.minecraft.client.CausticaClientComposition;
 import dev.comfyfluffy.caustica.minecraft.client.MinecraftTextureLifetime;
+import dev.comfyfluffy.caustica.minecraft.client.TonemapperQuickToggle;
 import dev.comfyfluffy.caustica.minecraft.client.vulkan.MinecraftVulkanBackend;
 import dev.comfyfluffy.caustica.spi.vulkan.VulkanLowLatency;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
+
+import java.io.File;
 
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * Runs Reflex sleep at the start of {@link Minecraft#runTick}, before simulation.
@@ -29,10 +37,55 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class MinecraftMixin {
 	@Inject(method = "close", at = @At("HEAD"))
 	private void caustica$destroyUiOverlayBeforeRendererShutdown(CallbackInfo ci) {
+		dev.comfyfluffy.caustica.minecraft.client.UltraScreenshot.INSTANCE.shutdown();
 		dev.comfyfluffy.caustica.minecraft.client.MinecraftDebugService.stop();
 		CausticaClientComposition.current().uiOverlay().destroy();
 		CausticaClientComposition.current().runtime().shutdown();
 		MinecraftTextureLifetime.drain();
+	}
+
+	@Inject(method = "handleGlobalKeyPress", at = @At("HEAD"), cancellable = true)
+	private void caustica$handleKeys(InputConstants.Key key, boolean controlDown,
+			CallbackInfoReturnable<Boolean> cir) {
+		Minecraft minecraft = (Minecraft) (Object) this;
+		if (minecraft.options.keyDebugModifier.isDown()) return;
+		if (dev.comfyfluffy.caustica.minecraft.client.UltraScreenshot.KEY.matches(key)) {
+			dev.comfyfluffy.caustica.minecraft.client.UltraScreenshot.INSTANCE.toggle(minecraft);
+			cir.setReturnValue(true);
+		} else if (TonemapperQuickToggle.KEY.matches(key)) {
+			TonemapperQuickToggle.flip();
+			cir.setReturnValue(true);
+		}
+	}
+
+	/** Rejects panorama capture before vanilla mutates the camera, window, or render target. */
+	@WrapMethod(method = "grabPanoramixScreenshot(Ljava/io/File;)Lnet/minecraft/network/chat/Component;")
+	private Component caustica$guardPanorama(File directory, Operation<Component> original) {
+		if (dev.comfyfluffy.caustica.minecraft.client.UltraCaptureSession.active()) {
+			return Component.translatable("caustica.status.ultraScreenshot.busy");
+		}
+		return original.call(directory);
+	}
+
+	@Inject(method = "startAttack", at = @At("HEAD"), cancellable = true)
+	private void caustica$suppressCaptureAttack(CallbackInfoReturnable<Boolean> cir) {
+		if (dev.comfyfluffy.caustica.minecraft.client.UltraCaptureSession.active()) {
+			cir.setReturnValue(false);
+		}
+	}
+
+	@Inject(method = "continueAttack", at = @At("HEAD"), cancellable = true)
+	private void caustica$suppressCaptureAttackHold(boolean leftClick, CallbackInfo ci) {
+		if (dev.comfyfluffy.caustica.minecraft.client.UltraCaptureSession.active()) {
+			ci.cancel();
+		}
+	}
+
+	@Inject(method = "startUseItem", at = @At("HEAD"), cancellable = true)
+	private void caustica$suppressCaptureUse(CallbackInfo ci) {
+		if (dev.comfyfluffy.caustica.minecraft.client.UltraCaptureSession.active()) {
+			ci.cancel();
+		}
 	}
 
 	// Session and resize work uses client-tick cadence, after the per-frame Reflex sleep.

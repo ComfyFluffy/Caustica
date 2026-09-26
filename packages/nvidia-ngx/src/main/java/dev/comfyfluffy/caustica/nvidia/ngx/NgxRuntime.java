@@ -48,11 +48,10 @@ public final class NgxRuntime {
 
     private final VulkanDeviceContext context;
     private final Settings settings;
-    private Initialized initialized;
-    private boolean failed;
+    private final NgxInitLatch initLatch = new NgxInitLatch();
     private boolean closed;
 
-    private record Initialized(NgxLibrary library, VkDevice device) { }
+    record Initialized(NgxLibrary library, VkDevice device) { }
 
     public record Settings(Path dataDirectory, Optional<Path> shimOverride) {
         public Settings {
@@ -75,19 +74,31 @@ public final class NgxRuntime {
         if (closed) {
             throw new IllegalStateException("NGX runtime is shut down");
         }
-        if (initialized != null) {
-            return initialized.library();
+        Initialized current = initLatch.ready();
+        if (current != null) {
+            return current.library();
         }
-        if (failed) {
+        if (initLatch.failed()) {
             return null;
         }
         try {
-            initialized = init(context.vk());
-            return initialized.library();
+            Initialized initialization = init(context.vk());
+            initLatch.markReady(initialization);
+            return initialization.library();
         } catch (Throwable t) {
-            failed = true;
+            initLatch.markFailed();
             LOGGER.error("NGX init failed; DLSS features disabled", t);
             return null;
+        }
+    }
+
+    /**
+     * Allows exactly one fresh init attempt for a new world activation. Without this, a failure
+     * latches until device teardown and keeps DLSS features disabled for the rest of the session.
+     */
+    public synchronized void beginActivation() {
+        if (!closed) {
+            initLatch.beginActivation();
         }
     }
 
@@ -100,15 +111,15 @@ public final class NgxRuntime {
             return;
         }
         closed = true;
-        if (initialized != null) {
+        Initialized initialization = initLatch.ready();
+        if (initialization != null) {
             try {
-                initialized.library().shutdown(initialized.device().address());
+                initialization.library().shutdown(initialization.device().address());
             } catch (Throwable t) {
                 LOGGER.warn("NGX shutdown failed", t);
             }
         }
-        initialized = null;
-        failed = false;
+        initLatch.clear();
     }
 
     /** NVSDK_NGX_Result: failure when the top 12 bits == 0xBAD. Shared by all NGX feature wrappers. */

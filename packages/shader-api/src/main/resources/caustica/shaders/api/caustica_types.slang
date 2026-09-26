@@ -237,9 +237,11 @@ public struct SurfaceInput {
     public float3 previousGeometricNormal;
     public float3 outgoingDirection;
     /**
-     * Ray footprint width at the hit, in scene units. Engine-produced from the ray cone, which is
-     * the one filtering fact an extension cannot derive for itself — everything downstream of it, the
-     * texture coordinates and the mip choice included, is the extension's own.
+     * Ray footprint width at the hit, in scene units, measured across the ray rather than along the
+     * surface. Engine-produced from the ray cone, which is the one filtering fact an extension cannot
+     * derive for itself — everything downstream of it, the texture coordinates and the mip choice
+     * included, is the extension's own. Zero for shadow-visibility evaluations, whose rays carry no
+     * pixel cone.
      */
     public float textureFootprint;
     /**

@@ -161,7 +161,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
     [format("rgba16f")] RWTexture2D<float4> stableRadiance = ResourceDescriptorHeap[NonUniformResourceIndex(pc.stableRadianceImageIndex)];
 
     NrdPlaneFrame frame = ((DevicePtr<NrdPlaneFrame>)pc.frameAddress)[0];
-    StablePlaneStorage records = stablePlaneStorage(pc.stablePlaneAddress, STABLE_PLANE_COUNT * frame.width * frame.height);
+    StablePlaneStorage records = stablePlaneStorage(pc.stablePlaneAddress, STABLE_PLANE_COUNT * frame.width * frame.height,
+            frame.preExposure);
     uint2 extent = uint2(frame.width, frame.height); uint2 pixel = tid.xy;
     if (any(pixel >= extent)) return;
     if (pc.mode == NRD_MODE_PREPARE) prepare(pixel, extent, records, frame, diffuseSignal,

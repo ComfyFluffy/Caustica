@@ -4,7 +4,7 @@ import dev.comfyfluffy.caustica.engine.vulkan.runtime.GpuBuffer;
 import dev.comfyfluffy.caustica.engine.vulkan.runtime.GpuImage;
 import dev.comfyfluffy.caustica.engine.vulkan.runtime.VulkanDeviceContext;
 import dev.comfyfluffy.caustica.renderer.raytracing.gen.PackedPathSegmentData;
-import dev.comfyfluffy.caustica.renderer.raytracing.gen.StablePlaneRecordData;
+import dev.comfyfluffy.caustica.renderer.raytracing.gen.PackedStablePlaneData;
 import org.lwjgl.vulkan.VK10;
 import dev.comfyfluffy.caustica.vulkan.ResourceLifetime;
 
@@ -85,6 +85,8 @@ public final class TraceResources {
                 VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderWidth + "x" + renderHeight);
         GpuImage specularMotion = createImage(context, renderWidth, renderHeight,
                 VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderWidth + "x" + renderHeight);
+        GpuImage responsivity = createImage(context, renderWidth, renderHeight,
+                VK10.VK_FORMAT_R16_SFLOAT, "guide responsivity " + renderWidth + "x" + renderHeight);
         GpuImage diffuseRadianceHitDistance = createImage(context, renderWidth, renderHeight,
                 VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                 "NRD diffuse radiance hit distance " + renderWidth + "x" + renderHeight);
@@ -126,7 +128,7 @@ public final class TraceResources {
         releases.add(pathScratchBuffer::destroy);
         images = new TraceImages(traceColor, stablePlaneMetadata,
                 normalRoughness, diffuseAlbedo, depth, primaryDepth, motion,
-                specularAlbedo, specularMotion, diffuseRadianceHitDistance,
+                specularAlbedo, specularMotion, responsivity, diffuseRadianceHitDistance,
                 specularRadianceHitDistance, nrdViewZ, nrdMotion, nrdDisocclusionThresholdMix,
                 denoisedDiffuseRadianceHitDistance,
                 denoisedSpecularRadianceHitDistance, nrdStableRadiance, reconstructedColor,
@@ -163,6 +165,6 @@ public final class TraceResources {
 
     static long stablePlaneBytes(int width, int height) {
         long pixels = Math.multiplyExact((long) width, (long) height);
-        return Math.multiplyExact(Math.multiplyExact(pixels, 3L), StablePlaneRecordData.BYTE_SIZE);
+        return Math.multiplyExact(Math.multiplyExact(pixels, 3L), PackedStablePlaneData.BYTE_SIZE);
     }
 }

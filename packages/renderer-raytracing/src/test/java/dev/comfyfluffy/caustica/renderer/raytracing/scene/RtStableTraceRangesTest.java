@@ -58,8 +58,8 @@ class RtStableTraceRangesTest {
 
     @Test void sbtOffsetLimitAndFailedEmitterReservationPreserveExistingRanges() {
         var geometry = new RtStableTraceRanges();
-        var full = geometry.reserve(1 << 23, 0);
-        assertEquals(0xfffffe, (full.geometryBase() + full.geometryCount() - 1) * 2);
+        var full = geometry.reserve(1 << 24, 0);
+        assertEquals(0xffffff, full.geometryBase() + full.geometryCount() - 1);
         assertThrows(IllegalStateException.class, () -> geometry.reserve(1, 0));
         geometry.release(full);
         assertEquals(0, geometry.geometryHighWater());

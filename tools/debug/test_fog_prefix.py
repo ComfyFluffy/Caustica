@@ -108,6 +108,36 @@ class FogPrefixTest(unittest.TestCase):
         rescaled = s[-1]*(1-np.exp(-.2*3))/(1-t[-1])
         self.assertGreater(rescaled,0)
 
+    def test_parallel_segments_and_batched_accumulation_match_serial_float32_integration(self):
+        rng=np.random.default_rng(4417)
+        steps=64
+        sigma=rng.uniform(0,.05,steps).astype(np.float32)
+        sigma[rng.random(steps)<.3]=0 # Empty and clipped cells.
+        length=rng.uniform(0,8,steps).astype(np.float32)
+        lighting=rng.uniform(0,3,(steps,3)).astype(np.float32)
+        exposure=np.float32(.37)
+        # Serial reference: one invocation walks every step and composes as it goes.
+        scattering,transmittance=np.zeros(3,np.float32),np.float32(1)
+        serial=[]
+        for i in range(steps):
+            if sigma[i]!=0:
+                segment_t=np.exp(-sigma[i]*length[i])
+                scattering=scattering+transmittance*(1-segment_t)*(lighting[i]*exposure)*.95
+                transmittance=transmittance*segment_t
+            serial.append(np.r_[scattering,transmittance])
+        # Integration stores each step's source and transmittance independently; empty cells store (0, 1).
+        segments=[np.r_[lighting[i]*exposure,np.exp(-sigma[i]*length[i])] if sigma[i]!=0
+                  else np.array([0,0,0,1],np.float32) for i in range(steps)]
+        for batch in (1,8,24,64):
+            prefix=[np.array([0,0,0,1],np.float32)]
+            for first in range(0,steps,batch):
+                scattering,transmittance=prefix[first][:3],prefix[first][3]
+                for segment in segments[first:first+batch]:
+                    scattering=scattering+transmittance*(1-segment[3])*segment[:3]*.95
+                    transmittance=transmittance*segment[3]
+                    prefix.append(np.r_[scattering,transmittance])
+            np.testing.assert_array_equal(np.array(prefix[1:]),np.array(serial))
+
     def test_dense_shadow_reference_exposes_nonzero_coarse_error(self):
         sigma=.04; start,end=7.,9.
         exact=np.exp(-sigma*start)-np.exp(-sigma*end)

@@ -85,7 +85,10 @@ public final class EngineSessionServices implements ContributionScopeFactory, Au
         passes.progress();
     }
 
-    /** Stops new owner scopes after the render-session orchestrator has closed its contributions. */
+    /**
+     * Stops new owner scopes after the render-session orchestrator has closed its contributions. Every
+     * service closes even after an earlier one fails; the first failure is rethrown with the rest suppressed.
+     */
     @Override
     public synchronized void close() {
         if (!accepting) return;
@@ -93,10 +96,11 @@ public final class EngineSessionServices implements ContributionScopeFactory, Au
             throw new IllegalStateException("contribution scopes remain open");
         }
         accepting = false;
-        passes.close();
-        progress();
-        resources.close();
-        compute.close();
+        Throwable failure = EngineWorldSession.runClosing(null, passes::close);
+        failure = EngineWorldSession.runClosing(failure, this::progress);
+        failure = EngineWorldSession.runClosing(failure, resources::close);
+        failure = EngineWorldSession.runClosing(failure, compute::close);
+        if (failure != null) throw EngineWorldSession.propagate(failure, "session services close failed");
     }
 
     private final class Scope implements ContributionScope {

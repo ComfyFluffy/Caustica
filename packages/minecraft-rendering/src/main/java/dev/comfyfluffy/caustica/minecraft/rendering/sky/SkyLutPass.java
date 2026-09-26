@@ -45,12 +45,17 @@ public final class SkyLutPass implements Pass<PassFrame> {
     public static final Option<Float> SUN_NOON_SOUTH_TILT_DEGREES = option("sun-noon-south-tilt-degrees", -89, 89, 30);
     public static final Option<Float> SUN_ANGULAR_RADIUS_DEGREES = option("sun-angular-radius-degrees", 0, 20, .6f);
     public static final Option<Float> MOON_ANGULAR_RADIUS_DEGREES = option("moon-angular-radius-degrees", 0, 20, 1.5f);
+    /**
+     * Full-moon illuminance at the top of the atmosphere in lux, before the phase scale. The physical
+     * full moon delivers about 0.3 lux; zero gives a moonless night lit only by airglow and stars.
+     */
+    public static final Option<Float> MOON_ILLUMINANCE_LUX = option("moon-illuminance-lux", 0, 10, .3f);
     public static final Option<Float> SUN_DISC_HALF_ANGLE_DEGREES = option("sun-disc-half-angle-degrees", 0, 45, 16.7f);
     public static final Option<Float> MOON_DISC_HALF_ANGLE_DEGREES = option("moon-disc-half-angle-degrees", 0, 45, 11.31f);
     public static final Option<Float> GROUND_ALBEDO = option("ground-albedo", 0, 1, .1f);
     public static final Option<Float> HORIZON_SOFTEN_DEGREES = option("horizon-soften-degrees", 0, 90, 15);
     public static final List<Option<?>> OPTIONS = List.of(SUN_NOON_SOUTH_TILT_DEGREES,
-            SUN_ANGULAR_RADIUS_DEGREES, MOON_ANGULAR_RADIUS_DEGREES, SUN_DISC_HALF_ANGLE_DEGREES,
+            SUN_ANGULAR_RADIUS_DEGREES, MOON_ANGULAR_RADIUS_DEGREES, MOON_ILLUMINANCE_LUX, SUN_DISC_HALF_ANGLE_DEGREES,
             MOON_DISC_HALF_ANGLE_DEGREES, GROUND_ALBEDO, HORIZON_SOFTEN_DEGREES);
 
     private final GpuDevice gpu;
@@ -252,7 +257,7 @@ public final class SkyLutPass implements Pass<PassFrame> {
 
     private static SkyLutPushData.SkyInputs pushInputs(SkyInputsData v) {
         return new SkyLutPushData.SkyInputs(vec(v.celestial()), vec(v.skyLook0()), vec(v.skyLook1()),
-                vec(v.skyLook2()), vec(v.skyLook3()), vec(v.sunUv()), vec(v.moonUv()));
+                vec(v.skyLook2()), vec(v.skyLook3()), vec(v.skyLook4()), vec(v.sunUv()), vec(v.moonUv()));
     }
     private static SkyLutPushData.Float4 vec(SkyInputsData.Float4 v) {
         return new SkyLutPushData.Float4(v.x(), v.y(), v.z(), v.w());
@@ -267,7 +272,9 @@ public final class SkyLutPass implements Pass<PassFrame> {
                         s.moonAngularRadiusRadians(), s.moonPhaseFixedFraction()),
                 new SkyInputsData.Float4(s.sunDiscHalfAngleRadians(), s.moonDiscHalfAngleRadians(),
                         s.viewerAltitudeKm(), s.moonPhaseIndex()),
-                new SkyInputsData.Float4(s.groundAlbedo(), s.horizonSoftenRadians(), 0, 0),
+                new SkyInputsData.Float4(s.groundAlbedo(), s.horizonSoftenRadians(), s.daylightFactor(),
+                        s.beamTransmittance()),
+                new SkyInputsData.Float4(s.skySaturation(), 0, 0, 0),
                 a.sunUv(), a.moonUv());
     }
 
@@ -278,13 +285,14 @@ public final class SkyLutPass implements Pass<PassFrame> {
         MinecraftLightingCalibration l = captured.lighting();
         return new SkyState(captured.sunAngleRadians(), captured.moonAngleRadians(),
                 captured.starAngleRadians(), captured.starBrightness(), l.sunIlluminanceLux(),
-                l.moonIlluminanceLux(), l.nightAirglowLuminanceCdM2(), l.starLuminanceCdM2(),
+                options.get(MOON_ILLUMINANCE_LUX), l.nightAirglowLuminanceCdM2(), l.starLuminanceCdM2(),
                 options.get(SUN_NOON_SOUTH_TILT_DEGREES) * r, options.get(SUN_ANGULAR_RADIUS_DEGREES) * r,
                 options.get(MOON_ANGULAR_RADIUS_DEGREES) * r, l.moonPhaseFixedFraction(),
                 options.get(SUN_DISC_HALF_ANGLE_DEGREES) * r,
                 options.get(MOON_DISC_HALF_ANGLE_DEGREES) * r, altitude,
                 captured.moonPhaseIndex(), options.get(GROUND_ALBEDO),
-                options.get(HORIZON_SOFTEN_DEGREES) * r);
+                options.get(HORIZON_SOFTEN_DEGREES) * r, captured.weather().daylightFactor(),
+                captured.weather().beamTransmittance(), captured.weather().skySaturation());
     }
 
     static float viewerAltitudeKm(double cameraY, double seaLevel, double metersPerSceneUnit) {
@@ -396,7 +404,8 @@ public final class SkyLutPass implements Pass<PassFrame> {
                     float starLuminance, float noonTiltRadians, float sunAngularRadiusRadians,
                     float moonAngularRadiusRadians, float moonPhaseFixedFraction, float sunDiscHalfAngleRadians,
                     float moonDiscHalfAngleRadians, float viewerAltitudeKm, float moonPhaseIndex,
-                    float groundAlbedo, float horizonSoftenRadians) { }
+                    float groundAlbedo, float horizonSoftenRadians, float daylightFactor,
+                    float beamTransmittance, float skySaturation) { }
 
     private static Option<Float> option(String name, float min, float max, float value) {
         return Option.range("sky." + name, min, max, value).inGroup(GROUP);

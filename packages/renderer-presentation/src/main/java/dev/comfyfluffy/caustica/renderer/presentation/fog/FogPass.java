@@ -13,6 +13,7 @@ import org.joml.Matrix4f;
 import dev.comfyfluffy.caustica.api.vulkan.GpuDevice;
 import dev.comfyfluffy.caustica.api.vulkan.GpuImage;
 import dev.comfyfluffy.caustica.api.vulkan.GpuImageDescriptorKind;
+import dev.comfyfluffy.caustica.api.vulkan.VulkanDeviceAddress;
 import dev.comfyfluffy.caustica.renderer.presentation.gen.FogPushData;
 import dev.comfyfluffy.caustica.renderer.presentation.gen.FogPushData.Float4;
 import dev.comfyfluffy.caustica.settings.Option;
@@ -21,7 +22,6 @@ import dev.comfyfluffy.caustica.vulkan.ComputeSynchronization;
 import dev.comfyfluffy.caustica.vulkan.ResourceLifetime;
 import dev.comfyfluffy.caustica.vulkan.ShaderObjectCompute;
 import dev.comfyfluffy.caustica.vulkan.VmaImage2D;
-import dev.comfyfluffy.caustica.vulkan.VmaMappedBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VK12;
@@ -45,16 +45,30 @@ public final class FogPass implements Pass<PostEffectFrame> {
     public static final Option<Float> SAMPLES = Option.range("fog.samples", 32.0f, 512.0f, 64.0f).inGroup(GROUP).step(32.0);
     public static final Option<Float> DEBUG = Option.range("fog.debug", 0.0f, 2.0f, 0.0f).inGroup(GROUP).step(1.0);
     public static final List<Option<?>> OPTIONS = List.of(ENABLED, DENSITY, RESOLUTION_DIVISOR, SAMPLES, DEBUG);
+    /**
+     * Lighting records traced by one volume-lighting dispatch. At 3840 x 2160 output with RR Performance and
+     * divisor 8, 2^21 records hold all 64 default steps of the 240 x 135 columns, so the frame traces its fog
+     * lighting in one dispatch; its 64-byte inputs and 16-byte results then occupy 158 MiB.
+     */
+    static final long BATCH_RECORDS = 1L << 21;
+    /** Larger column grids still trace at least this many steps per dispatch. */
+    static final int MINIMUM_BATCH_STEPS = 8;
+    // Dispatch modes of caustica_fog.slang.
+    private static final int INTEGRATE = 0;
+    private static final int COMPOSE = 1;
+    private static final int PREPARE = 2;
+    private static final int BOUND = 3;
+    private static final int ACCUMULATE = 4;
     private int allocatedSteps;
-    private static final int VISIBILITY_SAMPLES = 8;
+    private int batchSteps;
 
     private final GpuDevice gpu;
     private final ResourceFactory resources;
     private final Supplier<OptionValues> options;
     private final ShaderObjectCompute shader;
     private VmaImage2D fog;
-    private PrefixBuffer prefix;
-    private PrefixBuffer[] history;
+    private DeviceBuffer prefix;
+    private DeviceBuffer[] history;
     private long previousFrameIndex = Long.MIN_VALUE;
     private Camera previousCamera;
     private SceneId previousScene;
@@ -63,8 +77,8 @@ public final class FogPass implements Pass<PostEffectFrame> {
     private float previousDebug;
     private float[] previousFromClip;
     private final float[] previousClip = new float[16];
-    private VmaMappedBuffer visibilityRays;
-    private VmaMappedBuffer visibilityResults;
+    private DeviceBuffer visibilityRays;
+    private DeviceBuffer visibilityResults;
     private ResourceOwner imagesOwner;
 
     public FogPass(PostEffectSetup setup, ResourceFactory resources, Supplier<OptionValues> options) {
@@ -112,40 +126,49 @@ public final class FogPass implements Pass<PostEffectFrame> {
         ComputeSynchronization.betweenDispatches(frame.commandBuffer());
         GpuImage scene = frame.sceneColor();
         GpuImage target = frame.acquireSceneColorOutput();
-        // Reuse a small ray batch while accumulating front-to-back transport in the fog image.
-        for (int firstStep = 0; firstStep < steps; firstStep += VISIBILITY_SAMPLES) {
-            dispatch(frame, binding, values.get(DEBUG), scene,
-                    fog.storageIndex().value(), fog.width(), fog.height(), 2, firstStep);
-            frame.sampleVolumeLighting(visibilityRays.deviceAddressAt(0), visibilityResults.deviceAddressAt(0),
-                    width * VISIBILITY_SAMPLES, height);
-            dispatch(frame, binding, values.get(DEBUG), scene,
-                    fog.storageIndex().value(), fog.width(), fog.height(), 0, firstStep);
+        float debug = values.get(DEBUG);
+        int limits = fog.storageIndex().value();
+        dispatch(frame, binding, debug, scene, limits, width, height, 1, BOUND, 0, 0);
+        ComputeSynchronization.betweenDispatches(frame.commandBuffer());
+        // Every column and step of a batch runs in parallel; only accumulation walks the steps in order.
+        for (int firstStep = 0; firstStep < steps; firstStep += batchSteps) {
+            int count = Math.min(batchSteps, steps - firstStep);
+            dispatch(frame, binding, debug, scene, limits, width, height, count, PREPARE, firstStep, count);
+            frame.sampleVolumeLighting(new VulkanDeviceAddress(visibilityRays.address()),
+                    new VulkanDeviceAddress(visibilityResults.address()), width, height * count);
+            dispatch(frame, binding, debug, scene, limits, width, height, count, INTEGRATE, firstStep, count);
+            ComputeSynchronization.betweenDispatches(frame.commandBuffer());
+            dispatch(frame, binding, debug, scene, limits, width, height, 1, ACCUMULATE, firstStep, count);
             ComputeSynchronization.betweenDispatches(frame.commandBuffer());
         }
-        dispatch(frame, binding, values.get(DEBUG), scene,
-                target.descriptor(GpuImageDescriptorKind.STORAGE).index().value(), target.width(), target.height(), 1, 0);
+        dispatch(frame, binding, debug, scene, target.descriptor(GpuImageDescriptorKind.STORAGE).index().value(),
+                target.width(), target.height(), 1, COMPOSE, 0, 0);
+    }
+
+    /** Depth steps traced per volume-lighting dispatch for a grid of {@code columns} fog columns. */
+    static int batchSteps(long columns, int steps) {
+        return Math.clamp(BATCH_RECORDS / columns, MINIMUM_BATCH_STEPS, steps);
     }
 
     private boolean ensureImages(int width, int height, int steps) {
         if (fog != null && fog.width() == width && fog.height() == height && allocatedSteps == steps) return false;
-        VmaImage2D replacement = VmaImage2D.create(gpu, width, height, VK10.VK_FORMAT_R32G32B32A32_SFLOAT,
-                "Fog scattering and transmittance");
+        VmaImage2D replacement = VmaImage2D.create(gpu, width, height, VK10.VK_FORMAT_R32_SFLOAT,
+                "Fog depth limits");
+        int replacementBatch = batchSteps((long) width * height, steps);
         ResourceOwner owner;
-        VmaMappedBuffer rays = null;
-        VmaMappedBuffer results = null;
-        PrefixBuffer replacementPrefix = null;
-        PrefixBuffer firstHistory = null;
-        PrefixBuffer secondHistory = null;
+        DeviceBuffer rays = null;
+        DeviceBuffer results = null;
+        DeviceBuffer replacementPrefix = null;
+        DeviceBuffer firstHistory = null;
+        DeviceBuffer secondHistory = null;
         try {
-            long rayCount = (long) width * height * VISIBILITY_SAMPLES;
-            rays = VmaMappedBuffer.create(gpu, rayCount * 64, VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    "Fog visibility rays");
-            results = VmaMappedBuffer.create(gpu, rayCount * 16, VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    "Fog visibility results");
-            replacementPrefix = PrefixBuffer.create(gpu, (long) width * height * (steps + 2L) * 16L);
+            long rayCount = (long) width * height * replacementBatch;
+            rays = DeviceBuffer.create(gpu, rayCount * 64);
+            results = DeviceBuffer.create(gpu, rayCount * 16);
+            replacementPrefix = DeviceBuffer.create(gpu, (long) width * height * (steps + 1L) * 16L);
             long historyBytes = 80L + (long) width * height * steps * 16L;
-            firstHistory = PrefixBuffer.create(gpu, historyBytes);
-            secondHistory = PrefixBuffer.create(gpu, historyBytes);
+            firstHistory = DeviceBuffer.create(gpu, historyBytes);
+            secondHistory = DeviceBuffer.create(gpu, historyBytes);
             var prefixOwner = replacementPrefix;
             var firstHistoryOwner = firstHistory;
             var secondHistoryOwner = secondHistory;
@@ -166,15 +189,16 @@ public final class FogPass implements Pass<PostEffectFrame> {
         imagesOwner = owner;
         fog = replacement;
         prefix = replacementPrefix;
-        history = new PrefixBuffer[]{firstHistory, secondHistory};
+        history = new DeviceBuffer[]{firstHistory, secondHistory};
         allocatedSteps = steps;
+        batchSteps = replacementBatch;
         visibilityRays = rays;
         visibilityResults = results;
         return true;
     }
 
-    private void dispatch(PostEffectFrame frame, long binding, float debug, GpuImage scene,
-                          int targetIndex, int targetWidth, int targetHeight, int mode, int firstStep) {
+    private void dispatch(PostEffectFrame frame, long binding, float debug, GpuImage scene, int targetIndex,
+                          int targetWidth, int targetHeight, int depth, int mode, int firstStep, int count) {
         float[] matrix = frame.cameraRelativeFromClip();
         float[] jitter = frame.traceJitter();
         float[] tlasCamera = frame.cameraTlasPosition();
@@ -183,12 +207,12 @@ public final class FogPass implements Pass<PostEffectFrame> {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             var push = stack.malloc(FogPushData.BYTE_SIZE).order(ByteOrder.nativeOrder());
             new FogPushData(binding,
-                    visibilityRays.deviceAddressAt(0).value(), visibilityResults.deviceAddressAt(0).value(), prefix.address(),
+                    visibilityRays.address(), visibilityResults.address(), prefix.address(),
                     targetIndex,
                     scene.descriptor(GpuImageDescriptorKind.SAMPLED).index().value(),
                     frame.primaryDepth().descriptor(GpuImageDescriptorKind.SAMPLED).index().value(),
                     fog.sampledIndex().value(),
-                    mode, allocatedSteps, Math.round(debug),
+                    mode, allocatedSteps, count, Math.round(debug),
                     column(matrix, 0), column(matrix, 4), column(matrix, 8), column(matrix, 12),
                     new Float4(tlasCamera[0], tlasCamera[1], tlasCamera[2], (float) (0.001 / frame.metersPerSceneUnit())),
                     new Float4((float) (camera.x() - spatial.originX()), (float) (camera.y() - spatial.originY()),
@@ -196,7 +220,7 @@ public final class FogPass implements Pass<PostEffectFrame> {
                     new Float4(jitter[0], jitter[1], frame.preExposure(), firstStep),
                     history[(int) (frame.frameIndex() & 1)].address(), history[1 - (int) (frame.frameIndex() & 1)].address(),
                     column(previousClip, 0), column(previousClip, 4), column(previousClip, 8), column(previousClip, 12)).write(push);
-            shader.dispatch(frame.commandBuffer(), push, (targetWidth + 7) / 8, (targetHeight + 7) / 8, 1);
+            shader.dispatch(frame.commandBuffer(), push, (targetWidth + 7) / 8, (targetHeight + 7) / 8, depth);
         }
     }
 
@@ -204,9 +228,9 @@ public final class FogPass implements Pass<PostEffectFrame> {
         return new Float4(m[offset], m[offset + 1], m[offset + 2], m[offset + 3]);
     }
 
-    /** Device-local cumulative transport; its shared image owner retires every recorded GPU use. */
-    private record PrefixBuffer(long allocator, long buffer, long allocation, long address) implements AutoCloseable {
-        static PrefixBuffer create(GpuDevice gpu, long bytes) {
+    /** Device-local fog storage; its shared image owner retires every recorded GPU use. */
+    private record DeviceBuffer(long allocator, long buffer, long allocation, long address) implements AutoCloseable {
+        static DeviceBuffer create(GpuDevice gpu, long bytes) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 var info = VkBufferCreateInfo.calloc(stack).sType$Default().size(bytes)
                         .usage(VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK12.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
@@ -215,10 +239,10 @@ public final class FogPass implements Pass<PostEffectFrame> {
                 var buffer = stack.mallocLong(1);
                 var allocation = stack.mallocPointer(1);
                 int result = Vma.vmaCreateBuffer(gpu.vmaAllocator(), info, allocationInfo, buffer, allocation, null);
-                if (result != VK10.VK_SUCCESS) throw new IllegalStateException("Fog prefix allocation failed: " + result);
+                if (result != VK10.VK_SUCCESS) throw new IllegalStateException("Fog buffer allocation failed: " + result);
                 long address = VK12.vkGetBufferDeviceAddress(gpu.vk(),
                         VkBufferDeviceAddressInfo.calloc(stack).sType$Default().buffer(buffer.get(0)));
-                return new PrefixBuffer(gpu.vmaAllocator(), buffer.get(0), allocation.get(0), address);
+                return new DeviceBuffer(gpu.vmaAllocator(), buffer.get(0), allocation.get(0), address);
             }
         }
 

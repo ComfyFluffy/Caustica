@@ -15,6 +15,27 @@ final class RtFrameHistory {
     private static final double MAX_CAMERA_DISTANCE_SQUARED_METERS = 64;
     private static final double ANIMATION_PERIOD_SECONDS = 3600;
     private static final float MAX_ANIMATION_GAP_SECONDS = .25f;
+    // Render frames without an RT composite (a screen transition's synchronous redraw) leave the last
+    // submitted frame a valid predecessor; an interruption longer than this does not.
+    private static final long MAX_PREDECESSOR_AGE_NANOS = 250_000_000L;
+
+    /** Why a frame starts without temporal history. Each cause is a separate frame counter. */
+    enum Break {
+        /** No submitted predecessor: the first frame of a view, or the first after an explicit reset. */
+        FIRST_FRAME("frame.historyBreak.firstFrame"),
+        /** The predecessor is not an earlier frame submitted within the predecessor age. */
+        INTERRUPTED("frame.historyBreak.interrupted"),
+        /** The entry scene or its world scale changed. */
+        SCENE("frame.historyBreak.scene"),
+        EXTENT("frame.historyBreak.extent"),
+        ROUTE("frame.historyBreak.route"),
+        /** The camera turned, zoomed, or moved farther than reprojection can follow. */
+        CAMERA_CUT("frame.historyBreak.cameraCut");
+
+        final String metric;
+
+        Break(String metric) { this.metric = metric; }
+    }
 
     private RtFrameInput previous;
     private long samples;
@@ -24,11 +45,8 @@ final class RtFrameHistory {
         Matrix4f projection = snapshot.copyProjection();
         Matrix4f rotation = snapshot.copyViewRotation();
         Matrix4f projectionView = new Matrix4f(projection).mul(rotation);
-        boolean continuous = previous != null && previous.number() + 1 == number
-                && previous.snapshot().view().entryScene() == snapshot.view().entryScene()
-                && previous.snapshot().metersPerWorldUnit() == snapshot.metersPerWorldUnit()
-                && previous.extent().equals(extent) && previous.route() == route
-                && !cameraCut(previous, snapshot, projection, rotation);
+        Break historyBreak = historyBreak(snapshot, number, nanos, extent, route, projection, rotation);
+        boolean continuous = historyBreak == null;
         // Camera-relative projections use world motion; GPU instance history separately rebases scene origins.
         Float3 delta = continuous ? new Float3(
                 (float) (snapshot.cameraX() - previous.snapshot().cameraX()),
@@ -42,7 +60,7 @@ final class RtFrameHistory {
         float priorTime = continuous ? (float) (previous.snapshot().timeSeconds() % ANIMATION_PERIOD_SECONDS) : time;
         if (time - priorTime < 0 || time - priorTime > MAX_ANIMATION_GAP_SECONDS) priorTime = time;
         return new RtFrameInput(snapshot, number, nanos, extent, route, jitterX, jitterY, preExposure,
-                continuous, projection, rotation, projectionView,
+                historyBreak, projection, rotation, projectionView,
                 continuous ? previous.projectionView() : projectionView,
                 continuous ? previous.viewRotation() : rotation,
                 continuous ? previous.projection() : projection,
@@ -63,6 +81,18 @@ final class RtFrameHistory {
     }
 
     void reset() { previous = null; }
+
+    private Break historyBreak(FrameSnapshot snapshot, long number, long nanos, TraceExtent extent,
+                               DenoiserRoute route, Matrix4fc projection, Matrix4fc rotation) {
+        if (previous == null) return Break.FIRST_FRAME;
+        if (number <= previous.number() || nanos - previous.nanos() > MAX_PREDECESSOR_AGE_NANOS) return Break.INTERRUPTED;
+        if (previous.snapshot().view().entryScene() != snapshot.view().entryScene()
+                || previous.snapshot().metersPerWorldUnit() != snapshot.metersPerWorldUnit()) return Break.SCENE;
+        if (!previous.extent().equals(extent)) return Break.EXTENT;
+        if (previous.route() != route) return Break.ROUTE;
+        if (cameraCut(previous, snapshot, projection, rotation)) return Break.CAMERA_CUT;
+        return null;
+    }
 
     private static boolean cameraCut(RtFrameInput previous, FrameSnapshot snapshot,
                                      Matrix4fc projection, Matrix4fc rotation) {

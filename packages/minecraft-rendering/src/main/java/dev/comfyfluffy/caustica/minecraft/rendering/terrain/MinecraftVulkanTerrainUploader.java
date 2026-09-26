@@ -309,8 +309,10 @@ public final class MinecraftVulkanTerrainUploader implements MinecraftTerrainUpl
                 gpu.descriptorHeap().writer().writeResource(range, 0,
                         VkResourceDescriptorInfoEXT.calloc(stack).sType$Default()
                                  .type(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE).data(data -> data.pImage(image)));
-                gpu.descriptorHeap().writer().writeSampler(samplerRange, 0,
-                        borrowed.sampler().write(VkSamplerCreateInfo.calloc(stack).sType$Default()));
+                // Minecraft's atlas sampler stops at level zero. Shading reads the atlas mip chain at its
+                // ray-cone LOD, while coverage requests LOD zero and keeps the opacity-micromap contract.
+                gpu.descriptorHeap().writer().writeSampler(samplerRange, 0, borrowed.sampler()
+                        .withMipLevels(borrowed.mipLevels()).write(VkSamplerCreateInfo.calloc(stack).sType$Default()));
                 SharedAtlas atlas = new SharedAtlas(range.firstIndex().value(), samplerRange.firstIndex().value(),
                         new ResourceLifetime(range::destroy, samplerRange::destroy, borrowed::close)::close);
                 return SharedResource.owned(atlas, SharedAtlas::cleanup);

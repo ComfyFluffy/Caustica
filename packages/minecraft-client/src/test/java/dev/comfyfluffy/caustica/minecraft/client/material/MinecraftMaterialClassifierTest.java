@@ -62,6 +62,18 @@ final class MinecraftMaterialClassifierTest {
     }
 
     @Test
+    void torchFlamesRadiateAtTheTorchMultipleOfBlockEmission() {
+        for (String torch : List.of("torch", "soul_torch", "copper_torch")) {
+            assertTrue(net.minecraft.core.registries.BuiltInRegistries.BLOCK.containsKey(
+                    net.minecraft.resources.Identifier.withDefaultNamespace(torch)), torch);
+            assertEquals(MinecraftMaterialClassifier.TORCH_EMISSION_SCALE,
+                    MinecraftMaterialClassifier.emissionScale(ResourceId.of("minecraft", "block/" + torch)));
+        }
+        assertEquals(1.0f, MinecraftMaterialClassifier.emissionScale(ResourceId.parse("minecraft:block/glowstone")));
+        assertEquals(1.0f, MinecraftMaterialClassifier.emissionScale(ResourceId.of("somemod", "block/torch")));
+    }
+
+    @Test
     void dielectricDefaultsKeepIceBelowWater() {
         assertTrue(MinecraftMaterialClassifier.ICE_IOR < MinecraftMaterialClassifier.WATER_IOR);
         assertEquals(MinecraftMaterialClassifier.WATER_IOR,

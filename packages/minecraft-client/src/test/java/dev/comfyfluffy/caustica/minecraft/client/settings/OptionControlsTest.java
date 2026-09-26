@@ -1,7 +1,13 @@
 package dev.comfyfluffy.caustica.minecraft.client.settings;
 
+import dev.comfyfluffy.caustica.minecraft.client.EnglishText;
+import dev.comfyfluffy.caustica.minecraft.client.MinecraftOptions;
+import dev.comfyfluffy.caustica.minecraft.client.MinecraftProvidersExtension;
 import dev.comfyfluffy.caustica.minecraft.client.config.CausticaConfig;
 import dev.comfyfluffy.caustica.minecraft.client.config.CausticaOptions;
+import dev.comfyfluffy.caustica.renderer.presentation.RtToneMapping;
+import dev.comfyfluffy.caustica.renderer.presentation.fog.FogPass;
+import dev.comfyfluffy.caustica.renderer.runtime.RendererOptions;
 import dev.comfyfluffy.caustica.settings.Option;
 import dev.comfyfluffy.caustica.settings.ResourceId;
 import dev.comfyfluffy.caustica.settings.SettingsRegistry;
@@ -83,7 +89,7 @@ final class OptionControlsTest {
     }
 
     @Test
-    void resetSectionLeavesTemporaryOverridesAndTheirStoredPreferencesAlone() {
+    void resetPageLeavesTemporaryOverridesAndTheirStoredPreferencesAlone() {
         var option = Option.bool("override", false).storage("override", "caustica.test.ui.override");
         String previous = System.getProperty(option.systemPropertyKey());
         try {
@@ -92,12 +98,11 @@ final class OptionControlsTest {
             store.apply(FEATURE, option, true);
             store.save();
             var row = (SettingControl.BoolControl) OptionControls.of(store, FEATURE, option);
-            var section = new SettingsSection("test", Component.empty(), 0,
-                    List.of(new SettingGroup("test", Component.empty(), null, List.of(row))));
+            var page = new SettingsPage("test", Component.empty(),
+                    List.of(new SettingGroup("test", Component.empty(), List.of(row))));
             assertTrue(row.get());
             assertFalse(row.enabled());
-            assertFalse(section.isModified());
-            section.reset();
+            page.reset();
             store.save();
             assertTrue(row.get());
             System.clearProperty(option.systemPropertyKey());
@@ -122,5 +127,32 @@ final class OptionControlsTest {
 
     private static String key(Component component) {
         return ((TranslatableContents) component.getContents()).getKey();
+    }
+
+    /** Resolves through the shipped English file, so the templates are checked as Minecraft formats them. */
+    @Test
+    void numbersReadThroughTheirLangTemplatesAndNamedValues() {
+        try (EnglishText ignored = EnglishText.install()) {
+            SettingsRegistry registry = new SettingsRegistry();
+            MinecraftOptions.register(registry);
+            registry.feature(MinecraftProvidersExtension.ID).group(FogPass.GROUP).options(FogPass.OPTIONS).register();
+            var store = CausticaOptions.load(directory.resolve("format.toml"), registry);
+            var renderer = CausticaConfig.FEATURE;
+            assertEquals("95%", format(store, renderer, RendererOptions.Rt.Exposure.HIGH_PERCENTILE, 0.95));
+            assertEquals("1.5 EV", format(store, renderer, RendererOptions.Rt.Exposure.MANUAL_EV, 1.5));
+            assertEquals("EV False Color", format(store, renderer, RendererOptions.Rt.Composite.DEBUG_VIEW, 8));
+            assertEquals("1.25", format(store, renderer, RendererOptions.Rt.Tonemap.GAMMA, 1.25));
+            assertEquals("Transmittance", format(store, MinecraftProvidersExtension.ID, FogPass.DEBUG, 1));
+            assertEquals("64", format(store, MinecraftProvidersExtension.ID, FogPass.SAMPLES, 64));
+            var psychov30 = RendererOptions.Rt.Tonemap.SDR_CONTROLS.get(RtToneMapping.SdrMode.PSYCHOV30).getFirst();
+            assertEquals("Automatic", format(store, renderer, psychov30, 0));
+            assertEquals("1.2", format(store, renderer, psychov30, 1.2));
+            assertEquals("200 nits", format(store, renderer, RendererOptions.Rt.Tonemap.PAPER_WHITE_NITS, 200));
+        }
+    }
+
+    private static String format(CausticaOptions store, ResourceId feature, Option<?> option, double value) {
+        var row = (SettingControl.RangeControl) OptionControls.of(store, feature, option);
+        return row.format(value).getString();
     }
 }

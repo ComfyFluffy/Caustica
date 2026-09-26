@@ -11,6 +11,8 @@ import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkHostAddressRangeConstEXT;
 import org.lwjgl.vulkan.VkPushDataInfoEXT;
 import org.lwjgl.vulkan.VkShaderCreateInfoEXT;
+import org.lwjgl.vulkan.VkSpecializationInfo;
+import org.lwjgl.vulkan.VkSpecializationMapEntry;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -36,15 +38,17 @@ public final class ShaderObjectCompute implements AutoCloseable {
     /**
      * Loads a packaged compute shader's main entry point through the owning class's resource lookup.
      * Temporary native SPIR-V storage is released after creation, including when creation fails.
+     * {@code specializationConstants[i]} specializes the 32-bit constant with {@code SpecId i}.
      */
-    public static ShaderObjectCompute load(GpuDevice gpu, Class<?> resourceOwner, String resource) {
+    public static ShaderObjectCompute load(GpuDevice gpu, Class<?> resourceOwner, String resource,
+                                           int... specializationConstants) {
         try (var input = resourceOwner.getResourceAsStream(resource)) {
             if (input == null) throw new IllegalStateException("missing SPIR-V resource: " + resource);
             byte[] bytes = input.readAllBytes();
             ByteBuffer spirv = MemoryUtil.memAlloc(bytes.length);
             try {
                 spirv.put(bytes).flip();
-                return create(gpu, spirv, "main");
+                return create(gpu, spirv, "main", specializationConstants);
             } finally {
                 MemoryUtil.memFree(spirv);
             }
@@ -53,8 +57,12 @@ public final class ShaderObjectCompute implements AutoCloseable {
         }
     }
 
-    /** Create a compute shader object from a direct SPIR-V buffer. */
-    public static ShaderObjectCompute create(GpuDevice gpu, ByteBuffer spirv, String entryPoint) {
+    /**
+     * Create a compute shader object from a direct SPIR-V buffer. {@code specializationConstants[i]}
+     * specializes the 32-bit constant with {@code SpecId i}; booleans take 0 or 1.
+     */
+    public static ShaderObjectCompute create(GpuDevice gpu, ByteBuffer spirv, String entryPoint,
+                                             int... specializationConstants) {
         Objects.requireNonNull(gpu, "gpu");
         Objects.requireNonNull(spirv, "spirv");
         Objects.requireNonNull(entryPoint, "entryPoint");
@@ -71,11 +79,24 @@ public final class ShaderObjectCompute implements AutoCloseable {
                     .pName(stack.UTF8(entryPoint))
                     .setLayoutCount(0)
                     .pushConstantRangeCount(0);
+            if (specializationConstants.length > 0) {
+                info.get(0).pSpecializationInfo(specialization(stack, specializationConstants));
+            }
             LongBuffer output = stack.mallocLong(1);
             VulkanChecks.check(EXTShaderObject.vkCreateShadersEXT(gpu.vk(), info, null, output),
                     "vkCreateShadersEXT");
             return new ShaderObjectCompute(gpu.vk(), output.get(0));
         }
+    }
+
+    static VkSpecializationInfo specialization(MemoryStack stack, int[] constants) {
+        VkSpecializationMapEntry.Buffer entries = VkSpecializationMapEntry.calloc(constants.length, stack);
+        ByteBuffer data = stack.malloc(constants.length * Integer.BYTES);
+        for (int id = 0; id < constants.length; id++) {
+            entries.get(id).constantID(id).offset(id * Integer.BYTES).size(Integer.BYTES);
+            data.putInt(id * Integer.BYTES, constants[id]);
+        }
+        return VkSpecializationInfo.calloc(stack).pMapEntries(entries).pData(data);
     }
 
     /**

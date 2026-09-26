@@ -18,7 +18,7 @@ import java.util.function.Supplier;
 public final class RtFramePresenter {
     private final DlssFrameGeneration dlssFrameGeneration;
     private final Supplier<Settings> settings;
-    private final GeneratedFrameQueue generatedFrames = new GeneratedFrameQueue();
+    private final GeneratedFrameQueue generatedFrames;
     private final FrameGeneration frameGeneration;
     private final HdrPresentation hdrPresentation;
     private final SdrPqPresentation sdrPqPresentation;
@@ -39,6 +39,7 @@ public final class RtFramePresenter {
             Supplier<Settings> settings) {
         this.dlssFrameGeneration = Objects.requireNonNull(dlssFrameGeneration, "dlssFrameGeneration");
         this.settings = Objects.requireNonNull(settings, "settings");
+        this.generatedFrames = new GeneratedFrameQueue(context);
         this.frameGeneration = new FrameGeneration(context, dlssFrameGeneration);
         this.hdrPresentation = new HdrPresentation(context, frameGeneration);
         this.sdrPqPresentation = new SdrPqPresentation(context);

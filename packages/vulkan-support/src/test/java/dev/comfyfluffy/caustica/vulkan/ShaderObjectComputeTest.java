@@ -1,11 +1,14 @@
 package dev.comfyfluffy.caustica.vulkan;
 
 import org.junit.jupiter.api.Test;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.VkSpecializationInfo;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 final class ShaderObjectComputeTest {
@@ -39,6 +42,24 @@ final class ShaderObjectComputeTest {
                         ByteBuffer.allocateDirect(5 * Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN)
                                 .putInt(0x07230203).putInt(0).putInt(0).putInt(0).putInt(0).flip()
                                 .putInt(0, 0)));
+    }
+
+    @Test
+    void specializationConstantIBindsSpecIdI() {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkSpecializationInfo info = ShaderObjectCompute.specialization(stack, new int[] {7, 1, -3});
+            assertEquals(3, info.mapEntryCount());
+            assertEquals(3 * Integer.BYTES, info.dataSize());
+            ByteBuffer data = info.pData();
+            for (int id = 0; id < 3; id++) {
+                assertEquals(id, info.pMapEntries().get(id).constantID());
+                assertEquals(id * Integer.BYTES, info.pMapEntries().get(id).offset());
+                assertEquals(Integer.BYTES, info.pMapEntries().get(id).size());
+            }
+            assertEquals(7, data.getInt(0));
+            assertEquals(1, data.getInt(Integer.BYTES));
+            assertEquals(-3, data.getInt(2 * Integer.BYTES));
+        }
     }
 
     private static ByteBuffer module() {

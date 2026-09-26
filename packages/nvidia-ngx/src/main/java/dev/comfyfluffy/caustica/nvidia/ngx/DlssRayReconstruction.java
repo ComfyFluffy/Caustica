@@ -12,7 +12,8 @@ import java.util.Objects;
 /**
  * DLSS Ray Reconstruction backend for the RT renderer. Runs the DLSSD (Ray Reconstruction) feature
  * over path-traced color + guide buffers (normals/roughness, diffuse/specular albedo, depth, motion
- * vectors, reflection motion vectors), denoising and upscaling (render res → display res) in one pass.
+ * vectors, reflection motion vectors, responsivity), denoising and upscaling (render res → display res)
+ * in one pass.
  */
 public final class DlssRayReconstruction {
     private static final Logger LOGGER = LoggerFactory.getLogger(DlssRayReconstruction.class);
@@ -89,13 +90,15 @@ public final class DlssRayReconstruction {
 
     /**
      * Record a DLSS-RR evaluation: denoise + upscale the noisy path-traced color (at render res) using
-     * the guide buffers, writing the display-res result into {@code out}. {@code jitterX/jitterY} is the
-     * sub-pixel camera jitter applied to the primary ray this frame, in render pixels. Returns false
-     * (disabling RR) on failure. MVs are already in render-pixel space (scale 1).
+     * the guide buffers, writing the display-res result into {@code out}. {@code responsivity} is the
+     * render-resolution R16F mask in [0, 1]; larger values make RR favor the current frame over its
+     * history. {@code jitterX/jitterY} is the sub-pixel camera jitter applied to the primary ray this
+     * frame, in render pixels. Returns false (disabling RR) on failure. MVs are already in render-pixel
+     * space (scale 1).
      */
     public boolean evaluate(VkCommandBuffer commandBuffer, GpuImage color, GpuImage depth, GpuImage motion,
                             GpuImage diffuseAlbedo, GpuImage specularAlbedo, GpuImage normals,
-                            GpuImage specularMotion, GpuImage out,
+                            GpuImage specularMotion, GpuImage responsivity, GpuImage out,
                             int renderWidth, int renderHeight, int displayWidth, int displayHeight,
                             float jitterX, float jitterY, float preExposure) {
         if (!isReady()) {
@@ -115,7 +118,7 @@ public final class DlssRayReconstruction {
                     specularAlbedo.view(), specularAlbedo.image(), VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                     normals.view(), normals.image(), VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                     specularMotion.view(), specularMotion.image(), VK10.VK_FORMAT_R16G16_SFLOAT,
-                    0L, 0L, 0,
+                    responsivity.view(), responsivity.image(), VK10.VK_FORMAT_R16_SFLOAT,
                     out.view(), out.image(), VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                     renderWidth, renderHeight, displayWidth, displayHeight,
                     // Jitter and motion vectors use render-pixel units.

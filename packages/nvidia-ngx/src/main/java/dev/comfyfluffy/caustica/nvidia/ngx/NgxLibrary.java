@@ -74,7 +74,7 @@ final class NgxLibrary {
 		this.createDlssd = handle(lookup, "ngxshim_create_dlssd",
 				FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
-		// int ngxshim_evaluate_dlssd(cmd, feature, [color/depth/mv/diffAlbedo/specAlbedo/normals/specMotion/specHit/out: view,img,fmt]*9, rw,rh,dw,dh, jx,jy,mvsx,mvsy, reset, frameMs, preExposure)
+		// int ngxshim_evaluate_dlssd(cmd, feature, [color/depth/mv/diffAlbedo/specAlbedo/normals/specMotion/responsivity/out: view,img,fmt]*9, rw,rh,dw,dh, jx,jy,mvsx,mvsy, reset, frameMs, preExposure)
 		this.evaluateDlssd = handle(lookup, "ngxshim_evaluate_dlssd",
 				FunctionDescriptor.of(ValueLayout.JAVA_INT,
 						ValueLayout.JAVA_LONG, ValueLayout.ADDRESS,
@@ -239,7 +239,7 @@ final class NgxLibrary {
 	                         long specularAlbedoView, long specularAlbedoImage, int specularAlbedoFormat,
 	                         long normalsView, long normalsImage, int normalsFormat,
 	                         long specularMotionView, long specularMotionImage, int specularMotionFormat,
-	                         long specularHitDistanceView, long specularHitDistanceImage, int specularHitDistanceFormat,
+	                         long responsivityView, long responsivityImage, int responsivityFormat,
 	                         long outputView, long outputImage, int outputFormat,
 	                         int renderWidth, int renderHeight, int displayWidth, int displayHeight,
 	                         float jitterX, float jitterY, float mvScaleX, float mvScaleY,
@@ -253,7 +253,7 @@ final class NgxLibrary {
 					specularAlbedoView, specularAlbedoImage, specularAlbedoFormat,
 					normalsView, normalsImage, normalsFormat,
 					specularMotionView, specularMotionImage, specularMotionFormat,
-					specularHitDistanceView, specularHitDistanceImage, specularHitDistanceFormat,
+					responsivityView, responsivityImage, responsivityFormat,
 					outputView, outputImage, outputFormat,
 					renderWidth, renderHeight, displayWidth, displayHeight,
 					jitterX, jitterY, mvScaleX, mvScaleY, reset, frameTimeMs, preExposure);

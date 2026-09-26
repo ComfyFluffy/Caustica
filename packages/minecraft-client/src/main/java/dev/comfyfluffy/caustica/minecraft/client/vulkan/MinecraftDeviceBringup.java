@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.minecraft.client.vulkan;
 
+import dev.comfyfluffy.caustica.renderer.raytracing.shader.SharcSdk;
 import dev.comfyfluffy.caustica.renderer.runtime.RendererOptions;
 
 import com.mojang.blaze3d.vulkan.VulkanBackend;
@@ -169,6 +170,11 @@ public final class MinecraftDeviceBringup {
             VkPhysicalDeviceOpacityMicromapFeaturesEXT.MICROMAP);
     private static final VulkanFeature WIDE_LINES = new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT,
             "wideLines", VkPhysicalDeviceFeatures.WIDELINES);
+    // The SHaRC stages insert hash grid keys with 64-bit atomics and store the resolved cache as float16.
+    private static final VulkanFeature BUFFER_INT64_ATOMICS = new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT,
+            "shaderBufferInt64Atomics", VkPhysicalDeviceVulkan12Features.SHADERBUFFERINT64ATOMICS);
+    private static final VulkanFeature STORAGE_BUFFER_16_BIT = new VulkanFeature(VulkanBackend.VK11_FEATURES_STRUCT,
+            "storageBuffer16BitAccess", VkPhysicalDeviceVulkan11Features.STORAGEBUFFER16BITACCESS);
     private record ProfileFeature(dev.comfyfluffy.caustica.engine.vulkan.VulkanFeature profile,
                                   VulkanFeature device) {
     }
@@ -216,7 +222,7 @@ public final class MinecraftDeviceBringup {
     }
 
     private record Support(VulkanProfileSupport profile, boolean ser, boolean omm,
-                           boolean presentId, boolean wideLines) {
+                           boolean presentId, boolean wideLines, boolean sharc) {
     }
 
     public MinecraftDeviceBringup() {
@@ -281,6 +287,10 @@ public final class MinecraftDeviceBringup {
         if (support.ser()) features.add(SER);
         if (support.omm()) features.add(OMM);
         if (support.wideLines()) features.add(WIDE_LINES);
+        if (support.sharc()) {
+            features.add(BUFFER_INT64_ATOMICS);
+            features.add(STORAGE_BUFFER_16_BIT);
+        }
 
         boolean lowLatency = CausticaConfig.get(RendererOptions.Rt.Reflex.ENABLED)
                 && device.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
@@ -293,10 +303,11 @@ public final class MinecraftDeviceBringup {
         int samples = preferredOverlaySampleCount(
                 device.vkPhysicalDeviceProperties().limits().framebufferColorSampleCounts());
         negotiation.capabilities = new VulkanDeviceCapabilities(true, support.ser(), support.omm(),
-                lowLatency, presentIds, negotiation.hdrMetadata,
+                lowLatency, presentIds, negotiation.hdrMetadata, support.sharc(), support.sharc(),
                 new GpuRasterCapabilities(support.wideLines(), maxLineWidth, samples));
-        CausticaMod.LOGGER.info("Ray tracing enabled on [{}]: SER={}, Reflex={}, presentId={}, overlaySamples={}",
-                device.deviceName(), support.ser(), lowLatency, presentIds, samples);
+        CausticaMod.LOGGER.info("Ray tracing enabled on [{}]: SER={}, Reflex={}, presentId={}, overlaySamples={}, "
+                + "SHaRC features={}", device.deviceName(), support.ser(), lowLatency, presentIds, samples,
+                support.sharc());
         CausticaMod.LOGGER.info("Opacity micromap acceleration: {}", support.omm());
     }
 
@@ -334,7 +345,8 @@ public final class MinecraftDeviceBringup {
         negotiation.capabilities = new VulkanDeviceCapabilities(rayTracing,
                 rayTracing && old.shaderExecutionReordering(),
                 rayTracing && old.opacityMicromap() && entryPoints.VK_EXT_opacity_micromap,
-                lowLatency, lowLatency && old.presentIds(), old.hdrMetadata(), old.raster());
+                lowLatency, lowLatency && old.presentIds(), old.hdrMetadata(), old.shaderBufferInt64Atomics(),
+                old.storageBuffer16BitAccess(), old.raster());
         if (!rayTracing) CausticaMod.LOGGER.error("RT entry points are incomplete after device creation");
         if (old.lowLatency() && !lowLatency) CausticaMod.LOGGER.error("Low-latency entry points are incomplete");
     }
@@ -426,6 +438,12 @@ public final class MinecraftDeviceBringup {
             if (querySer) SER.struct().findOrCreateStructInPNextChain(available, stack);
             if (queryOmm) OMM.struct().findOrCreateStructInPNextChain(available, stack);
             if (queryPresent) PRESENT_ID.struct().findOrCreateStructInPNextChain(available, stack);
+            // Only a build with verified SHaRC headers negotiates the features of its stages.
+            boolean querySharc = SharcSdk.includeDirectory() != null;
+            if (querySharc) {
+                BUFFER_INT64_ATOMICS.struct().findOrCreateStructInPNextChain(available, stack);
+                STORAGE_BUFFER_16_BIT.struct().findOrCreateStructInPNextChain(available, stack);
+            }
             WIDE_LINES.struct().findOrCreateStructInPNextChain(available, stack);
             VK12.vkGetPhysicalDeviceFeatures2(device.vkPhysicalDevice(), available);
             Set<String> extensions = new HashSet<>();
@@ -440,7 +458,8 @@ public final class MinecraftDeviceBringup {
             VulkanProfileSupport profile = new VulkanProfileSupport(loaderVersion, requestedVersion,
                     device.vkPhysicalDeviceProperties().apiVersion(), extensions, supportedFeatures);
             return new Support(profile, querySer && SER.get(available), queryOmm && OMM.get(available),
-                    queryPresent && PRESENT_ID.get(available), WIDE_LINES.get(available));
+                    queryPresent && PRESENT_ID.get(available), WIDE_LINES.get(available),
+                    querySharc && BUFFER_INT64_ATOMICS.get(available) && STORAGE_BUFFER_16_BIT.get(available));
         }
     }
 

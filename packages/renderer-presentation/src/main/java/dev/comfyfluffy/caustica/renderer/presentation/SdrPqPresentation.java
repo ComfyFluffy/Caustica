@@ -30,6 +30,8 @@ final class SdrPqPresentation {
         }
         if (image == null || image.width() != target.width() || image.height() != target.height()) {
             if (image != null) {
+                // Submitted conversions and swapchain blits still use the previous-size image.
+                context.waitIdle();
                 image.destroy();
             }
             image = context.createStorageImage(target.width(), target.height(), VK10.VK_FORMAT_R16G16B16A16_SFLOAT,

@@ -7,6 +7,7 @@ import com.mojang.blaze3d.vulkan.VulkanQueue;
 import dev.comfyfluffy.caustica.minecraft.client.mixin.CommandEncoderAccessor;
 import dev.comfyfluffy.caustica.minecraft.client.mixin.GpuDeviceAccessor;
 import dev.comfyfluffy.caustica.minecraft.client.MinecraftRtRuntime;
+import dev.comfyfluffy.caustica.engine.vulkan.runtime.VulkanDeviceContext;
 import dev.comfyfluffy.caustica.spi.vulkan.DebugMarkers;
 import dev.comfyfluffy.caustica.spi.vulkan.GraphicsSubmission;
 import dev.comfyfluffy.caustica.spi.vulkan.VulkanQueueRef;
@@ -15,6 +16,8 @@ import dev.comfyfluffy.caustica.spi.vulkan.VulkanDeviceCapabilities;
 import dev.comfyfluffy.caustica.spi.vulkan.VulkanLowLatency;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDevice;
+
+import java.util.function.IntSupplier;
 
 /** Adapts Blaze3D's deferred Vulkan encoder and device wrappers to renderer-owned interfaces. */
 public final class MinecraftVulkanBackend implements VulkanRendererBackend {
@@ -58,6 +61,15 @@ public final class MinecraftVulkanBackend implements VulkanRendererBackend {
     }
 
     public MinecraftVulkanBackend currentOrNull() { return device == null ? null : this; }
+
+    /**
+     * Runs a Blaze3D queue submit, present, or wait under the renderer device's queue lock. Before the
+     * renderer context exists no renderer thread uses the device's queues.
+     */
+    public int synchronizedQueueOperation(IntSupplier operation) {
+        VulkanDeviceContext context = runtime.vulkanContextOrNull();
+        return context == null ? operation.getAsInt() : context.synchronizedQueueOperation(operation);
+    }
 
     public static GraphicsSubmission wrap(VulkanCommandEncoder encoder) {
         return new Submission(encoder);

@@ -1,12 +1,22 @@
-// Maps the display-res scene-linear ACEScg RT image to sRGB SDR and, when enabled, PQ/BT.2020 HDR,
-// via baked ACES 2.0 display-transform LUTs (see tools/bake_display_lut.py). Tonemap seam: the path tracer and DLSS-RR use scene-linear
-// ACEScg; exposure is applied from the compositor-owned 1x1 image right here, followed by the selected
-// scene-referred ACES look (LMT), then the shared ACES 2.0 output transform for each display.
+// Maps the display-res scene-linear ACEScg RT image to sRGB SDR and, when enabled, PQ/BT.2020 HDR.
+// The ACES 2.0 modes use the baked display-transform LUTs (see tools/bake_display_lut.py):
+// exposure, then the selected scene-referred ACES look (LMT), then the shared ACES 2.0 output
+// transform for each display. Every other mode selects an analytic operator from tone_mapping.slang,
+// which runs on the exposed scene-linear signal converted to BT.709 and never samples the tone LUTs.
+//
+// The selected SDR and HDR operators and the HDR switch are specialization constants that
+// RtDisplayPipeline fixes per shader variant, so each variant compiles only its own operators and
+// carries only their register pressure.
 
 import display_common;
 import presentation_common;
+import tone_mapping;
 
 [[vk::push_constant]] DisplayPush pc;
+
+[vk::constant_id(0)] const bool HDR_ENABLED = false;
+[vk::constant_id(1)] const int SDR_MODE = 0;
+[vk::constant_id(2)] const int HDR_MODE = 0;
 
 // MUST exactly match SHAPER_LO_STOPS/SHAPER_HI_STOPS in tools/bake_display_lut.py -- these are the two
 // halves of one shaper function, one run at bake time (Python), one at sample time (here); if they
@@ -86,11 +96,13 @@ float3 pqEncode(float3 nits) {
     return pow((PQ_C1 + PQ_C2 * y) / (1.0 + PQ_C3 * y), float3(PQ_M2));
 }
 
-float3 displayGammaHdr(float3 pqColor) {
+// peakNits is the peak the HDR transform targets: the bound ACES LUT's mastering peak for the
+// ACES 2.0 mode, paper white times headroom for the analytic modes.
+float3 displayGammaHdr(float3 pqColor, float peakNits) {
     if (abs(pc.gamma - 1.0) < 1.0e-6) {
         return clamp(pqColor, 0.0, 1.0);
     }
-    float peak = max(pc.hdrPeakNits, 1.0);
+    float peak = max(peakNits, 1.0);
     float3 normalizedNits = clamp(pqDecode(pqColor) / peak, 0.0, 1.0);
     float3 adjustedNits = peak * luminanceGamma(normalizedNits, BT2020_LUMA);
     return clamp(pqEncode(adjustedNits), 0.0, 1.0);
@@ -112,7 +124,48 @@ float3 tonemapHdr(float3 lookedAcesCg) {
     float3 uvw = shaperEncode(lookedAcesCg);
     Texture3D<float4> hdrToneLut = ResourceDescriptorHeap[NonUniformResourceIndex(pc.hdrToneLutIndex)];
     SamplerState hdrToneSampler = SamplerDescriptorHeap[NonUniformResourceIndex(pc.hdrToneSamplerIndex)];
-    return displayGammaHdr(hdrToneLut.SampleLevel(hdrToneSampler, lutTexCoord(uvw, pc.lutSize), 0.0).rgb);
+    return displayGammaHdr(hdrToneLut.SampleLevel(hdrToneSampler, lutTexCoord(uvw, pc.lutSize), 0.0).rgb,
+            pc.hdrPeakNits);
+}
+
+// Local analytical operators were authored against scene-linear BT.709. The transport and the
+// ACES 2.0 LUTs use ACEScg/AP1, so this conversion is explicit at the analytic seam; the ACES 2.0
+// modes never take it.
+static const float3 ACESCG_TO_BT709_R = float3(1.70505095, -0.62179214, -0.08325887);
+static const float3 ACESCG_TO_BT709_G = float3(-0.13025641, 1.14080477, -0.01054832);
+static const float3 ACESCG_TO_BT709_B = float3(-0.02400336, -0.12896897, 1.15297234);
+
+float3 acescgToBt709Signed(float3 acesCg) {
+    return float3(
+            dot(acesCg, ACESCG_TO_BT709_R),
+            dot(acesCg, ACESCG_TO_BT709_G),
+            dot(acesCg, ACESCG_TO_BT709_B));
+}
+
+ToneMappingParameters sdrToneParameters() {
+    ToneMappingParameters p;
+    p.param0 = pc.sdrParam0;
+    p.param1 = pc.sdrParam1;
+    p.param2 = pc.sdrParam2;
+    p.param3 = pc.sdrParam3;
+    p.param4 = pc.sdrParam4;
+    p.param5 = pc.sdrParam5;
+    p.param6 = pc.sdrParam6;
+    p.param7 = pc.sdrParam7;
+    return p;
+}
+
+ToneMappingParameters hdrToneParameters() {
+    ToneMappingParameters p;
+    p.param0 = pc.hdrParam0;
+    p.param1 = pc.hdrParam1;
+    p.param2 = pc.hdrParam2;
+    p.param3 = pc.hdrParam3;
+    p.param4 = pc.hdrParam4;
+    p.param5 = pc.hdrParam5;
+    p.param6 = pc.hdrParam6;
+    p.param7 = pc.hdrParam7;
+    return p;
 }
 
 [shader("compute")]
@@ -132,10 +185,32 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     float4 rt = rtImage[pix];
     float exposure = max(exposureImage[int2(0, 0)], 0.0);
     float3 exposedAcesCg = max(rt.rgb * exposure, float3(0.0));
-    float3 lookedAcesCg = applyLook(exposedAcesCg);
-    outputImage[pix] = float4(tonemap(lookedAcesCg), 1.0);
+    // The scene-referred look is part of the ACES 2.0 rendering; analytical modes consume the
+    // un-looked exposed signal and own their complete display rendering.
+    float3 lookedAcesCg = exposedAcesCg;
+    if (SDR_MODE == SDR_ACES_2_0 || (HDR_ENABLED && HDR_MODE == HDR_ACES_2_0)) {
+        lookedAcesCg = applyLook(exposedAcesCg);
+    }
+    float3 bt709 = acescgToBt709Signed(exposedAcesCg);
 
-    if (pc.hdrEnabled != 0) {
-        hdrImage[pix] = float4(tonemapHdr(lookedAcesCg), 1.0);
+    float3 sdrColor;
+    if (SDR_MODE == SDR_ACES_2_0) {
+        sdrColor = tonemap(lookedAcesCg);
+    } else {
+        // The swapchain target stores sRGB codes, so the display-linear analytic result is encoded.
+        float3 mapped = applySdrToneMapper(SDR_MODE, bt709, sdrToneParameters());
+        sdrColor = displayGammaSdr(linearToSrgb(clamp(mapped, 0.0, 1.0)));
+    }
+    outputImage[pix] = float4(sdrColor, 1.0);
+
+    if (HDR_ENABLED) {
+        float3 hdrColor;
+        if (HDR_MODE == HDR_ACES_2_0) {
+            hdrColor = tonemapHdr(lookedAcesCg);
+        } else {
+            hdrColor = displayGammaHdr(applyHdrToneMapper(HDR_MODE, bt709, pc.paperWhiteNits,
+                    pc.headroom, hdrToneParameters()), pc.paperWhiteNits * pc.headroom);
+        }
+        hdrImage[pix] = float4(hdrColor, 1.0);
     }
 }

@@ -10,6 +10,14 @@ public static const uint STABLE_PLANE_FLAG_TRANSMISSION = 8u;
 // Flags bits 8 through 15 store the number of delta segments before the endpoint.
 public static const uint STABLE_PLANE_DEPTH_SHIFT = 8u;
 public static const uint STABLE_PLANE_DEPTH_MASK = 255u;
+// A branch id is 1 for the camera path; each delta event shifts in two bits naming its lobe. The leading
+// bit and every reflection bit therefore occupy even bit positions.
+public static const uint STABLE_PLANE_BRANCH_REFLECTION = 1u;
+public static const uint STABLE_PLANE_BRANCH_TRANSMISSION = 2u;
+
+public bool stablePlaneBranchReflects(uint branchId) {
+    return countbits(branchId & 0x55555555u) > 1u;
+}
 
 // Logical world-space guide values; physical scratch storage is scalar SoA.
 public struct StablePlaneRecord {
@@ -28,118 +36,187 @@ public struct StablePlaneRecord {
     public uint branchId;
 };
 
-// Each scalar word owns one contiguous stream of all logical plane/pixel records.
+// Physical record: field i is word i of StablePlaneStorage. Each half pair keeps its first value in the low
+// 16 bits and saturates at +-65504. Every half value reaches an fp16 guide, signal or trace-output image, or is
+// an NRD demodulation factor that prepare and merge read identically.
+public struct PackedStablePlane {
+    public float3 currentVirtualPosition;
+    // Plane dominance compares this value, so it stays exact.
+    public float throughputLuminance;
+    public uint branchId;
+    public uint flags;
+    // Octahedral snorm16 x, y; axis-aligned normals decode exactly.
+    public uint normal;
+    // Halves of previousVirtualPosition - currentVirtualPosition, then roughness.
+    public uint motionXY;
+    public uint motionZRoughness;
+    // Halves of the diffuse then the specular BSDF estimate.
+    public uint diffuseBsdfEstimateXY;
+    public uint diffuseBsdfEstimateZSpecularBsdfEstimateX;
+    public uint specularBsdfEstimateYZ;
+    // Halves of radiance times the frame pre-exposure, each followed by its hit distance.
+    public uint noisyDiffuseRadianceXY;
+    public uint noisyDiffuseRadianceZDiffuseHitDistance;
+    public uint noisySpecularRadianceXY;
+    public uint noisySpecularRadianceZSpecularHitDistance;
+};
+
+static const float STABLE_PLANE_HALF_MAX = 65504.0;
+
+uint stablePlanePackHalves(float low, float high) {
+    float2 value = clamp(float2(low, high), float2(-STABLE_PLANE_HALF_MAX), float2(STABLE_PLANE_HALF_MAX));
+    return f32tof16(value.x) | (f32tof16(value.y) << 16u);
+}
+
+float2 stablePlaneUnpackHalves(uint word) {
+    return float2(f16tof32(word), f16tof32(word >> 16u));
+}
+
+uint stablePlanePackNormal(float3 normal) {
+    float2 octahedron = normal.xy / (abs(normal.x) + abs(normal.y) + abs(normal.z));
+    if (normal.z < 0.0) {
+        octahedron = (1.0 - abs(octahedron.yx)) * select(octahedron >= 0.0, float2(1.0), float2(-1.0));
+    }
+    int2 value = int2(round(octahedron * 32767.0));
+    return (uint(value.x) & 0xffffu) | (uint(value.y) << 16u);
+}
+
+float3 stablePlaneUnpackNormal(uint word) {
+    float2 octahedron = float2(float(int(word << 16u) >> 16), float(int(word) >> 16)) / 32767.0;
+    float3 normal = float3(octahedron, 1.0 - abs(octahedron.x) - abs(octahedron.y));
+    float fold = saturate(-normal.z);
+    normal.xy += select(normal.xy >= 0.0, float2(-fold), float2(fold));
+    return normalize(normal);
+}
+
+// Each PackedStablePlane word owns one contiguous stream of all logical plane/pixel records.
 public struct StablePlaneStorage {
     public uint64_t address;
     public uint recordCount;
-    public uint loadWord(uint index, uint word) {
+    // Radiance words hold radiance times this frame pre-exposure, like the fp16 trace output they sum into.
+    public float preExposure;
+    uint loadWord(uint index, uint word) {
         return ((ConstPtr<uint>)address)[uint64_t(word) * uint64_t(recordCount) + uint64_t(index)];
     }
-    public void storeWord(uint index, uint word, uint value) {
+    void storeWord(uint index, uint word, uint value) {
         ((DevicePtr<uint>)address)[uint64_t(word) * uint64_t(recordCount) + uint64_t(index)] = value;
     }
-    public float3 loadCurrentVirtualPosition(uint index) { return float3(asfloat(loadWord(index, 0u)), asfloat(loadWord(index, 1u)), asfloat(loadWord(index, 2u))); }
-    public void storeCurrentVirtualPosition(uint index, float3 value) {
-        storeWord(index, 0u, asuint(value.x));
-        storeWord(index, 1u, asuint(value.y));
-        storeWord(index, 2u, asuint(value.z));
+    float3 loadFloat3(uint index, uint word) {
+        return float3(asfloat(loadWord(index, word)), asfloat(loadWord(index, word + 1u)),
+                asfloat(loadWord(index, word + 2u)));
     }
-    public float loadRoughness(uint index) { return asfloat(loadWord(index, 3u)); }
-    public void storeRoughness(uint index, float value) {
-        storeWord(index, 3u, asuint(value));
+    void storeFloat3(uint index, uint word, float3 value) {
+        storeWord(index, word, asuint(value.x));
+        storeWord(index, word + 1u, asuint(value.y));
+        storeWord(index, word + 2u, asuint(value.z));
     }
-    public float3 loadPreviousVirtualPosition(uint index) { return float3(asfloat(loadWord(index, 4u)), asfloat(loadWord(index, 5u)), asfloat(loadWord(index, 6u))); }
-    public void storePreviousVirtualPosition(uint index, float3 value) {
-        storeWord(index, 4u, asuint(value.x));
-        storeWord(index, 5u, asuint(value.y));
-        storeWord(index, 6u, asuint(value.z));
+    float2 loadHalves(uint index, uint word) {
+        return stablePlaneUnpackHalves(loadWord(index, word));
     }
-    public float loadThroughputLuminance(uint index) { return asfloat(loadWord(index, 7u)); }
-    public void storeThroughputLuminance(uint index, float value) {
-        storeWord(index, 7u, asuint(value));
+    void storeHalves(uint index, uint word, float low, float high) {
+        storeWord(index, word, stablePlanePackHalves(low, high));
     }
-    public float3 loadNormal(uint index) { return float3(asfloat(loadWord(index, 8u)), asfloat(loadWord(index, 9u)), asfloat(loadWord(index, 10u))); }
-    public void storeNormal(uint index, float3 value) {
-        storeWord(index, 8u, asuint(value.x));
-        storeWord(index, 9u, asuint(value.y));
-        storeWord(index, 10u, asuint(value.z));
+    // Fill stores radiance and hit distance separately, so each keeps the other half of their shared word.
+    void storeLowHalf(uint index, uint word, float value) {
+        storeWord(index, word, (loadWord(index, word) & 0xffff0000u) | stablePlanePackHalves(value, 0.0));
     }
-    public float loadDiffuseHitDistance(uint index) { return asfloat(loadWord(index, 11u)); }
-    public void storeDiffuseHitDistance(uint index, float value) {
-        storeWord(index, 11u, asuint(value));
+    void storeHighHalf(uint index, uint word, float value) {
+        storeWord(index, word, (loadWord(index, word) & 0xffffu) | stablePlanePackHalves(0.0, value));
     }
-    public float3 loadDiffuseBsdfEstimate(uint index) { return float3(asfloat(loadWord(index, 12u)), asfloat(loadWord(index, 13u)), asfloat(loadWord(index, 14u))); }
-    public void storeDiffuseBsdfEstimate(uint index, float3 value) {
-        storeWord(index, 12u, asuint(value.x));
-        storeWord(index, 13u, asuint(value.y));
-        storeWord(index, 14u, asuint(value.z));
-    }
-    public float loadSpecularHitDistance(uint index) { return asfloat(loadWord(index, 15u)); }
-    public void storeSpecularHitDistance(uint index, float value) {
-        storeWord(index, 15u, asuint(value));
-    }
-    public float3 loadSpecularBsdfEstimate(uint index) { return float3(asfloat(loadWord(index, 16u)), asfloat(loadWord(index, 17u)), asfloat(loadWord(index, 18u))); }
-    public void storeSpecularBsdfEstimate(uint index, float3 value) {
-        storeWord(index, 16u, asuint(value.x));
-        storeWord(index, 17u, asuint(value.y));
-        storeWord(index, 18u, asuint(value.z));
-    }
-    public float3 loadNoisyDiffuseRadiance(uint index) { return float3(asfloat(loadWord(index, 20u)), asfloat(loadWord(index, 21u)), asfloat(loadWord(index, 22u))); }
-    public void storeNoisyDiffuseRadiance(uint index, float3 value) {
-        storeWord(index, 20u, asuint(value.x));
-        storeWord(index, 21u, asuint(value.y));
-        storeWord(index, 22u, asuint(value.z));
-    }
-    public uint loadFlags(uint index) { return loadWord(index, 23u); }
-    public void storeFlags(uint index, uint value) {
-        storeWord(index, 23u, value);
-    }
-    public float3 loadNoisySpecularRadiance(uint index) { return float3(asfloat(loadWord(index, 24u)), asfloat(loadWord(index, 25u)), asfloat(loadWord(index, 26u))); }
-    public void storeNoisySpecularRadiance(uint index, float3 value) {
-        storeWord(index, 24u, asuint(value.x));
-        storeWord(index, 25u, asuint(value.y));
-        storeWord(index, 26u, asuint(value.z));
-    }
-    public uint loadBranchId(uint index) { return loadWord(index, 27u); }
+    public uint loadBranchId(uint index) { return loadWord(index, 4u); }
     public void storeBranchId(uint index, uint value) {
-        storeWord(index, 27u, value);
+        storeWord(index, 4u, value);
+    }
+    public uint loadFlags(uint index) { return loadWord(index, 5u); }
+    public void storeFlags(uint index, uint value) {
+        storeWord(index, 5u, value);
+    }
+    public float3 loadNoisyDiffuseRadiance(uint index) {
+        return float3(loadHalves(index, 12u), loadHalves(index, 13u).x) / preExposure;
+    }
+    public void storeNoisyDiffuseRadiance(uint index, float3 value) {
+        float3 stored = value * preExposure;
+        storeHalves(index, 12u, stored.x, stored.y);
+        storeLowHalf(index, 13u, stored.z);
+    }
+    public void storeDiffuseHitDistance(uint index, float value) {
+        storeHighHalf(index, 13u, value);
+    }
+    public void storeNoisySpecularRadiance(uint index, float3 value) {
+        float3 stored = value * preExposure;
+        storeHalves(index, 14u, stored.x, stored.y);
+        storeLowHalf(index, 15u, stored.z);
+    }
+    public void storeSpecularHitDistance(uint index, float value) {
+        storeHighHalf(index, 15u, value);
     }
     public StablePlaneRecord load(uint index) {
         StablePlaneRecord value = {};
-        value.currentVirtualPosition = loadCurrentVirtualPosition(index);
-        value.roughness = loadRoughness(index);
-        value.previousVirtualPosition = loadPreviousVirtualPosition(index);
-        value.throughputLuminance = loadThroughputLuminance(index);
-        value.normal = loadNormal(index);
-        value.diffuseHitDistance = loadDiffuseHitDistance(index);
-        value.diffuseBsdfEstimate = loadDiffuseBsdfEstimate(index);
-        value.specularHitDistance = loadSpecularHitDistance(index);
-        value.specularBsdfEstimate = loadSpecularBsdfEstimate(index);
-        value.noisyDiffuseRadiance = loadNoisyDiffuseRadiance(index);
-        value.flags = loadFlags(index);
-        value.noisySpecularRadiance = loadNoisySpecularRadiance(index);
-        value.branchId = loadBranchId(index);
+        value.currentVirtualPosition = loadFloat3(index, 0u);
+        value.throughputLuminance = asfloat(loadWord(index, 3u));
+        value.branchId = loadWord(index, 4u);
+        value.flags = loadWord(index, 5u);
+        value.normal = stablePlaneUnpackNormal(loadWord(index, 6u));
+        float2 motionXY = loadHalves(index, 7u);
+        float2 motionZRoughness = loadHalves(index, 8u);
+        value.previousVirtualPosition = value.currentVirtualPosition + float3(motionXY, motionZRoughness.x);
+        value.roughness = motionZRoughness.y;
+        float2 diffuseEstimateXY = loadHalves(index, 9u);
+        float2 estimateZX = loadHalves(index, 10u);
+        value.diffuseBsdfEstimate = float3(diffuseEstimateXY, estimateZX.x);
+        value.specularBsdfEstimate = float3(estimateZX.y, loadHalves(index, 11u));
+        float2 diffuseZDistance = loadHalves(index, 13u);
+        float2 specularZDistance = loadHalves(index, 15u);
+        value.noisyDiffuseRadiance = float3(loadHalves(index, 12u), diffuseZDistance.x) / preExposure;
+        value.diffuseHitDistance = diffuseZDistance.y;
+        value.noisySpecularRadiance = float3(loadHalves(index, 14u), specularZDistance.x) / preExposure;
+        value.specularHitDistance = specularZDistance.y;
         return value;
     }
     public void store(uint index, StablePlaneRecord value) {
-        storeCurrentVirtualPosition(index, value.currentVirtualPosition);
-        storeRoughness(index, value.roughness);
-        storePreviousVirtualPosition(index, value.previousVirtualPosition);
-        storeThroughputLuminance(index, value.throughputLuminance);
-        storeNormal(index, value.normal);
-        storeDiffuseHitDistance(index, value.diffuseHitDistance);
-        storeDiffuseBsdfEstimate(index, value.diffuseBsdfEstimate);
-        storeSpecularHitDistance(index, value.specularHitDistance);
-        storeSpecularBsdfEstimate(index, value.specularBsdfEstimate);
-        storeNoisyDiffuseRadiance(index, value.noisyDiffuseRadiance);
-        storeFlags(index, value.flags);
-        storeNoisySpecularRadiance(index, value.noisySpecularRadiance);
-        storeBranchId(index, value.branchId);
+        float3 motion = value.previousVirtualPosition - value.currentVirtualPosition;
+        float3 diffuse = value.noisyDiffuseRadiance * preExposure;
+        float3 specular = value.noisySpecularRadiance * preExposure;
+        storeFloat3(index, 0u, value.currentVirtualPosition);
+        storeWord(index, 3u, asuint(value.throughputLuminance));
+        storeWord(index, 4u, value.branchId);
+        storeWord(index, 5u, value.flags);
+        storeWord(index, 6u, stablePlanePackNormal(value.normal));
+        storeHalves(index, 7u, motion.x, motion.y);
+        storeHalves(index, 8u, motion.z, value.roughness);
+        storeHalves(index, 9u, value.diffuseBsdfEstimate.x, value.diffuseBsdfEstimate.y);
+        storeHalves(index, 10u, value.diffuseBsdfEstimate.z, value.specularBsdfEstimate.x);
+        storeHalves(index, 11u, value.specularBsdfEstimate.y, value.specularBsdfEstimate.z);
+        storeHalves(index, 12u, diffuse.x, diffuse.y);
+        storeHalves(index, 13u, diffuse.z, value.diffuseHitDistance);
+        storeHalves(index, 14u, specular.x, specular.y);
+        storeHalves(index, 15u, specular.z, value.specularHitDistance);
+    }
+    // Build parks a queued delta branch in full-precision words 0 through 14 of its future record until it
+    // stores that record.
+    public void storeQueuedBranch(uint index, float3x3 imageTransform, float3 motion, float unfoldedLength,
+            uint identity, bool transmitted) {
+        storeFloat3(index, 0u, imageTransform[0]);
+        storeFloat3(index, 3u, imageTransform[1]);
+        storeFloat3(index, 6u, imageTransform[2]);
+        storeFloat3(index, 9u, motion);
+        storeWord(index, 12u, asuint(unfoldedLength));
+        storeWord(index, 13u, identity);
+        storeWord(index, 14u, transmitted ? 1u : 0u);
+    }
+    public void loadQueuedBranch(uint index, out float3x3 imageTransform, out float3 motion,
+            out float unfoldedLength, out uint identity, out bool transmitted) {
+        imageTransform = float3x3(loadFloat3(index, 0u), loadFloat3(index, 3u), loadFloat3(index, 6u));
+        motion = loadFloat3(index, 9u);
+        unfoldedLength = asfloat(loadWord(index, 12u));
+        identity = loadWord(index, 13u);
+        transmitted = loadWord(index, 14u) != 0u;
     }
 };
-public StablePlaneStorage stablePlaneStorage(uint64_t address, uint recordCount) {
+public StablePlaneStorage stablePlaneStorage(uint64_t address, uint recordCount, float preExposure) {
     StablePlaneStorage storage;
     storage.address = address;
     storage.recordCount = recordCount;
+    storage.preExposure = preExposure;
     return storage;
 }

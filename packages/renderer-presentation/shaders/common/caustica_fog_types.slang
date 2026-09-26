@@ -24,6 +24,8 @@ public struct FogPush {
     public uint fogIndex;
     public uint mode;
     public uint steps;
+    // Depth steps in the batch that begins at step traceData.w.
+    public uint batchSteps;
     public uint debug;
     public float4 clipX;
     public float4 clipY;

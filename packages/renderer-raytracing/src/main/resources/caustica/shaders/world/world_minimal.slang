@@ -40,7 +40,6 @@ public struct ShadowPayload {
     public float hitDistance;
     public float3 volumeAbsorption;
     public float volumeIor;
-    public uint seed;
 };
 public static const uint WORLD_RAY_MASK_SECONDARY = 0x01u;
 public static const uint WORLD_RAY_MASK_PRIMARY = 0x02u;

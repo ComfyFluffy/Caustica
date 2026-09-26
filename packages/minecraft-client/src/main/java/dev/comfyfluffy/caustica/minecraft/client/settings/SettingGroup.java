@@ -6,34 +6,28 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * A collapsible run of rows under one title.
+ * A titled run of rows on an options page.
  *
- * <p>{@code header} is the bool whose value decides whether {@code rows} are shown — bloom's on/off switch,
- * where turning it off makes its parameters meaningless rather than merely uninteresting. A group with no
- * header collapses only when the player clicks its caret, which is the right shape wherever there is no
- * state in which the rows do not apply.
+ * <p>{@code gate} is the bool whose value decides whether the other rows mean anything, such as bloom's on/off
+ * switch: while it is off they stay visible but disabled. It is the section's first row.
+ *
+ * <p>An {@code advanced} section holds internals most players never change, so a page shows it folded behind
+ * one button instead of under its title until the player unfolds it.
  */
-public record SettingGroup(String id, Component title, SettingControl.BoolControl header,
-                           List<SettingControl> rows) {
+public record SettingGroup(String id, Component title, SettingControl.BoolControl gate,
+                           List<SettingControl> rows, boolean advanced) {
     public SettingGroup {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(title, "title");
         rows = List.copyOf(rows);
     }
 
-    /** Whether the rows should be visible, given the header's value and the player's caret state. */
-    public boolean rowsVisible(boolean expandedByCaret) {
-        return header != null ? header.get() : expandedByCaret;
+    public SettingGroup(String id, Component title, List<SettingControl> rows) {
+        this(id, title, null, rows, false);
     }
 
-    /** Every control in the group, header included — what "reset this section" iterates. */
-    public List<SettingControl> allControls() {
-        if (header == null) {
-            return rows;
-        }
-        List<SettingControl> all = new java.util.ArrayList<>(rows.size() + 1);
-        all.add(header);
-        all.addAll(rows);
-        return List.copyOf(all);
+    /** Whether {@code row} can be edited given the gate; the gate itself always can. */
+    public boolean editable(SettingControl row) {
+        return gate == null || row == gate || gate.get();
     }
 }

@@ -50,6 +50,8 @@ final class FrameGeneration {
         int height = source.height();
         if (hudlessImage == null || hudlessImage.width() != width || hudlessImage.height() != height) {
             if (hudlessImage != null) {
+                // Submitted captures and interpolations still reference the previous-size image.
+                context.waitIdle();
                 hudlessImage.destroy();
             }
             hudlessImage = context.createStorageImage(
@@ -73,6 +75,8 @@ final class FrameGeneration {
         if (hdrHudlessImage == null
                 || hdrHudlessImage.width() != source.width() || hdrHudlessImage.height() != source.height()) {
             if (hdrHudlessImage != null) {
+                // Submitted captures and interpolations still reference the previous-size image.
+                context.waitIdle();
                 hdrHudlessImage.destroy();
             }
             hdrHudlessImage = context.createStorageImage(source.width(), source.height(),

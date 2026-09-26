@@ -374,7 +374,8 @@ public final class MinecraftProgramSession implements MinecraftWorldSessionContr
         return new MinecraftLightProvider.CelestialSettings(
                 values.get(SkyLutPass.SUN_NOON_SOUTH_TILT_DEGREES),
                 values.get(SkyLutPass.SUN_ANGULAR_RADIUS_DEGREES),
-                values.get(SkyLutPass.MOON_ANGULAR_RADIUS_DEGREES));
+                values.get(SkyLutPass.MOON_ANGULAR_RADIUS_DEGREES),
+                values.get(SkyLutPass.MOON_ILLUMINANCE_LUX));
     }
 
     @Override public synchronized void stop() {

@@ -38,6 +38,17 @@ public final class LangKeys {
         return Component.translatable(optionKey(featureId, option) + "." + value);
     }
 
+    /**
+     * A numeric value as a row shows it. {@code <option key>.value.<number>} names one exact value, such as a
+     * debug view. Otherwise {@code <option key>.value} is a template that receives the number and the
+     * number as a percentage ({@code "%s EV"}, {@code "%2$s%%"}); an option with neither shows the number.
+     */
+    public static Component optionValue(ResourceId featureId, Option<?> option, String number, String percent) {
+        String key = optionKey(featureId, option) + ".value";
+        return Component.translatableWithFallback(key + "." + number, "%s",
+                Component.translatableWithFallback(key, "%s", number, percent));
+    }
+
     private static String optionKey(ResourceId featureId, Option<?> option) {
         if (featureId.equals(CausticaConfig.FEATURE)) return "caustica.setting." + option.id();
         return "caustica.option." + featureId.namespace() + "." + featureId.path() + "." + option.id();

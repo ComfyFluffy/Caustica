@@ -15,6 +15,7 @@ public record TraceImages(
         GpuImage motion,
         GpuImage specularAlbedo,
         GpuImage specularMotion,
+        GpuImage responsivity,
         GpuImage diffuseRadianceHitDistance,
         GpuImage specularRadianceHitDistance,
         GpuImage nrdViewZ,
@@ -35,6 +36,7 @@ public record TraceImages(
         Objects.requireNonNull(motion, "motion");
         Objects.requireNonNull(specularAlbedo, "specularAlbedo");
         Objects.requireNonNull(specularMotion, "specularMotion");
+        Objects.requireNonNull(responsivity, "responsivity");
         Objects.requireNonNull(diffuseRadianceHitDistance, "diffuseRadianceHitDistance");
         Objects.requireNonNull(specularRadianceHitDistance, "specularRadianceHitDistance");
         Objects.requireNonNull(nrdViewZ, "nrdViewZ");

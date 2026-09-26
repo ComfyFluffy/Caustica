@@ -39,9 +39,9 @@ class FogInputsTest {
     }
 
     @Test
-    void reflectedPushRecordPreservesAddressMatricesAndPadding() {
+    void reflectedPushRecordPreservesAddressesCountsAndMatrices() {
         var v = new Float4(1, 2, 3, 4);
-        var record = new FogPushData(0x123456789abcdef0L, 0x1230L, 0x4560L, 0x7890L, 1, 2, 3, 4, 0, 64, 2,
+        var record = new FogPushData(0x123456789abcdef0L, 0x1230L, 0x4560L, 0x7890L, 1, 2, 3, 4, 0, 64, 32, 2,
                 v, v, v, v, v, v, v, 0xabc0L, 0xdef0L, v, v, v, v);
         ByteBuffer buffer = ByteBuffer.allocate(FogPushData.BYTE_SIZE).order(ByteOrder.nativeOrder());
         for (int i = 0; i < buffer.capacity(); i++) buffer.put(i, (byte) 0xff);
@@ -55,7 +55,8 @@ class FogInputsTest {
         assertEquals(0xabc0L, buffer.getLong(FogPushData.HISTORY_ADDRESS_OFFSET));
         assertEquals(0xdef0L, buffer.getLong(FogPushData.PREVIOUS_HISTORY_ADDRESS_OFFSET));
         assertEquals(4, buffer.getFloat(FogPushData.PREVIOUS_CLIP_W_OFFSET + 12));
-        assertEquals(0, buffer.getInt(60));
+        assertEquals(32, buffer.getInt(FogPushData.BATCH_STEPS_OFFSET));
+        assertEquals(2, buffer.getInt(FogPushData.DEBUG_OFFSET));
         assertEquals(4, buffer.getFloat(FogPushData.CLIP_W_OFFSET + 12));
         assertEquals(3, buffer.getFloat(FogPushData.TLAS_CAMERA_OFFSET + 8));
     }

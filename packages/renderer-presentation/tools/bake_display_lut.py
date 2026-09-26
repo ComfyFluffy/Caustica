@@ -6,7 +6,7 @@ auto-exposure scalar (RtExposure). The scene-referred LMT runs first, followed b
 2.0 output transform, gamut mapping, tone scale, and display transfer function.
 
 One SDR LUT (BT.709, sRGB OETF) plus one HDR LUT per REC2020 mastering-nits target ACES 2.0 ships
-(500/1000/2000/4000 -- see HDR_REC2020_NITS). Hdr.PEAK_NITS selects one of the baked HDR LUTs.
+(500/1000/2000/4000 -- see HDR_REC2020_NITS). The ACES 2.0 HDR mode renders through the LUT nearest Hdr.PEAK_NITS.
 The LMT is a separate log-to-log scene-referred table, so it does not duplicate all five
 output LUTs.
 

@@ -21,14 +21,25 @@ import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Arrays;
+import java.util.Set;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 final class WorldShaderCompilerTest {
     private static final ShaderSource BUILTINS = ShaderSource.classpath(WorldShaderCompilerTest.class,
@@ -89,24 +100,11 @@ final class WorldShaderCompilerTest {
             assertVulkan14(cache.resolve("radiance-closest.spv"), closest);
             assertVulkan14(cache.resolve("radiance-any.spv"), radianceAny);
             assertVulkan14(cache.resolve("environment-miss.spv"), environment);
-            assertSpirv(compiler.compileShadowAnyHit());
-            byte[] shadowClosest = compiler.compileShadowClosestHit();
-            byte[] shadowAny = compiler.compileShadowAnyHit();
-            byte[] shadowMiss = compiler.compilePlain("shadow.rmiss.slang", WorldShaderCompiler.ENTRY_POINT);
-            byte[] shadowBlocker = compiler.compilePlain("shadow_blocker.slang", WorldShaderCompiler.ENTRY_POINT);
-            for (byte[] stage : List.of(shadowClosest, shadowAny, shadowMiss, shadowBlocker)) {
-                assertSpirv(stage);
-                assertEquals(36, incomingPayloadBytes(stage));
-            }
-            assertVulkan14(cache.resolve("shadow-closest.spv"), shadowClosest);
-            assertVulkan14(cache.resolve("shadow-any.spv"), shadowAny);
-            assertVulkan14(cache.resolve("shadow-miss.spv"), shadowMiss);
-            assertVulkan14(cache.resolve("shadow-blocker.spv"), shadowBlocker);
-            assertEquals(1, countOpcode(shadowBlocker, 4449)); // OpTerminateRayKHR
-            assertEquals(0, countOpcode(shadowBlocker, 4448)); // OpIgnoreIntersectionKHR
             assertSpirv(compiler.compileEnvironmentMiss());
             assertSpirv(compiler.compilePlain("guide.rmiss.slang", WorldShaderCompiler.ENTRY_POINT));
-            assertSpirv(compiler.compileBuildStablePlanes());
+            byte[] build = compiler.compileBuildStablePlanes();
+            assertSpirv(build);
+            assertTrue(assertRadianceTraceRouting(build) > 0);
             byte[] resolve = compiler.compilePlain("resolve_stable_planes.slang", WorldShaderCompiler.ENTRY_POINT);
             assertSpirv(resolve);
             assertVulkan14(cache.resolve("resolve-stable-planes.spv"), resolve);
@@ -179,6 +177,125 @@ final class WorldShaderCompilerTest {
         }
     }
 
+    @Test
+    @ResourceLock("java.lang.System.properties")
+    void storedBinariesReplaceMatchingCompilesExceptForDumps(@TempDir Path cache) throws Exception {
+        String property = "caustica.debug.shader-dump-directory";
+        String previous = System.getProperty(property);
+        var program = new ProgramComposition(List.of());
+        ShaderBinaryCache binaries = ShaderBinaryCache.open(cache.resolve("spirv"), runtime.compilerIdentity());
+        byte[] stored = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN).putInt(0x07230203).array();
+        try {
+            System.clearProperty(property);
+            try (WorldShaderCompiler compiler = WorldShaderCompiler.createIsolated(
+                    List.of(runtime), cache.resolve("sources"), program, binaries, null)) {
+                byte[] compiled = compiler.compilePlain("guide.rmiss.slang", WorldShaderCompiler.ENTRY_POINT);
+                String key = binaries.key(compiler.composition().contentHash(),
+                        "guide.rmiss.slang", WorldShaderCompiler.ENTRY_POINT, false);
+                assertArrayEquals(compiled, binaries.load(key));
+                binaries.store(key, stored);
+            }
+            try (WorldShaderCompiler compiler = WorldShaderCompiler.createIsolated(
+                    List.of(runtime), cache.resolve("sources"), program, binaries, null)) {
+                assertArrayEquals(stored, compiler.compilePlain("guide.rmiss.slang", WorldShaderCompiler.ENTRY_POINT));
+            }
+
+            System.setProperty(property, cache.resolve("dumps").toString());
+            try (WorldShaderCompiler compiler = WorldShaderCompiler.createIsolated(
+                    List.of(runtime), cache.resolve("sources"), program, binaries, null)) {
+                byte[] dumped = compiler.compilePlain("guide.rmiss.slang", WorldShaderCompiler.ENTRY_POINT);
+                assertSpirv(dumped);
+                try (var dumps = Files.list(cache.resolve("dumps"))) {
+                    assertArrayEquals(dumped, Files.readAllBytes(dumps.findFirst().orElseThrow()));
+                }
+            }
+        } finally {
+            if (previous == null) System.clearProperty(property);
+            else System.setProperty(property, previous);
+        }
+    }
+
+    @Test
+    void stagesCompileConcurrentlyOnSiblingRuntimes(@TempDir Path cache) throws Exception {
+        List<SlangRuntime> runtimes = new ArrayList<>(List.of(runtime));
+        runtimes.addAll(runtime.siblings(1));
+        ExecutorService threads = Executors.newFixedThreadPool(4);
+        try (WorldShaderCompiler compiler = WorldShaderCompiler.createIsolated(
+                runtimes, cache, new ProgramComposition(List.of()), null, null)) {
+            List<Callable<byte[]>> compiles = List.of(
+                    () -> compiler.compilePlain("guide.rmiss.slang", WorldShaderCompiler.ENTRY_POINT),
+                    () -> compiler.compilePlain("resolve_stable_planes.slang", WorldShaderCompiler.ENTRY_POINT),
+                    compiler::compileClosestHit,
+                    compiler::compileEnvironmentMiss);
+            List<Future<byte[]>> stages = new ArrayList<>();
+            for (Callable<byte[]> compile : compiles) stages.add(threads.submit(compile));
+            for (Future<byte[]> stage : stages) assertSpirv(stage.get(2, TimeUnit.MINUTES));
+        } finally {
+            threads.shutdown();
+        }
+    }
+
+    @Test
+    void sharcHeadersKeyStoredBinaries(@TempDir Path cache) throws Exception {
+        var program = new ProgramComposition(List.of());
+        Path first = Files.createDirectories(cache.resolve("first"));
+        Path second = Files.createDirectories(cache.resolve("second"));
+        for (String header : SharcSdk.HEADERS.keySet()) {
+            Files.writeString(first.resolve(header), "// " + header);
+            Files.writeString(second.resolve(header), "// " + header);
+        }
+        Files.writeString(second.resolve("SharcCommon.h"), "// changed");
+        List<String> hashes = new ArrayList<>();
+        for (Path headers : Arrays.asList(null, first, second)) {
+            try (WorldShaderCompiler compiler = WorldShaderCompiler.create(runtime,
+                    cache.resolve("sources-" + hashes.size()), program, headers)) {
+                hashes.add(compiler.composition().contentHash());
+            }
+        }
+        assertEquals(3, Set.copyOf(hashes).size(), hashes::toString);
+    }
+
+    @Test
+    void sharcStagesCompileAgainstThePinnedSdk(@TempDir Path cache) throws Exception {
+        String sdk = System.getProperty("caustica.test.sharcSdk");
+        assumeTrue(sdk != null, "built without -PsharcSdk");
+        Path headers = Path.of(sdk).resolve("include");
+        assertNull(SharcSdk.difference(headers));
+        var program = new ProgramComposition(List.of(new ProgramComposition.Surface(
+                new ProgramKey(ProgramKey.Kind.SURFACE, 1), SurfaceDefinition.of(
+                        shader("caustica_error_surface", "ErrorSurface"),
+                        shader("caustica_error_coverage", "ErrorCoverage"), DATA.data(7), BINDING, INSTANCE))));
+        try (WorldShaderCompiler compiler = WorldShaderCompiler.create(runtime, cache, program, headers)) {
+            for (boolean reordered : new boolean[]{false, true}) {
+                byte[] query = compiler.compileSharcFill(reordered, false);
+                byte[] update = compiler.compileSharcFill(reordered, true);
+                assertSpirv(query);
+                assertSpirv(update);
+                assertVulkan14(cache.resolve("sharc-query-" + reordered + ".spv"), query);
+                assertVulkan14(cache.resolve("sharc-update-" + reordered + ".spv"), update);
+                assertShadowTraceRouting(query);
+                assertShadowTraceRouting(update);
+                // Only the update inserts hash grid keys, a 64-bit compare-exchange.
+                assertEquals(0, countOpcode(query, 230));
+                assertTrue(countOpcode(update, 230) > 0);
+            }
+            byte[] resolve = compiler.compileSharcResolve();
+            assertSpirv(resolve);
+            assertVulkan14(cache.resolve("sharc-resolve.spv"), resolve);
+            // A descriptor-heap shader object carries no set or binding decoration.
+            assertEquals(0, countDecorations(resolve, 33) + countDecorations(resolve, 34));
+        }
+    }
+
+    private static int countDecorations(byte[] spirv, int decoration) {
+        var words = ByteBuffer.wrap(spirv).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();
+        int found = 0;
+        for (int offset = 5; offset < words.limit(); offset += words.get(offset) >>> 16) {
+            if ((words.get(offset) & 65535) == 71 && words.get(offset + 2) == decoration) found++; // OpDecorate
+        }
+        return found;
+    }
+
     private static ShaderDefinition shader(String module, String type) {
         return new ShaderDefinition(BUILTINS, module, type);
     }
@@ -221,21 +338,37 @@ final class WorldShaderCompilerTest {
                 .mapToInt(instruction -> typeBytes(definitions, instruction[1])).findFirst().orElseThrow();
     }
 
+    /** Returns the radiance trace count after checking each trace's SBT routing and payload. */
+    private static int assertRadianceTraceRouting(byte[] spirv) {
+        var definitions = spirvDefinitions(spirv);
+        var words = ByteBuffer.wrap(spirv).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();
+        int traces = 0;
+        for (int offset = 5; offset < words.limit(); offset += words.get(offset) >>> 16) {
+            int opcode = words.get(offset) & 65535;
+            if (opcode != 4445 && opcode != 5316) continue; // OpTraceRayKHR, OpHitObjectTraceRayEXT
+            // Radiance rays address one hit record per geometry and the only miss record, the environment.
+            int flags = offset + (opcode == 4445 ? 2 : 3);
+            int[] payload = definitions.get(words.get(flags + 9));
+            assertEquals(28, typeBytes(definitions, payload[1]));
+            assertEquals(0, definitions.get(words.get(flags))[3]);
+            assertEquals(0, definitions.get(words.get(flags + 2))[3]);
+            assertEquals(1, definitions.get(words.get(flags + 3))[3]);
+            assertEquals(0, definitions.get(words.get(flags + 4))[3]);
+            traces++;
+        }
+        return traces;
+    }
+
     private static void assertShadowTraceRouting(byte[] spirv) {
+        assertRadianceTraceRouting(spirv);
         var definitions = spirvDefinitions(spirv);
         var words = ByteBuffer.wrap(spirv).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();
         int shadowQueries = 0;
         for (int offset = 5; offset < words.limit();) {
             int count = words.get(offset) >>> 16;
-            if ((words.get(offset) & 65535) == 4445) {
-                int[] payload = definitions.get(words.get(offset + 11));
-                assertEquals(28, typeBytes(definitions, payload[1]));
-                assertEquals(0, definitions.get(words.get(offset + 2))[3]);
-                assertEquals(0, definitions.get(words.get(offset + 4))[3]);
-                assertEquals(2, definitions.get(words.get(offset + 5))[3]);
-                assertEquals(0, definitions.get(words.get(offset + 6))[3]);
-            } else if ((words.get(offset) & 65535) == 4473) { // OpRayQueryInitializeKHR
-                assertEquals(2, definitions.get(words.get(offset + 3))[3]); // NoOpaqueKHR
+            if ((words.get(offset) & 65535) == 4473) { // OpRayQueryInitializeKHR
+                // NoneKHR: geometry opacity and opacity micromaps decide which candidates reach the shader.
+                assertEquals(0, definitions.get(words.get(offset + 3))[3]);
                 assertEquals(1, definitions.get(words.get(offset + 4))[3]); // Secondary mask
                 shadowQueries++;
             }
@@ -244,7 +377,6 @@ final class WorldShaderCompilerTest {
         assertTrue(shadowQueries > 0);
         assertTrue(countOpcode(spirv, 4477) > 0); // OpRayQueryProceedKHR
         assertTrue(countOpcode(spirv, 4476) > 0); // OpRayQueryConfirmIntersectionKHR
-        assertTrue(countOpcode(spirv, 4474) > 0); // OpRayQueryTerminateKHR
     }
 
     private static int countOpcode(byte[] spirv, int opcode) {

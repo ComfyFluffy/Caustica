@@ -63,6 +63,27 @@ NRI license and source:
 
 <https://github.com/NVIDIA-RTX/NRI/blob/main/LICENSE.txt>
 
+## NVIDIA SHaRC (Spatially Hashed Radiance Cache) SDK
+
+Caustica can use the NVIDIA SHaRC 1.8.0.0 shader headers (commit
+`e19ccacd511f42a3df6f850052d508c13c9e9737`) when a build is made with
+`-PsharcSdk=<SDK checkout>`. The headers are an external input supplied by
+whoever builds or runs Caustica: they are not part of this repository, and no
+build artifact contains them or code compiled from them. A `-PsharcSdk` build
+records only the SDK location, in `caustica/sharc.properties`. At run time
+Caustica verifies the SHA-256 of `SharcCommon.h`, `SharcTypes.h`,
+`HashGridCommon.h` and `HashGridTypes.h` at that location and compiles them on
+the local machine. Without the property, nothing SHaRC-related is read or
+packaged.
+
+SHaRC is proprietary software provided by NVIDIA Corporation and is not
+licensed under the LGPL. Use of the SDK is subject to the NVIDIA RTX SDKs
+license:
+
+<https://github.com/NVIDIA-RTX/SHARC/blob/e19ccacd511f42a3df6f850052d508c13c9e9737/License.md>
+
+The LGPL license grant for Caustica does not grant rights to the SHaRC SDK.
+
 ## Slang
 
 Caustica bundles the Slang 2026.14.1 compiler shared libraries and standard module
@@ -104,3 +125,178 @@ Bundled GLB source:
 <https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/0e3a605bda7c758293ab58432f1d51a2a355d47a/Models/Lantern/glTF-Binary/Lantern.glb>
 
 <https://creativecommons.org/publicdomain/zero/1.0/legalcode>
+
+## PsychoV24 Test24 adaptations
+
+The PsychoV24 Test24 tone-mapping adaptations in
+`packages/renderer-presentation/shaders/pipelines/display/psychov24.slang` (the
+CIE 170-2 PsychoV24 operator) and
+`packages/renderer-presentation/shaders/pipelines/display/psychovisual.slang`
+(the PsychoVisual operator, with the gamut squeeze routed through the BT.2020
+primary triangle and a hue-restore blend) are derived from RenoDX commit
+`fc85b7b15585050442ba35412597ecefc9e04cea`.
+
+Copyright (C) 2026 Carlos Lopez. SPDX-License-Identifier: MIT.
+
+The adaptation remains subject to the MIT license. The complete license text is
+available at <https://opensource.org/license/mit/>:
+
+Copyright (c) 2026 Carlos Lopez
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## PsychoV30 Test30 adaptation
+
+The PsychoV30 tone-mapping adaptation in
+`packages/renderer-presentation/shaders/pipelines/display/psychov30.slang` is
+adapted from the RenoDX PsychoV Test29/Test30 cores at the PsychoV30
+integration snapshot, with the integration profile's fixed arguments pinned
+and the dead reference branches omitted.
+
+Copyright (C) 2026 Carlos Lopez. SPDX-License-Identifier: MIT.
+
+The adaptation remains subject to the MIT license. The complete license text is
+available at <https://opensource.org/license/mit/>:
+
+Copyright (c) 2026 Carlos Lopez
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## PsychoV31 Test31 adaptation
+
+The PsychoV31 Test31 tone-mapping adaptation in
+`packages/renderer-presentation/shaders/pipelines/display/psychov31.slang` is
+adapted from the custom Test31 core (`custom_psychotm_test31`) of the RenoDX
+PsychoV Test31 shader over the PsychoV30 layer in `psychov30.slang`, with the
+integration profile's fixed arguments pinned and the dead reference branches
+omitted.
+
+Copyright (C) 2026 Carlos Lopez. Modifications Copyright (C) 2026 Musa Haji.
+SPDX-License-Identifier: MIT.
+
+The adaptation remains subject to the MIT license. The complete license text is
+available at <https://opensource.org/license/mit/>:
+
+Copyright (C) 2026 Carlos Lopez
+Copyright (C) 2026 Musa Haji
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## PsychoV69 adaptation
+
+The PsychoV69 tone-mapping adaptation in
+`packages/renderer-presentation/shaders/pipelines/display/psychov69.slang` is
+adapted from the PsychoV69 0.1.0 experimental source release
+(`dist/PsychoV69.hlsl`), derived in part from the PsychoV30/V31 cores, with the
+integration profile's fixed arguments pinned (scene reference white 1.0,
+BT.709 source boundary, dual neutral anchors) and the diagnostic status bits
+omitted.
+
+Copyright (C) 2026 Carlos Lopez. SPDX-License-Identifier: MIT.
+
+The adaptation remains subject to the MIT license. The complete license text is
+available at <https://opensource.org/license/mit/>:
+
+Copyright (c) 2026 Carlos Lopez
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Prism adaptation
+
+The Prism tone-mapping adaptation in
+`packages/renderer-presentation/shaders/pipelines/display/prism.slang` is a
+stripped port of the `prism.hlsl` tone-mapping functions built for RenoDX,
+pinned to the `prismTM.hlsl` snapshot, with working-space primaries derived
+by TheGreatHmmmmm. It keeps the gamut squeeze and the anchored C-infinity
+shoulder; no RenoDX runtime or game-specific code is included.
+
+Copyright (c) 2026 Musa Haji. Copyright (c) 2026 OopyDoopy / KickFister / Jon.
+SPDX-License-Identifier: MIT.
+
+The adaptation remains subject to the MIT license. The complete license text is
+available at <https://opensource.org/license/mit/>:
+
+Copyright (c) 2026 Musa Haji
+Copyright (c) 2026 OopyDoopy / KickFister / Jon
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

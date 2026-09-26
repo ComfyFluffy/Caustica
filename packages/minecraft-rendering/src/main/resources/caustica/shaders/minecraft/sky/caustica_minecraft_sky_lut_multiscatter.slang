@@ -50,7 +50,7 @@ public void runSkyMultiscatter(uint3 tid) {
         // will later provide, so reading it here would be circular.
         ScatteringResult r = integrateScatteredLuminance(
                 origin, dir, sunDir, float3(1.0), 0.0,
-                MULTISCATTER_STEPS, false, false,
+                MULTISCATTER_STEPS, 0.0, false,
                 pc.transmittanceImage, pc.multiScatterImage, pc.sampler, groundAlbedo, true);
         luminanceSum += r.luminance;
         multiScatSum += r.multiScatAs1;

@@ -40,9 +40,11 @@ public void runSkyView(uint3 tid) {
     skyViewLocalDirections(worldLightDir.y, viewZenithCos, lightViewCos, viewDir, lightDir);
 
     float3 origin = float3(0.0, sky.viewerRadiusKm, 0.0);
+    // Only the beam that passes the rain keeps the phase functions' aureole around the body; the light the
+    // rain diffuses scatters isotropically.
     float3 luminance = integrateScatteredLuminance(
             origin, viewDir, lightDir, illuminance, angularRadius,
-            SKY_VIEW_STEPS, true, true,
+            SKY_VIEW_STEPS, sky.beamTransmittance, true,
             pc.transmittanceImage, pc.multiScatterImage, pc.sampler,
             sky.groundAlbedo, true).luminance;
 
@@ -56,7 +58,7 @@ public void runSkyView(uint3 tid) {
         skyViewLocalDirections(worldLightDir.y, horizonCos, lightViewCos, tangentDir, tangentLight);
         float3 skyward = integrateScatteredLuminance(
                 origin, tangentDir, tangentLight, illuminance, angularRadius,
-                SKY_VIEW_STEPS, true, true,
+                SKY_VIEW_STEPS, sky.beamTransmittance, true,
                 pc.transmittanceImage, pc.multiScatterImage, pc.sampler,
                 sky.groundAlbedo, false).luminance;
         // Log-space interpolation spreads the brightness change evenly in exposure stops.
@@ -65,5 +67,8 @@ public void runSkyView(uint3 tid) {
         luminance = exp2(lerp(low, high, smoothstep(0.0, sky.horizonSoften, dip)));
     }
 
+    // Overcast greys the dome at its own luminance. The weather's darkening is already in the sun's
+    // illuminance, and this table is also the scene's sky light, so the grey keeps every texel's cd/m².
+    luminance = lerp(float3(dot(luminance, BT709_LUMINANCE)), luminance, sky.skySaturation);
     skyViewImage[tid.xy] = float4(max(luminance, float3(0.0)), 1.0);
 }

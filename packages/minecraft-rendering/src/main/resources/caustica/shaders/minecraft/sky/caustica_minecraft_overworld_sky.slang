@@ -68,7 +68,8 @@ float3 lutSkyEvaluateEnvironment(EnvironmentQuery query) {
             // the bright core and collapses the painted halo to ~0 — the real halo comes from the Mie
             // in-scatter in the LUT, which is where it belongs.
             float core = pow(clamp(dot(texel, texel) * 0.45, 0.0, 1.0), 6.0);
-            color += discRadiance(state.sunIlluminance, state.sunDiscHalfAngle) * sunExtinction * core;
+            color += discRadiance(state.sunIlluminance * state.beamTransmittance, state.sunDiscHalfAngle)
+                   * sunExtinction * core;
         }
         if (celestialSquareLocal(dir, state.moonDir, state.moonDiscHalfAngle, local)) {
             float2 uv = lerp(state.moonUv.xy, state.moonUv.zw, local * 0.5 + 0.5);
@@ -81,7 +82,7 @@ float3 lutSkyEvaluateEnvironment(EnvironmentQuery query) {
             // The phase sprite already carries the lit shape; a contrast ramp suppresses its faint
             // painted halo while keeping that shape.
             float shape = smoothstep(0.0, 1.0, min(length(texel), 1.0));
-            color += discRadiance(state.moonIlluminance, state.moonDiscHalfAngle)
+            color += discRadiance(state.moonIlluminance * state.beamTransmittance, state.moonDiscHalfAngle)
                    * moonExtinction * texel * shape;
         }
         // No separate horizon gate on either body. A set sun or moon goes dark because its extinction is

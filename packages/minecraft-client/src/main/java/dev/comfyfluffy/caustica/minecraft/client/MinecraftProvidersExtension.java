@@ -60,7 +60,8 @@ public final class MinecraftProvidersExtension implements MinecraftExtension, Ca
     }
 
     @Override public void registerSettings(SettingsRegistry registry) {
-        registry.feature(ID).title(DisplayText.literal("Minecraft"))
+        registry.feature(ID).title(DisplayText.translatable("feature.caustica.minecraft"))
+                .description(DisplayText.translatable("feature.caustica.minecraft.description"))
                 .group(SkyLutPass.GROUP).options(SkyLutPass.OPTIONS)
                 .group(FogPass.GROUP).options(FogPass.OPTIONS).register();
     }

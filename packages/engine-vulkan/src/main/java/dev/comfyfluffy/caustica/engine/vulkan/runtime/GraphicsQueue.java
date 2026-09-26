@@ -17,8 +17,7 @@ public final class GraphicsQueue {
     private final CommandPoolCache<VkCommandBuffer> commandPools;
     private final ScheduledExecutorService retirement = Executors.newSingleThreadScheduledExecutor(
             Thread.ofPlatform().daemon().name("Caustica graphics retirement").factory());
-    private final ArrayList<DestroyJob> destroyJobs = new ArrayList<>();
-    private long nextGraphicsValue;
+    private final Retirements retirements = new Retirements();
     private volatile Throwable executorFailure;
 
     GraphicsQueue(VulkanDeviceContext ctx) {
@@ -34,7 +33,7 @@ public final class GraphicsQueue {
         retirement.shutdown();
         awaitTermination(retirement);
         commandPools.destroyAfterDeviceIdle();
-        GpuCrashHistory.record(SEMAPHORE_DESTROY, graphicsTimeline, nextGraphicsValue, 0, 1);
+        GpuCrashHistory.record(SEMAPHORE_DESTROY, graphicsTimeline, retirements.reservedValue(), 0, 1);
         VK10.vkDestroySemaphore(ctx.vk(), graphicsTimeline, null);
         checkExecutorFailure();
     }
@@ -42,7 +41,7 @@ public final class GraphicsQueue {
     public GraphicsUse beginGraphicsUse() {
         assertRenderThread();
         checkExecutorFailure();
-        long value = ++nextGraphicsValue;
+        long value = retirements.reserve();
         GpuCrashHistory.record(GRAPHICS_RESERVED, graphicsTimeline, value, 0, 0);
         return new GraphicsUse(this, value);
     }
@@ -76,9 +75,18 @@ public final class GraphicsQueue {
     }
 
     void keepAliveAfterGraphicsValue(long value, Runnable release) {
-        synchronized (destroyJobs) { destroyJobs.add(new DestroyJob(value, release)); }
+        retirements.add(value, release);
     }
 
+    /**
+     * Releases after every graphics use reserved before this call completes. Callable from any thread;
+     * an abandoned reservation is covered by the next signalled value or the device-idle drain.
+     */
+    void releaseAfterReservedGraphics(Runnable release) {
+        retirements.addAfterReserved(release);
+    }
+
+    /** Releases on the next retirement poll; only for keep-alives of a frame that submitted no commands. */
     void releaseAbandoned(Runnable release) {
         keepAliveAfterGraphicsValue(0L, release);
     }
@@ -91,30 +99,19 @@ public final class GraphicsQueue {
     }
 
     private void processRetirement(long completed) {
-        List<Runnable> ready = new ArrayList<>();
-        synchronized (destroyJobs) {
-            var iterator = destroyJobs.iterator();
-            while (iterator.hasNext()) {
-                DestroyJob job = iterator.next();
-                if (job.value <= completed) {
-                    GpuCrashHistory.record(GRAPHICS_RETIRE, graphicsTimeline, job.value, completed, 0);
-                    iterator.remove();
-                    ready.add(job.release);
-                }
-            }
-        }
-        for (Runnable release : ready) {
-            try { release.run(); }
+        for (DestroyJob job : retirements.takeCompleted(completed)) {
+            GpuCrashHistory.record(GRAPHICS_RETIRE, graphicsTimeline, job.value, completed, 0);
+            try { job.release.run(); }
             catch (Throwable failure) { latchFailure(failure); }
         }
     }
 
     void drainAfterDeviceIdle() {
-        GpuCrashHistory.record(GRAPHICS_DRAIN, graphicsTimeline, nextGraphicsValue, 0, 0);
+        GpuCrashHistory.record(GRAPHICS_DRAIN, graphicsTimeline, retirements.reservedValue(), 0, 0);
         await(retirement.submit(() -> {
             while (true) {
                 processRetirement(Long.MAX_VALUE);
-                synchronized (destroyJobs) { if (destroyJobs.isEmpty()) break; }
+                if (retirements.isEmpty()) break;
             }
         }));
     }
@@ -267,5 +264,45 @@ public final class GraphicsQueue {
 
     }
 
-    private record DestroyJob(long value, Runnable release) {}
+    /** Release jobs keyed by the graphics timeline value that must complete before each runs. */
+    static final class Retirements {
+        private final ArrayList<DestroyJob> jobs = new ArrayList<>();
+        // Only the render thread reserves; releases deferred from any thread read the latest reservation.
+        private volatile long reservedValue;
+
+        long reserve() {
+            return ++reservedValue;
+        }
+
+        long reservedValue() {
+            return reservedValue;
+        }
+
+        synchronized void add(long value, Runnable release) {
+            jobs.add(new DestroyJob(value, release));
+        }
+
+        void addAfterReserved(Runnable release) {
+            add(reservedValue, release);
+        }
+
+        synchronized List<DestroyJob> takeCompleted(long completed) {
+            List<DestroyJob> ready = new ArrayList<>();
+            var iterator = jobs.iterator();
+            while (iterator.hasNext()) {
+                DestroyJob job = iterator.next();
+                if (job.value <= completed) {
+                    iterator.remove();
+                    ready.add(job);
+                }
+            }
+            return ready;
+        }
+
+        synchronized boolean isEmpty() {
+            return jobs.isEmpty();
+        }
+    }
+
+    record DestroyJob(long value, Runnable release) {}
 }

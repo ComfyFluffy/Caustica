@@ -10,6 +10,7 @@ import dev.comfyfluffy.caustica.minecraft.rendering.MinecraftLightFrame;
 import dev.comfyfluffy.caustica.minecraft.rendering.MinecraftLightingCalibration;
 import dev.comfyfluffy.caustica.minecraft.rendering.MinecraftSkyFrame;
 import dev.comfyfluffy.caustica.minecraft.rendering.MinecraftFogFrame;
+import dev.comfyfluffy.caustica.minecraft.rendering.MinecraftWeather;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
@@ -64,7 +65,8 @@ final class MinecraftClientFrameCapture {
                 probe.getValue(EnvironmentAttributes.STAR_BRIGHTNESS, partial),
                 probe.getValue(EnvironmentAttributes.MOON_PHASE, partial).index(),
                 minecraft.level.getSeaLevel(), cameraY, metersPerSceneUnit,
-                calibration));
+                calibration, new MinecraftWeather(minecraft.level.getRainLevel(partial),
+                        minecraft.level.getThunderLevel(partial))));
     }
 
     private static Optional<MinecraftSkyFrame.CelestialAtlas> atlas(

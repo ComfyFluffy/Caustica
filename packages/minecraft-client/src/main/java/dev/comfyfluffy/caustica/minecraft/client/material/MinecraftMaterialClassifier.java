@@ -29,6 +29,14 @@ public final class MinecraftMaterialClassifier {
             ResourceId.of("minecraft", "block/frosted_ice_2"),
             ResourceId.of("minecraft", "block/frosted_ice_3"));
 
+    /** Torch flames radiate at this multiple of the block emission luminance. */
+    public static final float TORCH_EMISSION_SCALE = 3.0f;
+
+    private static final Set<ResourceId> TORCH_MATERIALS = Set.of(
+            ResourceId.of("minecraft", "block/torch"),
+            ResourceId.of("minecraft", "block/soul_torch"),
+            ResourceId.of("minecraft", "block/copper_torch"));
+
     private static final Set<Block> POLISHED = Set.of(
             Blocks.QUARTZ_BLOCK, Blocks.SMOOTH_QUARTZ, Blocks.QUARTZ_BRICKS, Blocks.QUARTZ_PILLAR,
             Blocks.SMOOTH_STONE, Blocks.OBSIDIAN, Blocks.CRYING_OBSIDIAN,
@@ -60,6 +68,11 @@ public final class MinecraftMaterialClassifier {
         if (material == null) return OpenPbrDefaults.TRANSMISSIVE_SPECULAR_IOR;
         if (isGlassMaterial(material)) return GLASS_IOR;
         return ICE_MATERIALS.contains(material) ? ICE_IOR : OpenPbrDefaults.TRANSMISSIVE_SPECULAR_IOR;
+    }
+
+    /** Multiplier on the calibrated block emission luminance for an emitting material's texture. */
+    public static float emissionScale(ResourceId material) {
+        return TORCH_MATERIALS.contains(material) ? TORCH_EMISSION_SCALE : 1.0f;
     }
 
     public static boolean isGlass(BlockState state) {

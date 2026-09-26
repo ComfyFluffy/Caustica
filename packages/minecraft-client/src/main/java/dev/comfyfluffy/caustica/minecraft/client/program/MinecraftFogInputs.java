@@ -33,11 +33,21 @@ final class MinecraftFogInputs {
                 (float) light.illuminanceRedLux(), (float) light.illuminanceGreenLux(),
                 (float) light.illuminanceBlueLux()};
         float daylight = (float) Math.max(0, Math.cos(celestial.sunAngleRadians()));
-        float sky = celestial.lighting().sunIlluminanceLux() * daylight * 0.015f
-                + celestial.lighting().nightAirglowLuminanceCdM2();
+        float sky = celestial.lighting().sunIlluminanceLux() * celestial.weather().daylightFactor() * daylight
+                * 0.015f + celestial.lighting().nightAirglowLuminanceCdM2();
         return new FogFrame(field, frame.dailyDensity(), celestial.seaLevel() + 6, 18,
                 windPhase(frame.animationSeconds()), direction, illuminance,
-                new float[]{sky * 0.7f, sky * 0.85f, sky});
+                overcast(new float[]{sky * 0.7f, sky * 0.85f, sky}, celestial.weather().skySaturation()));
+    }
+
+    /**
+     * The ambient stands in for the sky's light, so the weather greys it as it greys the sky-view LUT: toward its
+     * own ACEScg luminance, which stays unchanged, keeping {@code saturation} of its colour.
+     */
+    private static float[] overcast(float[] ambient, float saturation) {
+        float luminance = 0.27222872f * ambient[0] + 0.67408177f * ambient[1] + 0.05368952f * ambient[2];
+        return new float[]{luminance + saturation * (ambient[0] - luminance),
+                luminance + saturation * (ambient[1] - luminance), luminance + saturation * (ambient[2] - luminance)};
     }
 
     /** Radians in a 65,536-second cycle; integer shader harmonics stay continuous at the wrap. */

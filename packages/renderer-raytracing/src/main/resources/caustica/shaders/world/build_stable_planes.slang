@@ -49,7 +49,8 @@ StableBranch branchAdvance(StableBranch branch, WorldHit hit, TraceLobes lobes, 
     float3 movement = hit.previousPosition - hit.position;
     branch.motion += mul(branch.imageTransform, movement - mul(transform, movement));
     branch.imageTransform = mul(branch.imageTransform, transform);
-    branch.identity = (branch.identity << 2u) | (transmission ? 2u : 1u);
+    branch.identity = (branch.identity << 2u)
+            | (transmission ? STABLE_PLANE_BRANCH_TRANSMISSION : STABLE_PLANE_BRANCH_REFLECTION);
     branch.transmitted |= transmission;
     return branch;
 }
@@ -59,28 +60,17 @@ StableBranch branchAdvance(StableBranch branch, WorldHit hit, TraceLobes lobes, 
 void branchEnqueue(uint2 pixel, uint2 extent, uint plane, StableBranch branch) {
     uint address = stablePlaneRecordIndex(pixel, extent, plane);
     pathSegmentStorage(worldBindings.pathQueueAddress, STABLE_PLANE_COUNT * extent.x * extent.y).store(address, branch.path);
-    StablePlaneStorage records = stablePlaneRecords(extent);
-    records.storeCurrentVirtualPosition(address, branch.imageTransform[0]);
-    records.storePreviousVirtualPosition(address, branch.imageTransform[1]);
-    records.storeNormal(address, branch.imageTransform[2]);
-    records.storeDiffuseBsdfEstimate(address, branch.motion);
-    records.storeRoughness(address, branch.length);
-    records.storeBranchId(address, branch.identity);
-    records.storeFlags(address, branch.transmitted ? 1u : 0u);
+    stablePlaneRecords(extent).storeQueuedBranch(address, branch.imageTransform, branch.motion, branch.length,
+            branch.identity, branch.transmitted);
 }
 
 StableBranch branchDequeue(uint2 pixel, uint2 extent, uint plane) {
     uint address = stablePlaneRecordIndex(pixel, extent, plane);
     PathSegmentStorage endpoints = pathSegmentStorage(worldBindings.pathQueueAddress, STABLE_PLANE_COUNT * extent.x * extent.y);
-    StablePlaneStorage records = stablePlaneRecords(extent);
     StableBranch branch;
     branch.path = endpoints.load(address);
-    branch.imageTransform = float3x3(records.loadCurrentVirtualPosition(address),
-            records.loadPreviousVirtualPosition(address), records.loadNormal(address));
-    branch.motion = records.loadDiffuseBsdfEstimate(address);
-    branch.length = records.loadRoughness(address);
-    branch.identity = records.loadBranchId(address);
-    branch.transmitted = records.loadFlags(address) != 0u;
+    stablePlaneRecords(extent).loadQueuedBranch(address, branch.imageTransform, branch.motion, branch.length,
+            branch.identity, branch.transmitted);
     // A terminal environment or over-budget branch must leave no valid fill endpoint.
     endpoints.storeFlags(address, 0u);
     return branch;
@@ -99,6 +89,7 @@ public void runBuildStablePlanes<TComposition : IComposition>() {
     branch.imageTransform = float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
     branch.identity = 1u;
     float3 cameraDirection = branch.path.direction;
+    float coneSpread = traceCameraSpread(pixel, extent, frame);
     uint count = 1u;
     float3 stableRadiance = float3(0.0);
     [unroll]
@@ -113,7 +104,7 @@ public void runBuildStablePlanes<TComposition : IComposition>() {
             intersection.pathFlags = WORLD_PATH_GUIDE;
             RayDesc ray = traceRay(branch.path);
             uint mask = branch.path.depth == 0u ? WORLD_RAY_MASK_PRIMARY : WORLD_RAY_MASK_SECONDARY;
-            TraceRay(worldAccelerationStructure(), RAY_FLAG_NONE, mask, 0u, 2u, 0u, ray, intersection);
+            TraceRay(worldAccelerationStructure(), RAY_FLAG_NONE, mask, 0u, 1u, 0u, ray, intersection);
             bool environment = (intersection.pathFlags & WORLD_PATH_MISS) != 0u;
             float distance = environment ? TRACE_MAX_DISTANCE : intersection.hitDistance;
             float3 transmission = exp(-branch.path.absorption * distance);
@@ -126,7 +117,8 @@ public void runBuildStablePlanes<TComposition : IComposition>() {
             restart.throughput = branch.path.throughput;
             branch.length += distance;
             // Material closures need not remain live across medium sampling and its shadow traversal.
-            WorldHit hit = resolveWorldHit<TComposition>(intersection, ray, 0.0);
+            // Build follows only delta events, so the cone width is the camera spread times the unfolded length.
+            WorldHit hit = resolveWorldHit<TComposition>(intersection, ray, 0.0, coneSpread * branch.length);
             if (plane == 0u && step == 0u) {
                 // Camera-segment media stop at the physical boundary, before delta branches continue.
                 float4 clip = mul(frame.curViewProj, float4(hit.position - frame.camOffset, 1.0));

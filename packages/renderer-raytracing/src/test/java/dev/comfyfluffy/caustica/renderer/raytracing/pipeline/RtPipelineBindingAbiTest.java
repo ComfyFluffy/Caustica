@@ -33,25 +33,27 @@ final class RtPipelineBindingAbiTest {
         assertEquals(84, RtBindings.WORLD_DENOISED_DIFFUSE_RADIANCE_HIT_DISTANCE_INDEX_OFFSET);
         assertEquals(88, RtBindings.WORLD_DENOISED_SPECULAR_RADIANCE_HIT_DISTANCE_INDEX_OFFSET);
         assertEquals(92, RtBindings.WORLD_NRD_STABLE_RADIANCE_INDEX_OFFSET);
-        assertEquals(96, RtBindings.WORLD_INITIAL_VOLUME_IMPLEMENTATION_OFFSET);
-        assertEquals(100, RtBindings.WORLD_INITIAL_VOLUME_ACTIVE_OFFSET);
-        assertEquals(104, RtBindings.WORLD_INITIAL_VOLUME_BINDING_OFFSET);
-        assertEquals(112, RtBindings.WORLD_INITIAL_VOLUME_INSTANCE_OFFSET);
-        assertEquals(120, RtBindings.WORLD_NEE_AT_STATE_ADDRESS_OFFSET);
-        assertEquals(128, RtBindings.WORLD_NRD_SIGNAL_ENCODING_OFFSET);
-        assertEquals(132, RtBindings.WORLD_RECONSTRUCTION_MICRO_JITTER_SCALE_OFFSET);
-        assertEquals(136, RtBindings.WORLD_STABLE_PLANE_BUFFER_ADDRESS_OFFSET);
-        assertEquals(144, RtBindings.WORLD_VISIBILITY_RAYS_ADDRESS_OFFSET);
-        assertEquals(152, RtBindings.WORLD_VISIBILITY_RESULTS_ADDRESS_OFFSET);
-        assertEquals(160, RtBindings.WORLD_SPATIAL_MEDIUM_BINDING_DATA_OFFSET);
-        assertEquals(168, RtBindings.WORLD_SPATIAL_MEDIUM_INSTANCE_DATA_OFFSET);
-        assertEquals(176, RtBindings.WORLD_SPATIAL_MEDIUM_IMPLEMENTATION_OFFSET);
-        assertEquals(180, RtBindings.WORLD_SPATIAL_MEDIUM_ACTIVE_OFFSET);
-        assertEquals(184, RtBindings.WORLD_SPATIAL_MEDIUM_ORIGIN_X_OFFSET);
-        assertEquals(188, RtBindings.WORLD_SPATIAL_MEDIUM_ORIGIN_Y_OFFSET);
-        assertEquals(192, RtBindings.WORLD_SPATIAL_MEDIUM_ORIGIN_Z_OFFSET);
-        assertEquals(200, RtBindings.WORLD_SHADOW_DIAGNOSTICS_ADDRESS_OFFSET);
-        assertEquals(208, WORLD_PUSH_CONSTANT_SIZE);
+        assertEquals(96, RtBindings.WORLD_RESPONSIVITY_GUIDE_INDEX_OFFSET);
+        assertEquals(100, RtBindings.WORLD_INITIAL_VOLUME_IMPLEMENTATION_OFFSET);
+        assertEquals(104, RtBindings.WORLD_INITIAL_VOLUME_ACTIVE_OFFSET);
+        assertEquals(112, RtBindings.WORLD_INITIAL_VOLUME_BINDING_OFFSET);
+        assertEquals(120, RtBindings.WORLD_INITIAL_VOLUME_INSTANCE_OFFSET);
+        assertEquals(128, RtBindings.WORLD_NEE_AT_STATE_ADDRESS_OFFSET);
+        assertEquals(136, RtBindings.WORLD_NRD_SIGNAL_ENCODING_OFFSET);
+        assertEquals(140, RtBindings.WORLD_RECONSTRUCTION_MICRO_JITTER_SCALE_OFFSET);
+        assertEquals(144, RtBindings.WORLD_STABLE_PLANE_BUFFER_ADDRESS_OFFSET);
+        assertEquals(152, RtBindings.WORLD_VISIBILITY_RAYS_ADDRESS_OFFSET);
+        assertEquals(160, RtBindings.WORLD_VISIBILITY_RESULTS_ADDRESS_OFFSET);
+        assertEquals(168, RtBindings.WORLD_SPATIAL_MEDIUM_BINDING_DATA_OFFSET);
+        assertEquals(176, RtBindings.WORLD_SPATIAL_MEDIUM_INSTANCE_DATA_OFFSET);
+        assertEquals(184, RtBindings.WORLD_SPATIAL_MEDIUM_IMPLEMENTATION_OFFSET);
+        assertEquals(188, RtBindings.WORLD_SPATIAL_MEDIUM_ACTIVE_OFFSET);
+        assertEquals(192, RtBindings.WORLD_SPATIAL_MEDIUM_ORIGIN_X_OFFSET);
+        assertEquals(196, RtBindings.WORLD_SPATIAL_MEDIUM_ORIGIN_Y_OFFSET);
+        assertEquals(200, RtBindings.WORLD_SPATIAL_MEDIUM_ORIGIN_Z_OFFSET);
+        assertEquals(208, RtBindings.WORLD_SHADOW_DIAGNOSTICS_ADDRESS_OFFSET);
+        assertEquals(216, RtBindings.WORLD_SHARC_FRAME_ADDRESS_OFFSET);
+        assertEquals(224, WORLD_PUSH_CONSTANT_SIZE);
     }
 
     @Test

@@ -184,7 +184,8 @@ final class MinecraftProgramSessionTest {
         OptionValues values = new OptionValues() {
             @Override @SuppressWarnings("unchecked") public <T> T get(Option<T> option) {
                 Object value = option == SkyLutPass.SUN_NOON_SOUTH_TILT_DEGREES ? 11.0f
-                        : option == SkyLutPass.SUN_ANGULAR_RADIUS_DEGREES ? 0.3f : 0.7f;
+                        : option == SkyLutPass.SUN_ANGULAR_RADIUS_DEGREES ? 0.3f
+                        : option == SkyLutPass.MOON_ILLUMINANCE_LUX ? 2.5f : 0.7f;
                 return (T) value;
             }
         };
@@ -194,13 +195,14 @@ final class MinecraftProgramSessionTest {
         assertEquals(11.0, settings.noonTiltDegrees());
         assertEquals(0.3, settings.sunAngularRadiusDegrees(), 1.0e-6);
         assertEquals(0.7, settings.moonAngularRadiusDegrees(), 1.0e-6);
+        assertEquals(2.5, settings.moonIlluminanceLux(), 1.0e-6);
     }
 
     @Test
     void lightUpdateTimingBracketsTheCapturedFrameUpdate() {
         List<String> events = new ArrayList<>();
         MinecraftLightProvider lights = new MinecraftLightProvider(new NoopSceneChannel(), new SceneId() { },
-                () -> new MinecraftLightProvider.CelestialSettings(30, 0.6, 1.5),
+                () -> new MinecraftLightProvider.CelestialSettings(30, 0.6, 1.5, 0.3),
                 () -> { events.add("update"); return null; });
         var pass = new MinecraftProgramSession.LightUpdatePass(lights,
                 new RecordingInstrumentation(events));

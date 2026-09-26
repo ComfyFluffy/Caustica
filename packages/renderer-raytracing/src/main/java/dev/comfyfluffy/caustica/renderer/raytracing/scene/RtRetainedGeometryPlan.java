@@ -14,7 +14,8 @@ import java.util.List;
 
 /** Pure planning and CPU ABI packing for native retained geometry. */
 public final class RtRetainedGeometryPlan {
-    public static final int HIT_RECORDS_PER_GEOMETRY = 2;
+    // Only radiance rays use TraceRay, with SBT stride 1; visibility uses inline ray queries.
+    public static final int HIT_RECORDS_PER_GEOMETRY = 1;
     public static final int RECORD_BYTES = RetainedGeometryRecordData.BYTE_SIZE;
 
     public static final int SURFACE_IMPLEMENTATION_OFFSET = 0;
@@ -171,13 +172,15 @@ public final class RtRetainedGeometryPlan {
             // Volume boundaries must reach closest-hit for ordered medium and transmission updates.
             boolean anyHit = !volume && (record.flags() & (CUTOUT | STOCHASTIC)) != 0;
             groups.add(anyHit ? HitGroup.RADIANCE_CUTOUT : HitGroup.RADIANCE_OPAQUE);
-            groups.add(volume ? HitGroup.SHADOW_TRANSMISSIVE
-                    : (record.flags() & GUARANTEED_SHADOW_BLOCKER) != 0 ? HitGroup.SHADOW_BLOCKER
-                    : anyHit ? HitGroup.SHADOW_CUTOUT : HitGroup.SHADOW_OPAQUE);
         }
         return List.copyOf(groups);
     }
 
+    /**
+     * Opaque geometry needs no coverage test, so traversal commits it without shader involvement. Opacity does
+     * not imply zero transmission: volume boundaries and uncertified surfaces are opaque and still transmit.
+     * Every guaranteed shadow blocker is opaque, so visibility queries see a blocker only as a committed hit.
+     */
     private static boolean isOpaque(MeshBuild.Geometry<?> geometry) {
         return geometry.volume() != null || geometry.surface() == null
                 || geometry.surface().coverage() instanceof MeshBuild.CoveragePolicy.Opaque;
@@ -197,10 +200,6 @@ public final class RtRetainedGeometryPlan {
 
     public enum HitGroup {
         RADIANCE_OPAQUE,
-        RADIANCE_CUTOUT,
-        SHADOW_OPAQUE,
-        SHADOW_CUTOUT,
-        SHADOW_TRANSMISSIVE,
-        SHADOW_BLOCKER
+        RADIANCE_CUTOUT
     }
 }

@@ -60,15 +60,16 @@ final class RtExposurePipeline {
         try (MemoryStack stack = MemoryStack.stackPush();
              var ignored = RtDebugLabels.scope(context, command, "exposure resolve")) {
             // Four ordered scene-EV/compensation-EV knots shape the metered exposure response.
+            RtExposure.Response response = config.response();
             ByteBuffer push = stack.malloc(ExposureResolvePushData.BYTE_SIZE);
             new ExposureResolvePushData(histogram.deviceAddress().value(), state.deviceAddress().value(), storage(exposure),
                     config.key(), config.minEv(), config.maxEv(), config.adaptDarken(), config.adaptBrighten(),
                     frameTimeSeconds, config.evBias(), config.lowPercentile(), config.highPercentile(),
                     config.environmentWeightCap(),
-                    -2.0f, -3.0f,
-                    2.0f, -2.0f,
-                    8.0f, 0.0f,
-                    15.0f, 1.0f,
+                    response.sceneEv(0), response.compensationEv(0),
+                    response.sceneEv(1), response.compensationEv(1),
+                    response.sceneEv(2), response.compensationEv(2),
+                    response.sceneEv(3), response.compensationEv(3),
                     config.emissiveWeightCap(), config.evOffset(), config.preExposure(),
                     config.resetSequence()).write(push);
             resolveShader.dispatch(command, push, 1, 1, 1);

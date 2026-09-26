@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.List;
 
 /**
  * A baked ACES look or display transform: one RGBA16F 3D mip uploaded from a classpath resource.
@@ -37,6 +38,20 @@ public final class RtToneLut {
     // them with shaders/pipelines/display/main.comp.slang's fixed shaper.
     private static final float SHADER_SHAPER_LO_STOPS = -12.0f;
     private static final float SHADER_SHAPER_HI_STOPS = 12.0f;
+
+    /** Mastering peaks of the packaged ACES 2.0 HDR LUTs, {@code hdr_aces2_rec2020_<nits>nit.bin}. */
+    public static final List<Integer> HDR_LUT_NITS = List.of(500, 1000, 2000, 4000);
+
+    /** The packaged HDR LUT mastering peak nearest the display peak; ties take the lower. */
+    public static int nearestHdrLutNits(float peakNits) {
+        int nearest = HDR_LUT_NITS.getFirst();
+        for (int candidate : HDR_LUT_NITS) {
+            if (Math.abs(peakNits - candidate) < Math.abs(peakNits - nearest)) {
+                nearest = candidate;
+            }
+        }
+        return nearest;
+    }
 
     private final VmaImageAllocation imageAllocation;
     private final GpuDescriptorRange<GpuDescriptorIndex.Resource> sampledDescriptor;

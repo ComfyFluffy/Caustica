@@ -30,6 +30,7 @@ public struct WorldResourceIndices {
     public StorageImageIndex denoisedDiffuseRadianceHitDistance;
     public StorageImageIndex denoisedSpecularRadianceHitDistance;
     public StorageImageIndex nrdStableRadiance;
+    public StorageImageIndex responsivityGuide;
 };
 
 /**
@@ -60,6 +61,8 @@ public struct WorldBindingRoots {
     public float spatialMediumOriginY;
     public float spatialMediumOriginZ;
     public uint64_t shadowDiagnosticsAddress;
+    // This frame's SharcFrame; only the SHaRC fill variants read it.
+    public uint64_t sharcFrameAddress;
 };
 
 public RaytracingAccelerationStructure worldAccelerationStructure() {

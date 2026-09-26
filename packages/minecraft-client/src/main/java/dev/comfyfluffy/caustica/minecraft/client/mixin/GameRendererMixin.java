@@ -10,6 +10,7 @@ import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
 import dev.comfyfluffy.caustica.minecraft.client.CausticaClientComposition;
 import dev.comfyfluffy.caustica.minecraft.client.MinecraftDebugCapture;
 import dev.comfyfluffy.caustica.minecraft.client.MinecraftDebugService;
+import dev.comfyfluffy.caustica.minecraft.client.UltraScreenshot;
 import dev.comfyfluffy.caustica.minecraft.client.MinecraftDebugService.CapturePhase;
 import dev.comfyfluffy.caustica.minecraft.client.MinecraftUiOverlay;
 import dev.comfyfluffy.caustica.minecraft.client.vulkan.MinecraftVulkanBackend;
@@ -50,6 +51,7 @@ public abstract class GameRendererMixin {
 	private void caustica$beginOverlayFrame(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
 		try (var hostWork = MinecraftHostTelemetry.work("frame.begin")) {
 			caustica$worldComposited = false;
+			UltraScreenshot.INSTANCE.beginFrame(Minecraft.getInstance());
 			MinecraftDebugService.beginFrame();
 			CausticaClientComposition.current().runtime().beginRenderFrame();
 			if (!CausticaClientComposition.current().runtime().frameActive()) {
@@ -80,6 +82,8 @@ public abstract class GameRendererMixin {
 			MinecraftDebugService.frameRendered(
 					caustica$worldComposited);
 			MinecraftDebugCapture.poll(Minecraft.getInstance(),
+					caustica$worldComposited);
+			UltraScreenshot.INSTANCE.frameRendered(Minecraft.getInstance(),
 					caustica$worldComposited);
 		}
 	}
